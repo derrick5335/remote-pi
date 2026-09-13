@@ -954,14 +954,16 @@ class Gateway {
       case "resume": return this.showSessions();
       case "reset":
       case "new": {
-        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
         this.resetSessionState();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
-          return this.telegram.send(this.chatId, "新会话已取消");
+          this.queueTelegram(() => this.telegram.send(this.chatId, "新会话已取消"));
+          return;
         }
         const state = await this.pi.request("get_state").catch(() => null);
-        return this.telegram.send(this.chatId, formatSessionReset({ model: state?.model, cwd: this.config.cwd }));
+        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
+        this.queueTelegram(() => this.telegram.send(this.chatId, text));
+        return;
       }
       case "name": {
         if (!argument) return this.telegram.send(this.chatId, "用法：/name <名称>");
