@@ -105,25 +105,6 @@ function formatAssistantError(errorMessage) {
   return `❌ ${message}`;
 }
 
-function formatThinkingStream(thinking, maxLines = 5, isSettled = false) {
-  const header = isSettled ? "💭 思考完成" : "💭 正在思考…";
-  if (!thinking?.trim()) return header;
-  const rawLines = thinking.trimEnd().split("\n");
-  const visualLines = [];
-  for (const raw of rawLines) {
-    const trimmed = raw.trim();
-    if (!trimmed) continue;
-    for (let i = 0; i < trimmed.length; i += 75) {
-      visualLines.push(trimmed.slice(i, i + 75));
-    }
-  }
-  if (!visualLines.length) return header;
-  const hasMore = visualLines.length > maxLines;
-  const slice = visualLines.slice(-maxLines);
-  const lines = slice.map((line) => `> ${line}`).join("\n");
-  return hasMore ? `${header}\n\n> …\n${lines}` : `${header}\n\n${lines}`;
-}
-
 function telegramMarkdown(text) {
   const blocks = [];
   const holdBlock = (rendered) => {
@@ -443,16 +424,62 @@ class Telegram {
   }
 }
 
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
 class PiRpc {
-  constructor(config, onEvent) {
+  constructor(config, onEvent, isBusy) {
     this.config = config;
     this.onEvent = onEvent;
+    this.isBusyCallback = isBusy || (() => false);
     this.pending = new Map();
     this.sequence = 0;
     this.closing = false;
+    this.idleStopping = false;
+    this.startingPromise = null;
+    this.idleStoppingPromise = null;
+    this.idleTimeoutMs = Number(process.env.REMOTE_PI_IDLE_TIMEOUT_MS) || DEFAULT_IDLE_TIMEOUT_MS;
+    this.idleTimer = null;
+  }
+
+  isBusy() {
+    return this.pending.size > 0 || this.isBusyCallback();
+  }
+
+  touch() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    if (this.closing || this.idleStopping || !this.proc) return;
+    if (this.isBusy()) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (!this.isBusy()) this.stopIdle().catch((err) => console.error("Pi idle stop error:", err));
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref();
+  }
+
+  async ensureStarted() {
+    if (this.proc && !this.idleStopping) return;
+    if (this.startingPromise) return this.startingPromise;
+    this.startingPromise = (async () => {
+      try {
+        if (this.idleStoppingPromise) await this.idleStoppingPromise;
+        await this.start();
+      } finally {
+        this.startingPromise = null;
+      }
+    })();
+    return this.startingPromise;
   }
 
   async start() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.closing = false;
+    this.idleStopping = false;
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
     const env = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
@@ -482,12 +509,14 @@ class PiRpc {
         reject(new Error(`Pi exited (${code ?? signal})`));
       }
       this.pending.clear();
-      if (!this.closing) {
+      this.proc = null;
+      if (!this.closing && !this.idleStopping) {
         console.error(`Pi exited (${code ?? signal}); exiting so launchd can restart both.`);
         process.exitCode = 1;
         setTimeout(() => process.exit(1), 100);
       }
     });
+    this.touch();
   }
 
   handleLine(line) {
@@ -498,39 +527,69 @@ class PiRpc {
       const pending = this.pending.get(value.id);
       this.pending.delete(value.id);
       clearTimeout(pending.timer);
+      this.touch();
       value.success ? pending.resolve(value.data) : pending.reject(new Error(value.error || `${value.command} failed`));
     } else {
       this.onEvent(value);
     }
   }
 
-  request(type, fields = {}, timeout = 600_000) {
+  async request(type, fields = {}, timeout = 600_000) {
+    await this.ensureStarted();
+    this.touch();
     const id = `tg-${++this.sequence}`;
     return new Promise((resolveRequest, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.touch();
         reject(new Error(`Pi RPC ${type} timed out`));
       }, timeout);
       this.pending.set(id, { resolve: resolveRequest, reject, timer });
       this.write({ id, type, ...fields });
+    }).finally(() => {
+      this.touch();
     });
   }
 
   write(value) {
     if (!this.proc?.stdin?.writable) throw new Error("Pi RPC is not running");
+    this.touch();
     this.proc.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
-  async stop() {
-    this.closing = true;
+  async stopProc() {
     if (!this.proc) return;
     const proc = this.proc;
+    this.proc = null;
     proc.kill("SIGTERM");
     await new Promise((resolveClose) => {
       if (proc.killed || proc.exitCode !== null) return resolveClose();
       proc.once("close", resolveClose);
       setTimeout(resolveClose, 2000);
     });
+  }
+
+  async stopIdle() {
+    if (!this.proc || this.closing || this.startingPromise) return;
+    if (this.isBusy()) return;
+    console.log(`${new Date().toISOString()} Pi RPC idle for ${Math.round(this.idleTimeoutMs / 60_000)}m; stopping subprocess to save memory.`);
+    this.idleStopping = true;
+    this.idleStoppingPromise = this.stopProc();
+    try {
+      await this.idleStoppingPromise;
+    } finally {
+      this.idleStopping = false;
+      this.idleStoppingPromise = null;
+    }
+  }
+
+  async stop() {
+    this.closing = true;
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    await this.stopProc();
   }
 }
 
@@ -540,20 +599,20 @@ class Gateway {
     this.chatId = config.allowedUserId;
     this.chatReady = false;
     this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
-    this.pi = new PiRpc(config, (event) => this.queueEvent(event));
+    this.pi = new PiRpc(config, (event) => this.queueEvent(event), () => this.isBusy());
     this.actions = new Map();
     this.commandAliases = new Map();
     this.toolPanel = null;
-    this.thinkingText = "";
-    this.thinkingMessageId = null;
-    this.thinkingTimer = null;
-    this.thinkingInFlight = false;
     this.mediaGroups = new Map();
     this.queue = { steering: [], followUp: [] };
     this.isStreaming = false;
     this.typingTimer = null;
     this.eventChain = Promise.resolve();
     this.telegramChain = Promise.resolve();
+  }
+
+  isBusy() {
+    return this.isStreaming || !!this.pendingUi || this.queue.steering.length > 0 || this.queue.followUp.length > 0;
   }
 
   async start() {
@@ -724,23 +783,17 @@ class Gateway {
     this.isStreaming = false;
     this.stopTyping();
     this.pendingUi = null;
-    this.thinkingText = "";
-    this.thinkingMessageId = null;
-    this.thinkingInFlight = false;
     for (const group of this.mediaGroups.values()) {
       if (group.timer) clearTimeout(group.timer);
     }
     this.mediaGroups.clear();
-    if (this.thinkingTimer) {
-      clearTimeout(this.thinkingTimer);
-      this.thinkingTimer = null;
-    }
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
     this.toolPanel = null;
     if (this.draft?.timer) clearTimeout(this.draft.timer);
     this.draft = null;
     this.queue = { steering: [], followUp: [] };
+    this.pi?.touch();
   }
 
   async prompt(message, images, streamingBehavior) {
@@ -842,11 +895,13 @@ class Gateway {
         return this.prompt(argument, undefined, "followUp");
       }
       case "abort": {
-        if (this.pendingUi) {
+        if (this.pendingUi && this.pi.proc) {
           this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
         }
-        await this.pi.request("clear_queue").catch(() => {});
-        await this.pi.request("abort").catch(() => {});
+        if (this.pi.proc) {
+          await this.pi.request("clear_queue").catch(() => {});
+          await this.pi.request("abort").catch(() => {});
+        }
         this.resetSessionState();
         return this.telegram.send(this.chatId, "⏹ 已停止");
       }
@@ -858,7 +913,7 @@ class Gateway {
       }
       case "queue": {
         if (argument === "clear") {
-          const removed = await this.pi.request("clear_queue");
+          const removed = this.pi.proc ? await this.pi.request("clear_queue").catch(() => ({ steering: [], followUp: [] })) : { steering: [], followUp: [] };
           this.queue = { steering: [], followUp: [] };
           return this.telegram.send(this.chatId, `已清空\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
         }
@@ -1086,7 +1141,7 @@ class Gateway {
     this.config.sessionDir = join(this.config.stateDir, "sessions", target.replace(/^\//, "").replaceAll("/", "-"));
     await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
     this.resetSessionState();
-    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event));
+    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event), () => this.isBusy());
     await this.pi.start();
     await this.registerBotCommands();
     const state = await this.pi.request("get_state");
@@ -1099,12 +1154,7 @@ class Gateway {
       this.pendingUi = null;
       this.repliedInRun = false;
       this.startTyping();
-      this.thinkingText = "";
-      this.thinkingMessageId = null;
-      if (this.thinkingTimer) {
-        clearTimeout(this.thinkingTimer);
-        this.thinkingTimer = null;
-      }
+      this.pi?.touch();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
       this.toolPanel = null;
@@ -1113,13 +1163,7 @@ class Gateway {
       this.isStreaming = false;
       this.pendingUi = null;
       this.stopTyping();
-      if (this.thinkingTimer) {
-        clearTimeout(this.thinkingTimer);
-        this.thinkingTimer = null;
-      }
-      if (this.thinkingText && this.thinkingMessageId) {
-        this.queueTelegram(() => this.flushThinkingBox(true));
-      }
+      this.pi?.touch();
       if (this.toolPanel && this.toolPanel.tools.length) {
         if (this.toolPanel.heartbeat) clearInterval(this.toolPanel.heartbeat);
         for (const tool of this.toolPanel.tools) {
@@ -1166,11 +1210,6 @@ class Gateway {
             draft.timer = null;
             this.queueTelegram(() => this.flushDraft(draft));
           }, 1200);
-        }
-      } else if (update?.type === "thinking_delta" || update?.type === "thinking_start") {
-        if (update?.delta) {
-          this.thinkingText = (this.thinkingText || "") + update.delta;
-          this.scheduleThinkingUpdate();
         }
       }
     }
@@ -1220,33 +1259,6 @@ class Gateway {
     }
     if (event.type === "extension_ui_request") await this.handleUiRequest(event);
     if (event.type === "extension_error") await this.telegram.send(this.chatId, `❌ Extension ${event.extensionPath}: ${event.error}`);
-  }
-
-  scheduleThinkingUpdate() {
-    if (this.thinkingTimer) return;
-    this.thinkingTimer = setTimeout(() => {
-      this.thinkingTimer = null;
-      this.queueTelegram(() => this.flushThinkingBox());
-    }, 1200);
-  }
-
-  async flushThinkingBox(isSettled = false) {
-    if (!this.thinkingText || this.thinkingFlushing) return;
-    this.thinkingFlushing = true;
-    try {
-      const text = formatThinkingStream(this.thinkingText, 5, isSettled);
-      if (!text) return;
-      if (this.thinkingMessageId) {
-        await this.telegram.edit(this.chatId, this.thinkingMessageId, text, !isSettled);
-      } else {
-        const sent = await this.telegram.sendOne(this.chatId, text);
-        this.thinkingMessageId = sent.message_id;
-      }
-    } catch (error) {
-      console.error("Thinking update error:", error.message);
-    } finally {
-      this.thinkingFlushing = false;
-    }
   }
 
   scheduleToolPanelUpdate(force = false, isSettled = false) {
@@ -1335,7 +1347,6 @@ class Gateway {
     }
     this.mediaGroups.clear();
     if (this.logTimer) clearInterval(this.logTimer);
-    if (this.thinkingTimer) clearTimeout(this.thinkingTimer);
     if (this.draft?.timer) clearTimeout(this.draft.timer);
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
@@ -1356,12 +1367,6 @@ async function selfTest() {
   assert.equal(telegramSkillName("skill:grill-me"), "skill_grill_me");
   assert.equal(telegramSkillName(`skill:${"a".repeat(40)}`).length, 32);
   assert.equal(telegramMarkdown("### Status!\n- **ready** and `a_b`"), "*Status\\!*\n• *ready* and `a_b`");
-  assert.equal(formatThinkingStream(""), "💭 正在思考…");
-  assert.ok(formatThinkingStream("analyzing problem").includes("> analyzing problem"));
-  const tenLines = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n");
-  const streamFormatted = formatThinkingStream(tenLines);
-  assert.ok(streamFormatted.includes("> …\n> line 6\n> line 7\n> line 8\n> line 9\n> line 10"));
-  assert.ok(!streamFormatted.includes("> line 5"));
   assert.equal(telegramMarkdown("```js\na_b();\n```"), "```js\na_b();\n```");
   assert.ok(telegramMarkdown("| A | B |\n|---|---|\n| 1 | 2 |").includes("```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"));
   assert.equal(
@@ -1390,6 +1395,15 @@ async function selfTest() {
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("⏳"));
   assert.ok(renderToolPanel([{ summary: "web_search", status: "running", startedAt: 1_000 }], false, 66_000).includes("1m 5s"));
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("🛠 已完成 1 项操作"));
+  const mockPi = new PiRpc({ sessionDir: "/tmp" }, () => {}, () => false);
+  mockPi.proc = { kill: () => {} };
+  assert.equal(mockPi.isBusy(), false);
+  mockPi.touch();
+  assert.ok(mockPi.idleTimer !== null);
+  mockPi.isBusyCallback = () => true;
+  assert.equal(mockPi.isBusy(), true);
+  mockPi.touch();
+  assert.equal(mockPi.idleTimer, null);
   console.log("self-test: ok");
   const tmpLog = join(tmpdir(), `test-remote-pi-rot-${Date.now()}.log`);
   await writeFile(tmpLog, "x".repeat(20));
