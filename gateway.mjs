@@ -113,6 +113,13 @@ function formatAssistantError(errorMessage) {
   return `❌ ${message}`;
 }
 
+function expandableBlockquote(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return "";
+  const lines = clean.split("\n").map((line) => `>${line}`).join("\n");
+  return `**${lines}||`;
+}
+
 function telegramMarkdown(text) {
   const blocks = [];
   const holdBlock = (rendered) => {
@@ -132,6 +139,14 @@ function telegramMarkdown(text) {
     if (!/^[ \t]*\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|[ \t]*$/m.test(table)) return table;
     const newline = table.endsWith("\n") ? "\n" : "";
     return holdBlock(`\`\`\`\n${table.trim().replace(/[\\`]/g, "\\$&")}\n\`\`\``) + newline;
+  });
+
+  s = s.replace(/^\*\*>\s?([\s\S]*?)\|\|$/gm, (_, content) => {
+    const lines = content.split("\n").map((line) => {
+      const clean = line.replace(/^>\s?/, "");
+      return `>${inlineTelegramMarkdown(clean)}`;
+    });
+    return holdBlock(`**${lines.join("\n")}||`);
   });
 
   const renderLine = (line) => {
@@ -237,6 +252,10 @@ function renderToolPanel(tools, isSettled = false, now = Date.now()) {
   });
   const hidden = tools.length - recent.length;
   const prefix = hidden > 0 ? [`… 之前已完成 ${hidden} 项`] : [];
+  const body = [...prefix, ...recent].join("\n");
+  if (tools.length >= 3 || isSettled) {
+    return `${header}\n${expandableBlockquote(body)}`;
+  }
   return [header, ...prefix, ...recent].join("\n");
 }
 
@@ -324,6 +343,8 @@ function loadConfig() {
     logFile: resolve(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log")),
     approve: file.approve !== false,
     sttCommand: file.sttCommand || "",
+    ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "👀",
+    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "👍",
   };
   config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
   config.downloadsDir = join(config.stateDir, "downloads");
@@ -451,6 +472,24 @@ class Telegram {
 
   async deleteMessage(chatId, messageId) {
     await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, 10_000, 1);
+  }
+
+  async setReaction(chatId, messageId, emojis) {
+    if (!messageId) return null;
+    const list = !emojis ? [] : Array.isArray(emojis) ? emojis : [emojis];
+    const reaction = list.map((e) => (typeof e === "string" ? { type: "emoji", emoji: e } : e));
+    try {
+      return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction }, 5000, 1);
+    } catch (error) {
+      if (reaction.length > 1) {
+        try {
+          return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: [reaction.at(-1)] }, 5000, 1);
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
   }
 
   async poll(handler) {
@@ -660,6 +699,7 @@ class Gateway {
     this.nextDraftId = 0;
     this.spoolOffset = 0;
     this.spoolInitialized = false;
+    this.activeMessageIds = [];
   }
 
   isBusy() {
@@ -791,6 +831,13 @@ class Gateway {
       }
     } catch (error) {
       console.error("Telegram input:", error);
+      if (this.activeMessageIds.length) {
+        const ids = [...this.activeMessageIds];
+        this.activeMessageIds = [];
+        for (const id of ids) {
+          this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]).catch(() => {});
+        }
+      }
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
     }
   }
@@ -813,12 +860,15 @@ class Gateway {
     if (this.pendingUi && !message.text?.startsWith("/")) {
       const pending = this.pendingUi;
       this.pendingUi = null;
+      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await this.telegram.send(this.chatId, "已提交。 ");
+      await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
       return;
     }
 
     if (message.media_group_id) {
+      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       const key = `${this.chatId}:${message.media_group_id}`;
       const group = this.mediaGroups.get(key) || { messages: [], timer: null };
       group.messages.push(message);
@@ -836,15 +886,18 @@ class Gateway {
 
     const media = await this.extractMedia(message);
     if (media) {
+      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       if (message.voice && this.config.sttCommand) {
         try {
           const transcript = await runStt(this.config.sttCommand, media.saved.path);
+          this.activeMessageIds.push(message.message_id);
           await this.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
           return;
         } catch (error) {
           return this.telegram.send(this.chatId, `❌ ${error.message}`);
         }
       }
+      this.activeMessageIds.push(message.message_id);
       await this.prompt(attachmentPrompt(message.caption || `用户发送了${media.label}。`, [media.saved]), media.image ? [media.image] : undefined);
       return;
     }
@@ -855,9 +908,26 @@ class Gateway {
       await this.telegram.send(this.chatId, "⚠️ 如需重启 Gateway，请手动发送 /restart 命令。");
       return;
     }
+
+    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+
     const command = parseCommand(text);
-    if (command) await this.handleCommand(command, text);
-    else await this.prompt(text);
+    if (command) {
+      if (command.name === "followup") {
+        this.activeMessageIds.push(message.message_id);
+      }
+      try {
+        await this.handleCommand(command, text);
+        if (command.name !== "followup") {
+          await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
+        }
+      } catch (error) {
+        throw error;
+      }
+    } else {
+      this.activeMessageIds.push(message.message_id);
+      await this.prompt(text);
+    }
   }
 
   async handleMediaGroup(messages) {
@@ -871,6 +941,7 @@ class Gateway {
       files.push(media.saved);
       if (media.image) images.push(media.image);
     }
+    for (const m of messages) this.activeMessageIds.push(m.message_id);
     if (files.length) {
       await this.prompt(attachmentPrompt(caption || "请查看这组文件。", files), images.length ? images : undefined);
     } else if (caption) {
@@ -1001,6 +1072,9 @@ class Gateway {
         try {
           const res = await this.pi.request("bash", { command: argument });
           const output = res.output ? res.output.trim() : "（命令无输出）";
+          if (output.split("\n").length > 3) {
+            return this.telegram.send(this.chatId, expandableBlockquote(output));
+          }
           return this.telegram.send(this.chatId, output);
         } catch (error) {
           return this.telegram.send(this.chatId, `❌ ${error.message}`);
@@ -1037,6 +1111,13 @@ class Gateway {
         const kept = this.queue;
         this.resetSessionState();
         if (!clear) this.queue = kept;
+        if (this.activeMessageIds.length) {
+          const ids = [...this.activeMessageIds];
+          this.activeMessageIds = [];
+          for (const id of ids) {
+            this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
+          }
+        }
         return this.telegram.send(this.chatId, clear ? "⏹ 已停止，队列已清空" : "⏹ 已停止（排队消息保留，/abort clear 可清空）");
       }
       case "restart": {
@@ -1327,6 +1408,13 @@ class Gateway {
       if (!this.repliedInRun) {
         this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复（可能是上游请求超时）。可使用 /model 切换模型或重试。"));
       }
+      if (this.activeMessageIds.length) {
+        const ids = [...this.activeMessageIds];
+        this.activeMessageIds = [];
+        for (const id of ids) {
+          this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
+        }
+      }
     }
     if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
     if (!this.chatReady) return;
@@ -1531,6 +1619,11 @@ async function selfTest() {
     "• code: `/\\`\\`\\`([^\\\\n]*)\\\\n?([\\\\s\\\\S]*?)\\`\\`\\`/` and `\\`\\`\\`lang`"
   );
   assert.equal(telegramMarkdown("**`code`**"), "*`code`*");
+  assert.equal(expandableBlockquote("line 1\nline 2"), "**>line 1\n>line 2||");
+  assert.equal(
+    telegramMarkdown(expandableBlockquote("line 1\nline 2")),
+    "**>line 1\n>line 2||"
+  );
   assert.ok(formatAssistantError("Codex error: The usage limit has been reached").includes("额度已用尽"));
   assert.ok(formatAssistantError("Rate limit exceeded").includes("速率限制"));
   assert.equal(formatAssistantError("Network failure"), "❌ Network failure");
@@ -1616,6 +1709,35 @@ async function selfTest() {
     ].join("\n")
   );
   console.log("self-test: ok");
+  {
+    const tg = new Telegram("123456:fake-token", "/tmp/fake-offset");
+    const calls = [];
+    tg.call = async (method, body) => {
+      calls.push({ method, body });
+      if (body.reaction?.length > 1 && body.reaction[0].emoji === "fail_multi") {
+        throw new Error("Telegram setMessageReaction: too many reactions");
+      }
+      return true;
+    };
+
+    await tg.setReaction(123, 456, "👀");
+    assert.deepEqual(calls[0], {
+      method: "setMessageReaction",
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }] },
+    });
+
+    await tg.setReaction(123, 456, ["👀", "👍"]);
+    assert.deepEqual(calls[1], {
+      method: "setMessageReaction",
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }, { type: "emoji", emoji: "👍" }] },
+    });
+
+    await tg.setReaction(123, 456, ["fail_multi", "👍"]);
+    assert.deepEqual(calls[3], {
+      method: "setMessageReaction",
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👍" }] },
+    });
+  }
   const tmpLog = join(tmpdir(), `test-remote-pi-rot-${Date.now()}.log`);
   await writeFile(tmpLog, "x".repeat(20));
   await rotateLog(tmpLog, 10);
