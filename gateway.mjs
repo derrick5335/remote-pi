@@ -4,10 +4,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { copyFile, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { copyFile, appendFile, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { StringDecoder } from "node:string_decoder";
+import { createInterface } from "node:readline";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 const MAX_MESSAGE = 1800;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
@@ -32,7 +34,8 @@ const HELP = `Remote Pi
 /clone              克隆当前分支
 /compact [要求]      压缩上下文
 /export             导出 HTML
-/abort              停止当前任务
+/abort              停止当前任务（排队消息保留）
+/abort clear        停止并清空队列
 /restart            重启 Gateway
 /queue [clear]       查看或清空消息队列
 /followup <消息>     追加为排队后续任务`;
@@ -44,7 +47,7 @@ const BOT_COMMANDS = [
   ["resume", "恢复历史会话"], ["new", "新会话"], ["name", "设置会话名"],
   ["session", "Session 和费用"], ["history", "查看历史消息"],
   ["tree", "查看 Session 树"], ["fork", "从历史分支"], ["clone", "克隆当前分支"],
-  ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务"],
+  ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务（保留队列）"],
   ["restart", "重启 Gateway"],
   ["queue", "查看或清空队列"],
   ["followup", "排队追加后续任务"],
@@ -65,6 +68,11 @@ function retryableTelegramStatus(status) {
 
 function telegramSkillName(piName) {
   return `skill_${piName.slice("skill:".length).toLowerCase().replace(/[^a-z0-9_]/g, "_")}`.slice(0, 32);
+}
+
+function telegramCommandName(command) {
+  if (command.source === "skill") return telegramSkillName(command.name);
+  return command.name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
 }
 
 function escapeTelegramMarkdown(text) {
@@ -209,14 +217,8 @@ function assistantText(content) {
 }
 
 function toolSummary(name, args = {}) {
-  if (typeof args?.command === "string") return `${name}: ${args.command}`;
-  if (typeof args?.path === "string") return `${name}: ${args.path}`;
-  if (typeof args?.pattern === "string") return `${name}: ${args.pattern}`;
-  if (typeof args?.query === "string") return `${name}: ${args.query}`;
-  if (Array.isArray(args?.queries) && args.queries.length) return `${name}: ${args.queries.join(", ")}`;
-  if (typeof args?.url === "string") return `${name}: ${args.url}`;
-  const firstVal = Object.values(args || {}).find((v) => typeof v === "string");
-  if (firstVal) return `${name}: ${firstVal}`;
+  const val = args?.command || args?.path || args?.pattern || args?.query || (Array.isArray(args?.queries) && args.queries.join(", ")) || args?.url || Object.values(args || {}).find((v) => typeof v === "string");
+  if (val) return `${name}: ${val}`;
   const json = JSON.stringify(args || {});
   return json && json !== "{}" ? `${name} ${json}` : name;
 }
@@ -253,10 +255,64 @@ function entryText(entry) {
   return "";
 }
 
+function formatContextTokens(count) {
+  if (!count || typeof count !== "number") return "";
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  if (count >= 1_000) return `${Math.round(count / 1_000)}K`;
+  return String(count);
+}
+
+function formatSessionReset({ model, cwd }) {
+  const modelId = model?.id || "unknown";
+  const provider = model?.provider || "unknown";
+  const contextTokens = formatContextTokens(model?.contextWindow);
+  const context = contextTokens ? `${contextTokens} tokens (detected)` : "unknown";
+  const endpoint = model?.baseUrl || "unknown";
+  return [
+    "✨ Session reset! Starting fresh.",
+    "",
+    `◆ Model: ${modelId}`,
+    `◆ Provider: ${provider}`,
+    `◆ Context: ${context}`,
+    `◆ Endpoint: ${endpoint}`,
+    `◆ CWD: ${cwd}`,
+  ].join("\n");
+}
+
+function extensionFromMime(mime = "") {
+  const map = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "video/quicktime": ".mov", "application/pdf": ".pdf" };
+  return map[String(mime).toLowerCase()] || "";
+}
+
+function attachmentPrompt(caption, files) {
+  return `${caption}\n\n附件已保存到本地：\n${files.map((file) => `- ${file.path}`).join("\n")}`;
+}
+
+function previewText(text) {
+  const chars = [...text];
+  return chars.slice(0, MAX_MESSAGE).join("") + (chars.length > MAX_MESSAGE ? "\n\n*(内容较长，输出中…)*" : "");
+}
+
+function runStt(sttCommand, audioPath) {
+  return new Promise((resolveStt, rejectStt) => {
+    const child = spawn("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (chunk) => (out += chunk));
+    child.stderr.on("data", (chunk) => (err += chunk));
+    child.on("error", rejectStt);
+    child.on("close", (code) => {
+      const text = out.trim();
+      if (code === 0 && text) return resolveStt(text);
+      rejectStt(new Error(`语音转写失败 (exit ${code ?? "signal"})：${(err.trim() || text || "无输出").slice(-300)}`));
+    });
+  });
+}
+
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
   let file = {};
-  if (existsSync(path)) file = JSON.parse(requireText(path));
+  if (existsSync(path)) file = JSON.parse(readFileSync(path, "utf8"));
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
@@ -267,18 +323,16 @@ function loadConfig() {
     stateDir: resolve(file.stateDir || join(homedir(), ".local", "var", "remote-pi")),
     logFile: resolve(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log")),
     approve: file.approve !== false,
+    sttCommand: file.sttCommand || "",
   };
   config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
+  config.downloadsDir = join(config.stateDir, "downloads");
+  config.spoolDir = join(config.stateDir, "spool");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
   if (!existsSync(config.cwd)) throw new Error(`Pi working directory does not exist: ${config.cwd}`);
   if (!existsSync(config.devRoot)) throw new Error(`Project directory does not exist: ${config.devRoot}`);
   return config;
-}
-
-function requireText(path) {
-  // Config is tiny and startup is synchronous by design.
-  return readFileSync(path, "utf8");
 }
 
 let rotatingLog = false;
@@ -320,13 +374,13 @@ class Telegram {
       } catch (error) {
         lastError = error;
         if (attempt === maxAttempts - 1) throw error;
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, (attempt + 1) * 1000));
+        await sleep((attempt + 1) * 1000);
         continue;
       }
       if (response.ok && data.ok) return data.result;
       lastError = new Error(`Telegram ${method}: ${data.description || response.status}`);
       if (!retryableTelegramStatus(response.status) || attempt === maxAttempts - 1) throw lastError;
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, (data.parameters?.retry_after || attempt + 1) * 1000));
+      await sleep((data.parameters?.retry_after || attempt + 1) * 1000);
     }
     throw lastError;
   }
@@ -390,11 +444,13 @@ class Telegram {
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
   }
 
-  async download(fileId) {
-    const file = await this.call("getFile", { file_id: fileId });
-    const response = await fetch(`${this.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(60_000) });
-    if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
-    return Buffer.from(await response.arrayBuffer()).toString("base64");
+  async sendDraft(chatId, draftId, text) {
+    // Bot API 9.5+; ephemeral streaming preview, replaced when the final message is sent.
+    await this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text, can_stop: true }, 10_000, 1);
+  }
+
+  async deleteMessage(chatId, messageId) {
+    await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, 10_000, 1);
   }
 
   async poll(handler) {
@@ -402,7 +458,7 @@ class Telegram {
     for (;;) {
       try {
         const updates = await this.call("getUpdates", {
-          offset, timeout: 50, allowed_updates: ["message", "callback_query"],
+          offset, timeout: 50, allowed_updates: ["message", "callback_query", "stopped_message_generation"],
         }, 60_000);
         for (const update of updates) {
           // At-most-once is safer than running a coding instruction twice after a crash.
@@ -415,10 +471,10 @@ class Telegram {
       } catch (error) {
         console.error(new Date().toISOString(), error.message);
         if (error.message?.includes("Conflict")) {
-          await new Promise((resolveDelay) => setTimeout(resolveDelay, 15_000));
+          await sleep(15_000);
           continue;
         }
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 3000));
+        await sleep(3000);
       }
     }
   }
@@ -482,7 +538,9 @@ class PiRpc {
     this.idleStopping = false;
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
-    const env = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
+    const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
+    if (existsSync(extensionPath)) args.push("-e", extensionPath);
+    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", REMOTE_PI_SPOOL: this.config.spoolDir, PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
     this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(process.stderr);
     await new Promise((resolveSpawn, reject) => {
@@ -490,19 +548,8 @@ class PiRpc {
       this.proc.once("error", reject);
     });
 
-    const decoder = new StringDecoder("utf8");
-    let buffer = "";
-    this.proc.stdout.on("data", (chunk) => {
-      buffer += decoder.write(chunk);
-      for (;;) {
-        const newline = buffer.indexOf("\n");
-        if (newline < 0) break;
-        let line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (line) this.handleLine(line);
-      }
-    });
+    createInterface({ input: this.proc.stdout, crlfDelay: Infinity })
+      .on("line", (line) => line && this.handleLine(line));
     this.proc.on("close", (code, signal) => {
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
@@ -609,6 +656,10 @@ class Gateway {
     this.typingTimer = null;
     this.eventChain = Promise.resolve();
     this.telegramChain = Promise.resolve();
+    this.draftSupport = "unknown";
+    this.nextDraftId = 0;
+    this.spoolOffset = 0;
+    this.spoolInitialized = false;
   }
 
   isBusy() {
@@ -622,8 +673,12 @@ class Gateway {
     await Promise.all([
       mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
+      mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
+      mkdir(join(this.config.spoolDir, "answers"), { recursive: true, mode: 0o700 }),
     ]);
     await this.acquireLock();
+    // A stale webhook makes getUpdates return nothing forever.
+    await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
     const me = await this.telegram.call("getMe");
     try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
     catch (error) { if (!error.message.includes("chat not found")) throw error; }
@@ -631,6 +686,11 @@ class Gateway {
     const state = await this.pi.request("get_state");
     await this.registerBotCommands();
     console.log(`${new Date().toISOString()} @${me.username} ready; Pi session ${state.sessionId}`);
+    const eventsPath = join(this.config.spoolDir, "events.jsonl");
+    this.spoolTimer = setInterval(() => {
+      this.consumeSpool(eventsPath).catch((error) => console.error("Extension spool:", error.message));
+    }, 700);
+    this.spoolTimer.unref();
     await this.telegram.poll((update) => this.handleUpdate(update));
   }
 
@@ -645,6 +705,59 @@ class Gateway {
     }
     await writeFile(pidFile, String(process.pid), { mode: 0o600 });
     this.pidFile = pidFile;
+  }
+
+  async consumeSpool(eventsPath) {
+    const buffer = await readFile(eventsPath).catch(() => null);
+    if (!buffer) return;
+    // First successful read: start from the current end so stale events from a previous run aren't replayed.
+    if (!this.spoolInitialized) {
+      this.spoolInitialized = true;
+      this.spoolOffset = buffer.length;
+      return;
+    }
+    if (buffer.length < this.spoolOffset) this.spoolOffset = 0;
+    const chunk = buffer.subarray(this.spoolOffset).toString("utf8");
+    this.spoolOffset = buffer.length;
+    for (const line of chunk.split("\n")) {
+      if (!line.trim()) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      await this.handleSpoolEvent(event);
+    }
+    // ponytail: truncate instead of rotating; offset 0 re-inits to "current end" on the next tick
+    if (buffer.length > 10 * 1024 * 1024) {
+      await truncate(eventsPath).catch(() => {});
+      this.spoolOffset = 0;
+    }
+  }
+
+  async handleSpoolEvent(event) {
+    if (event.type === "attach") {
+      for (const path of event.paths || []) {
+        await this.queueTelegram(async () => {
+          try { await this.telegram.sendDocument(this.chatId, path); }
+          catch (error) { await this.telegram.send(this.chatId, `❌ 附件发送失败 ${basename(path)}: ${error.message}`); }
+        });
+      }
+    } else if (event.type === "ask") {
+      const options = (event.options || []).slice(0, 8);
+      await this.queueTelegram(() => this.telegram.send(this.chatId, event.question, this.keyboard(options.map((option) => ({
+        label: option,
+        action: { type: "ask", askId: event.id, answer: option, question: event.question },
+      })))));
+    }
+  }
+
+  async saveDownload(fileId, name) {
+    const file = await this.telegram.call("getFile", { file_id: fileId });
+    const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
+    if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
+    const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
+    await writeFile(path, buffer);
+    return { path, data: buffer.toString("base64") };
   }
 
   queueEvent(event) {
@@ -672,11 +785,28 @@ class Gateway {
         if (!this.isAllowed(callback.from, callback.message?.chat)) return;
         this.chatReady = true;
         await this.handleCallback(callback);
+      } else if (update.stopped_message_generation) {
+        // User tapped the native stop button on a streaming draft.
+        await this.handleCommand({ name: "abort", argument: "" }, "/abort");
       }
     } catch (error) {
       console.error("Telegram input:", error);
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
     }
+  }
+
+  async extractMedia(m) {
+    if (m.photo?.length) {
+      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`);
+      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "图片" };
+    }
+    const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
+    if (!file) return null;
+    const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
+    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`);
+    const image = file.mime_type?.startsWith("image/") ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
+    const label = m.voice ? "语音消息" : file.file_name ? `文件 ${file.file_name}` : kind;
+    return { file, saved, image, label };
   }
 
   async handleMessage(message) {
@@ -704,39 +834,27 @@ class Gateway {
       return;
     }
 
-    if (message.photo?.length) {
-      const image = message.photo.at(-1);
-      const data = await this.telegram.download(image.file_id);
-      await this.prompt(message.caption || "请查看这张图片。", [{ type: "image", data, mimeType: "image/jpeg" }]);
-      return;
-    }
-
-    if (message.document) {
-      const doc = message.document;
-      const isImage = doc.mime_type?.startsWith("image/");
-      if (isImage) {
-        const data = await this.telegram.download(doc.file_id);
-        await this.prompt(message.caption || "请查看这张图片。", [{ type: "image", data, mimeType: doc.mime_type || "image/jpeg" }]);
-        return;
+    const media = await this.extractMedia(message);
+    if (media) {
+      if (message.voice && this.config.sttCommand) {
+        try {
+          const transcript = await runStt(this.config.sttCommand, media.saved.path);
+          await this.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
+          return;
+        } catch (error) {
+          return this.telegram.send(this.chatId, `❌ ${error.message}`);
+        }
       }
-      if (doc.file_size && doc.file_size > 500 * 1024) {
-        await this.telegram.send(this.chatId, "❌ 文件过大，目前仅支持 500KB 以内的文本/代码文件。");
-        return;
-      }
-      const b64 = await this.telegram.download(doc.file_id);
-      const rawBuf = Buffer.from(b64, "base64");
-      if (rawBuf.includes(0)) {
-        await this.telegram.send(this.chatId, `❌ 不支持二进制文件：${doc.file_name || "file"}`);
-        return;
-      }
-      const text = rawBuf.toString("utf8");
-      const promptText = `[用户上传了文件 ${doc.file_name || "file"}]:\n\`\`\`\n${text}\n\`\`\`${message.caption ? `\n\n${message.caption}` : ""}`;
-      await this.prompt(promptText);
+      await this.prompt(attachmentPrompt(message.caption || `用户发送了${media.label}。`, [media.saved]), media.image ? [media.image] : undefined);
       return;
     }
 
     const text = message.text?.trim();
     if (!text) return;
+    if (/^restart$/i.test(text)) {
+      await this.telegram.send(this.chatId, "⚠️ 如需重启 Gateway，请手动发送 /restart 命令。");
+      return;
+    }
     const command = parseCommand(text);
     if (command) await this.handleCommand(command, text);
     else await this.prompt(text);
@@ -744,20 +862,17 @@ class Gateway {
 
   async handleMediaGroup(messages) {
     const images = [];
+    const files = [];
     let caption = "";
     for (const m of messages) {
       if (m.caption) caption = m.caption;
-      if (m.photo?.length) {
-        const image = m.photo.at(-1);
-        const data = await this.telegram.download(image.file_id);
-        images.push({ type: "image", data, mimeType: "image/jpeg" });
-      } else if (m.document?.mime_type?.startsWith("image/")) {
-        const data = await this.telegram.download(m.document.file_id);
-        images.push({ type: "image", data, mimeType: m.document.mime_type || "image/jpeg" });
-      }
+      const media = await this.extractMedia(m);
+      if (!media) continue;
+      files.push(media.saved);
+      if (media.image) images.push(media.image);
     }
-    if (images.length) {
-      await this.prompt(caption || "请查看这组图片。", images);
+    if (files.length) {
+      await this.prompt(attachmentPrompt(caption || "请查看这组文件。", files), images.length ? images : undefined);
     } else if (caption) {
       await this.prompt(caption);
     }
@@ -790,7 +905,13 @@ class Gateway {
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
     this.toolPanel = null;
-    if (this.draft?.timer) clearTimeout(this.draft.timer);
+    if (this.draft) {
+      if (this.draft.timer) clearTimeout(this.draft.timer);
+      if (this.draft.draftId !== null && this.draftSupport === "supported") {
+        this.telegram.sendDraft(this.chatId, this.draft.draftId, "").catch(() => {});
+      }
+      if (this.draft.messageId) this.telegram.deleteMessage(this.chatId, this.draft.messageId).catch(() => {});
+    }
     this.draft = null;
     this.queue = { steering: [], followUp: [] };
     this.pi?.touch();
@@ -816,7 +937,7 @@ class Gateway {
           throw error;
         }
       }
-      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ 已加入 follow-up 队列");
+      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ 已加入 follow-up 队列", { disable_notification: true });
     } catch (error) {
       this.stopTyping();
       throw error;
@@ -831,11 +952,16 @@ class Gateway {
       case "model": return this.showModels(argument);
       case "thinking": return this.showThinking(argument);
       case "resume": return this.showSessions();
+      case "reset":
       case "new": {
         if (this.isStreaming) await this.pi.request("abort").catch(() => {});
         this.resetSessionState();
         const result = await this.pi.request("new_session");
-        return this.telegram.send(this.chatId, result.cancelled ? "新会话已取消" : "✅ 已创建新会话");
+        if (result.cancelled) {
+          return this.telegram.send(this.chatId, "新会话已取消");
+        }
+        const state = await this.pi.request("get_state").catch(() => null);
+        return this.telegram.send(this.chatId, formatSessionReset({ model: state?.model, cwd: this.config.cwd }));
       }
       case "name": {
         if (!argument) return this.telegram.send(this.chatId, "用法：/name <名称>");
@@ -866,6 +992,9 @@ class Gateway {
       }
       case "sh": case "bash": {
         if (!argument) return this.telegram.send(this.chatId, "用法：/sh <命令>");
+        if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
+          return this.telegram.send(this.chatId, "❌ 禁止在此执行服务重启/停止命令。如需重启 Gateway 请手动发送 /restart。");
+        }
         this.startTyping();
         try {
           const res = await this.pi.request("bash", { command: argument });
@@ -895,15 +1024,18 @@ class Gateway {
         return this.prompt(argument, undefined, "followUp");
       }
       case "abort": {
+        const clear = argument === "clear";
         if (this.pendingUi && this.pi.proc) {
           this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
         }
         if (this.pi.proc) {
-          await this.pi.request("clear_queue").catch(() => {});
+          if (clear) await this.pi.request("clear_queue").catch(() => {});
           await this.pi.request("abort").catch(() => {});
         }
+        const kept = this.queue;
         this.resetSessionState();
-        return this.telegram.send(this.chatId, "⏹ 已停止");
+        if (!clear) this.queue = kept;
+        return this.telegram.send(this.chatId, clear ? "⏹ 已停止，队列已清空" : "⏹ 已停止（排队消息保留，/abort clear 可清空）");
       }
       case "restart": {
         await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
@@ -932,15 +1064,23 @@ class Gateway {
   async registerBotCommands() {
     const data = await this.pi.request("get_commands");
     const commands = [...BOT_COMMANDS];
-    for (const command of data.commands.filter((item) => item.source === "skill")) {
-      const telegramName = telegramSkillName(command.name);
-      if (commands.some((item) => item.command === telegramName)) continue;
+    for (const command of data.commands) {
+      const telegramName = telegramCommandName(command);
+      if (!telegramName || commands.some((item) => item.command === telegramName)) continue;
+      if (!/^[a-z0-9_]{1,32}$/.test(telegramName)) continue;
       commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
       this.commandAliases.set(telegramName, command.name);
-      this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
+      if (command.source === "skill") {
+        this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
+      }
     }
-    await this.telegram.call("setMyCommands", { commands });
-    await this.telegram.call("setMyCommands", { commands, scope: { type: "all_private_chats" } });
+    if (data.commands.some((item) => item.name === "git-commit-push")) {
+      this.commandAliases.set("commit_push", "git-commit-push");
+      this.commandAliases.set("gcp", "git-commit-push");
+    }
+    const finalCommands = commands.slice(0, 100);
+    await this.telegram.call("setMyCommands", { commands: finalCommands });
+    await this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } });
   }
 
   async showCommands() {
@@ -1027,6 +1167,7 @@ class Gateway {
           if (entry.type === "session") header = entry;
           if (entry.type === "session_info" && entry.name) title = entry.name;
           if (!title && entry.type === "message" && entry.message?.role === "user") title = contentText(entry.message.content).slice(0, 60);
+          if (header && title) break;
         }
         if (header?.cwd === this.config.cwd) sessions.push({ path, id: header.id, title: title || name, mtime });
       } catch (error) { console.error(`Skipping session ${path}:`, error.message); }
@@ -1113,6 +1254,9 @@ class Gateway {
         return;
       } else if (action.type === "ui") {
         this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
+      } else if (action.type === "ask") {
+        await writeFile(join(this.config.spoolDir, "answers", `${action.askId}.json`), JSON.stringify({ answer: action.answer }));
+        await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${action.question}\n\n✅ ${action.answer}`).catch(() => {});
       }
       await this.telegram.answer(callback.id, "完成");
     } catch (error) {
@@ -1193,12 +1337,7 @@ class Gateway {
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
-      this.draft = { text: "", messageId: null, timer: null };
-      if (this.toolPanel?.messageId && !this.toolPanel.tools.some((t) => t.status === "running")) {
-        if (this.toolPanel.timer) clearTimeout(this.toolPanel.timer);
-        if (this.toolPanel.heartbeat) clearInterval(this.toolPanel.heartbeat);
-        this.toolPanel = null;
-      }
+      this.draft = { text: "", messageId: null, timer: null, draftId: null };
     }
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
@@ -1294,7 +1433,7 @@ class Gateway {
       if (this.toolPanel.messageId) {
         await this.telegram.edit(this.chatId, this.toolPanel.messageId, text);
       } else {
-        const sent = await this.telegram.sendOne(this.chatId, text);
+        const sent = await this.telegram.sendOne(this.chatId, text, { disable_notification: true });
         if (this.toolPanel) this.toolPanel.messageId = sent.message_id;
       }
     } finally {
@@ -1306,10 +1445,27 @@ class Gateway {
     if (!draft.text || draft.flushing) return;
     draft.flushing = true;
     try {
-      const isOver = draft.text.length > MAX_MESSAGE;
-      const text = [...draft.text].slice(0, MAX_MESSAGE).join("") + (isOver ? "\n\n*(内容较长，输出中…)*" : "");
+      const text = previewText(draft.text);
+      if (this.draftSupport !== "unsupported") {
+        if (draft.draftId === null) draft.draftId = ++this.nextDraftId;
+        try {
+          await this.telegram.sendDraft(this.chatId, draft.draftId, text);
+          this.draftSupport = "supported";
+          return;
+        } catch (error) {
+          const msg = String(error.message || "");
+          if (/not found|unknown method|404/i.test(msg)) {
+            this.draftSupport = "unsupported";
+            console.error("sendMessageDraft unavailable; falling back to send+edit:", error.message);
+          } else {
+            console.error("sendMessageDraft transient error:", error.message);
+            if (this.draftSupport === "supported") return;
+          }
+        }
+      }
+      // Fallback preview: silent real message edited in place; finishDraft deletes it and sends the final answer.
       if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, text, true);
-      else draft.messageId = (await this.telegram.sendOne(this.chatId, text)).message_id;
+      else draft.messageId = (await this.telegram.sendOne(this.chatId, text, { disable_notification: true })).message_id;
     } catch {
     } finally {
       draft.flushing = false;
@@ -1318,9 +1474,12 @@ class Gateway {
 
   async finishDraft(draft) {
     if (!draft.text) return;
-    const parts = chunks(draft.text);
-    if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, parts.shift());
-    for (const part of parts) await this.telegram.sendOne(this.chatId, part);
+    // Dismiss the preview; the final answer is sent fresh so the phone rings once.
+    if (this.draftSupport === "supported" && draft.draftId !== null) {
+      await this.telegram.sendDraft(this.chatId, draft.draftId, "").catch(() => {});
+    }
+    if (draft.messageId) await this.telegram.deleteMessage(this.chatId, draft.messageId).catch(() => {});
+    for (const part of chunks(draft.text)) await this.telegram.sendOne(this.chatId, part);
   }
 
   async handleUiRequest(request) {
@@ -1340,16 +1499,10 @@ class Gateway {
   }
 
   stop() {
-    this.stopTyping();
-    try { if (existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) unlinkSync(this.pidFile); } catch {}
-    for (const group of this.mediaGroups.values()) {
-      if (group.timer) clearTimeout(group.timer);
-    }
-    this.mediaGroups.clear();
+    this.resetSessionState();
     if (this.logTimer) clearInterval(this.logTimer);
-    if (this.draft?.timer) clearTimeout(this.draft.timer);
-    if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
-    if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
+    if (this.spoolTimer) clearInterval(this.spoolTimer);
+    try { unlinkSync(this.pidFile); } catch {}
     this.pi.stop();
   }
 }
@@ -1366,6 +1519,8 @@ async function selfTest() {
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/other"), false);
   assert.equal(telegramSkillName("skill:grill-me"), "skill_grill_me");
   assert.equal(telegramSkillName(`skill:${"a".repeat(40)}`).length, 32);
+  assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");
+  assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
   assert.equal(telegramMarkdown("### Status!\n- **ready** and `a_b`"), "*Status\\!*\n• *ready* and `a_b`");
   assert.equal(telegramMarkdown("```js\na_b();\n```"), "```js\na_b();\n```");
   assert.ok(telegramMarkdown("| A | B |\n|---|---|\n| 1 | 2 |").includes("```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"));
@@ -1404,6 +1559,60 @@ async function selfTest() {
   assert.equal(mockPi.isBusy(), true);
   mockPi.touch();
   assert.equal(mockPi.idleTimer, null);
+  assert.equal(formatContextTokens(1048576), "1.0M");
+  assert.equal(formatContextTokens(128000), "128K");
+  assert.equal(formatContextTokens(8192), "8K");
+  assert.equal(formatContextTokens(500), "500");
+  assert.equal(extensionFromMime("audio/ogg"), ".ogg");
+  assert.equal(extensionFromMime("weird/type"), "");
+  assert.ok(attachmentPrompt("看看", [{ path: "/tmp/a b.txt" }]).includes("- /tmp/a b.txt"));
+  assert.equal(previewText("ab"), "ab");
+  assert.ok(previewText("x".repeat(4000)).endsWith("*(内容较长，输出中…)*"));
+  assert.ok([...previewText("x".repeat(4000))].length <= MAX_MESSAGE + 20);
+  assert.equal(await runStt("printf %s $1", "/tmp/audio.ogg"), "/tmp/audio.ogg");
+  {
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const sent = [];
+    gw.telegram = { send: async (_chat, text) => sent.push(text), sendDocument: async (_chat, path) => sent.push(`doc:${path}`) };
+    const eventsPath = join(tmpdir(), `remote-pi-spool-${Date.now()}.jsonl`);
+    await writeFile(eventsPath, "");
+    await gw.consumeSpool(eventsPath);
+    await appendFile(eventsPath, `${JSON.stringify({ type: "attach", paths: ["/tmp/a.txt"] })}\n${JSON.stringify({ type: "ask", id: "ask-1", question: "选一个", options: ["甲", "乙"] })}\n`);
+    await gw.consumeSpool(eventsPath);
+    await gw.consumeSpool(eventsPath);
+    assert.deepEqual(sent, ["doc:/tmp/a.txt", "选一个"]);
+    await unlink(eventsPath);
+
+    gw.telegram.sendDraft = async () => { throw new Error("fetch failed"); };
+    gw.telegram.sendOne = async () => ({ message_id: 123 });
+    const draft = { text: "hello", flushing: false, draftId: null, messageId: null };
+    await gw.flushDraft(draft);
+    assert.equal(gw.draftSupport, "unknown");
+
+    gw.telegram.sendDraft = async () => { throw new Error("Telegram sendMessageDraft: Not Found"); };
+    await gw.flushDraft(draft);
+    assert.equal(gw.draftSupport, "unsupported");
+  }
+  assert.equal(
+    formatSessionReset({
+      model: {
+        id: "gemini-3.8-flash",
+        provider: "antigravity",
+        contextWindow: 1048576,
+        baseUrl: "http://127.0.0.1:51122/v1",
+      },
+      cwd: "/Users/user/dev/remote-pi",
+    }),
+    [
+      "✨ Session reset! Starting fresh.",
+      "",
+      "◆ Model: gemini-3.8-flash",
+      "◆ Provider: antigravity",
+      "◆ Context: 1.0M tokens (detected)",
+      "◆ Endpoint: http://127.0.0.1:51122/v1",
+      "◆ CWD: /Users/user/dev/remote-pi",
+    ].join("\n")
+  );
   console.log("self-test: ok");
   const tmpLog = join(tmpdir(), `test-remote-pi-rot-${Date.now()}.log`);
   await writeFile(tmpLog, "x".repeat(20));

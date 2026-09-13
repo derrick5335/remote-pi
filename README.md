@@ -35,11 +35,23 @@ Send normal text to prompt Pi. Messages sent while Pi is working become steering
 - `/followup <消息>`（排队追加后续任务，不打断当前轮次）
 - `/model`, `/thinking`
 - `/resume`, `/new`, `/name`, `/session`, `/history`, `/tree`, `/fork`, `/clone`
-- `/compact`, `/export`, `/abort`（清空待办队列并紧急刹车）, `/queue`
+- `/compact`, `/export`, `/abort`（停止当前任务，排队消息保留；`/abort clear` 连队列清空）, `/queue`
 - Extension commands and prompt templates
 - Skills appear in Telegram as `/skill_name`; manual `/skill-name` is also accepted and mapped to Pi's `/skill:name`
 
-Telegram 图片与原图文档均自动转为图片 Prompt，支持直接发送文本/代码文件（`< 500KB`）作为上下文。Agent replies are rendered as safe Telegram MarkdownV2 (headings, lists, quotes, links, inline code, fenced code, bold, italic, and strikethrough), with plain-text fallback for malformed input. Only the configured user in a private chat is accepted.
+Telegram 发送的图片、文件、视频、语音均可作为上下文：文件保存到 `~/.local/var/remote-pi/downloads` 并把路径写进 Prompt，图片同时内联给模型，无大小限制（Telegram Bot API 上限 20MB）。语音消息支持 STT 转写：在 `~/.config/remote-pi/config.json` 配置 `"sttCommand"`（bash 命令，`$1` 为音频文件路径，stdout 即转写文本），例如 Groq Whisper：
+
+```json
+{
+  "sttCommand": "curl -s https://api.groq.com/openai/v1/audio/transcriptions -H 'Authorization: Bearer $GROQ_API_KEY' -F file=@$1 -F model=whisper-large-v3-turbo -F response_format=text"
+}
+```
+
+未配置 `sttCommand` 时语音仅落盘。模型还可主动使用两个 Telegram 工具（由同目录的 `telegram-extension.mjs` 提供，Gateway 自动以 `-e` 加载）：`telegram_attach` 把本地文件作为附件发到聊天（让 Pi 主动交付产物）；`telegram_ask` 用内联按钮向用户提问。Agent replies are rendered as safe Telegram MarkdownV2 (headings, lists, quotes, links, inline code, fenced code, bold, italic, and strikethrough), with plain-text fallback for malformed input. Only the configured user in a private chat is accepted.
+
+## Streaming
+
+助手回复用 Telegram 原生流式草稿（`sendMessageDraft`，聊天中可直接点停止按钮中止生成），API 不支持时自动回退为静音预览消息 + 编辑。工具面板、队列提示等中间消息全部静音（`disable_notification`），只有最终回复会响铃。
 
 ## Service
 
@@ -59,7 +71,7 @@ node gateway.mjs --self-test
 
 ## Power behavior
 
-The LaunchAgent runs `caffeinate -i -- node gateway.mjs`: it prevents idle sleep while leaving lid-close and manual sleep intact. `KeepAlive` starts it at user login, restarts crashes, and restores it after wake; Telegram polling retries stale network connections.
+The LaunchAgent runs `caffeinate -s -i -- node gateway.mjs`: it prevents idle sleep and keeps Dark Wake active while connected to power, while leaving lid-close and manual sleep intact. `KeepAlive` starts it at user login, restarts crashes, and restores it after wake; Telegram polling retries stale network connections.
 
 ## Security
 

@@ -3,6 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LABEL="local.remote-pi"
+
+if [[ "${1:-}" =~ ^(restart|stop|uninstall)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
+    echo "❌ 不能在 Telegram Gateway 会话内重启或停止自身服务（会导致自杀与失联）。" >&2
+    echo "💡 如需重启 Gateway，请在 Telegram 中手动发送 /restart 命令。" >&2
+    exit 1
+fi
+
 DOMAIN="gui/$(id -u)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONFIG_DIR="$HOME/.config/remote-pi"
@@ -54,7 +61,7 @@ EOF
 <dict>
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
-    <array><string>/usr/bin/caffeinate</string><string>-i</string><string>--</string><string>$NODE</string><string>$ROOT/gateway.mjs</string></array>
+    <array><string>/usr/bin/caffeinate</string><string>-s</string><string>-i</string><string>--</string><string>$NODE</string><string>$ROOT/gateway.mjs</string></array>
     <key>WorkingDirectory</key><string>$ROOT</string>
     <key>KeepAlive</key><true/>
     <key>ProcessType</key><string>Background</string>
