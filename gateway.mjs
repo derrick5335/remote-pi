@@ -1,0 +1,1411 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { copyFile, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+
+const MAX_MESSAGE = 1800;
+const MAX_LOG_SIZE = 5 * 1024 * 1024;
+const HELP = `Remote Pi
+
+直接发送文字即可和 Pi 对话；运行中发送的文字会作为 steer。
+
+/help               显示帮助
+/commands           扩展、Prompt 和 Skill 命令
+/cwd                查看或切换 ~/dev 下的项目
+/sh <命令>           直接执行 Shell 命令
+/get <文件路径>      从当前项目下载文件
+/model [关键词|provider/model]
+/thinking [level]
+/resume             选择历史会话
+/new                新会话
+/name <名称>         设置会话名
+/session            当前模型、Session、Token 和费用
+/history [条数]      历史消息，默认 20，最多 50
+/tree               查看 Session 树
+/fork               从历史用户消息创建分支
+/clone              克隆当前分支
+/compact [要求]      压缩上下文
+/export             导出 HTML
+/abort              停止当前任务
+/restart            重启 Gateway
+/queue [clear]       查看或清空消息队列
+/followup <消息>     追加为排队后续任务`;
+
+const BOT_COMMANDS = [
+  ["help", "帮助"], ["commands", "扩展、Prompt 和 Skill 命令"],
+  ["cwd", "查看或切换工作目录"], ["sh", "直接执行 Shell 命令"], ["get", "下载项目文件"],
+  ["model", "查看或切换模型"], ["thinking", "查看或切换思考级别"],
+  ["resume", "恢复历史会话"], ["new", "新会话"], ["name", "设置会话名"],
+  ["session", "Session 和费用"], ["history", "查看历史消息"],
+  ["tree", "查看 Session 树"], ["fork", "从历史分支"], ["clone", "克隆当前分支"],
+  ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务"],
+  ["restart", "重启 Gateway"],
+  ["queue", "查看或清空队列"],
+  ["followup", "排队追加后续任务"],
+].map(([command, description]) => ({ command, description }));
+
+function parseCommand(text) {
+  const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
+  return match ? { name: match[1].toLowerCase(), argument: match[2]?.trim() ?? "" } : null;
+}
+
+function isDirectChild(root, target) {
+  return dirname(target) === root;
+}
+
+function retryableTelegramStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+function telegramSkillName(piName) {
+  return `skill_${piName.slice("skill:".length).toLowerCase().replace(/[^a-z0-9_]/g, "_")}`.slice(0, 32);
+}
+
+function escapeTelegramMarkdown(text) {
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+function inlineTelegramMarkdown(text) {
+  const placeholders = [];
+  const hold = (rendered) => {
+    const key = `\x1a${placeholders.length}\x1a`;
+    placeholders.push(rendered);
+    return key;
+  };
+
+  let s = text.replace(/(?<!`)(`+)([\s\S]+?)(?<!`)\1(?!`)/g, (_, ticks, code) => {
+    let clean = code;
+    if (clean.startsWith(" ") && clean.endsWith(" ") && clean.trim().length > 0) clean = clean.slice(1, -1);
+    return hold(`\`${clean.replace(/[\\`]/g, "\\$&")}\``);
+  });
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_, label, url) => hold(`[${escapeTelegramMarkdown(label)}](${url.replace(/[\\)]/g, "\\$&")})`));
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, content) => hold(`*${escapeTelegramMarkdown(content)}*`));
+  s = s.replace(/~~([^~\n]+)~~/g, (_, content) => hold(`~${escapeTelegramMarkdown(content)}~`));
+  s = s.replace(/(?<!\*)\*([^*\n\s](?:[^*\n]*[^*\n\s])?)\*(?!\*)/g, (_, content) => hold(`_${escapeTelegramMarkdown(content)}_`));
+  s = s.replace(/(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)/g, (_, content) => hold(`_${escapeTelegramMarkdown(content)}_`));
+  s = escapeTelegramMarkdown(s);
+  while (/\x1a(\d+)\x1a/.test(s)) s = s.replace(/\x1a(\d+)\x1a/g, (_, index) => placeholders[Number(index)]);
+  return s;
+}
+
+function formatAssistantError(errorMessage) {
+  const message = String(errorMessage || "模型调用失败");
+  if (/usage limit|quota|balance|credit|insufficient|budget/i.test(message)) {
+    return `⚠️ ${message}\n\n💡 提示：当前模型用量额度已用尽。你可以使用 /model 切换到其他可用模型（例如 Gemini 或 Claude）。`;
+  }
+  if (/rate limit|too many requests|429/i.test(message)) {
+    return `⚠️ ${message}\n\n💡 提示：触发了服务商速率限制，请稍候重试，或使用 /model 切换模型。`;
+  }
+  return `❌ ${message}`;
+}
+
+function formatThinkingStream(thinking, maxLines = 5, isSettled = false) {
+  const header = isSettled ? "💭 思考完成" : "💭 正在思考…";
+  if (!thinking?.trim()) return header;
+  const rawLines = thinking.trimEnd().split("\n");
+  const visualLines = [];
+  for (const raw of rawLines) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    for (let i = 0; i < trimmed.length; i += 75) {
+      visualLines.push(trimmed.slice(i, i + 75));
+    }
+  }
+  if (!visualLines.length) return header;
+  const hasMore = visualLines.length > maxLines;
+  const slice = visualLines.slice(-maxLines);
+  const lines = slice.map((line) => `> ${line}`).join("\n");
+  return hasMore ? `${header}\n\n> …\n${lines}` : `${header}\n\n${lines}`;
+}
+
+function telegramMarkdown(text) {
+  const blocks = [];
+  const holdBlock = (rendered) => {
+    const key = `\x1bBLOCK_${blocks.length}\x1b`;
+    blocks.push(rendered);
+    return key;
+  };
+
+  const fenceRegex = /^[ \t]{0,3}```([^\n]*)\n([\s\S]*?\n)?[ \t]{0,3}```[ \t]*$/gm;
+  let s = text.replace(fenceRegex, (_, info, body) => {
+    const lang = (info || "").trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_+-]/g, "");
+    const code = (body || "").replace(/[\\`]/g, "\\$&").replace(/\n$/, "");
+    return holdBlock(`\`\`\`${lang}\n${code}\n\`\`\``);
+  });
+
+  s = s.replace(/(?:^[ \t]*\|.+?\|[ \t]*$\n?)+/gm, (table) => {
+    if (!/^[ \t]*\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|[ \t]*$/m.test(table)) return table;
+    const newline = table.endsWith("\n") ? "\n" : "";
+    return holdBlock(`\`\`\`\n${table.trim().replace(/[\\`]/g, "\\$&")}\n\`\`\``) + newline;
+  });
+
+  const renderLine = (line) => {
+    if (line.includes("\x1bBLOCK_")) return line;
+    let match = line.match(/^#{1,6}\s+(.+)$/);
+    if (match) return `*${escapeTelegramMarkdown(match[1].trim())}*`;
+    match = line.match(/^(\s*)[-*+]\s+(.+)$/);
+    if (match) return `${match[1]}• ${inlineTelegramMarkdown(match[2])}`;
+    match = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
+    if (match) return `${match[1]}${match[2]}\\. ${inlineTelegramMarkdown(match[3])}`;
+    match = line.match(/^>\s?(.*)$/);
+    if (match) return `>${inlineTelegramMarkdown(match[1])}`;
+    return inlineTelegramMarkdown(line);
+  };
+
+  s = s.split("\n").map(renderLine).join("\n");
+  while (/\x1bBLOCK_(\d+)\x1b/.test(s)) s = s.replace(/\x1bBLOCK_(\d+)\x1b/g, (_, index) => blocks[Number(index)]);
+  return s;
+}
+
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+function scanFence(text) {
+  let open = null;
+  for (const line of text.split("\n")) {
+    const m = FENCE_RE.exec(line);
+    if (m) {
+      if (!open) {
+        if (m[1][0] === "~" || !m[2].includes("`")) open = { marker: m[1], info: m[2].trim() };
+      } else if (m[1][0] === open.marker[0] && m[1].length >= open.marker.length && m[2].trim() === "") {
+        open = null;
+      }
+    }
+  }
+  return open;
+}
+
+function renderChunk(text, from, to) {
+  const slice = text.slice(from, to);
+  const openStart = scanFence(text.slice(0, from));
+  const openEnd = scanFence(text.slice(0, to));
+  const pre = openStart ? `${openStart.marker}${openStart.info}\n` : "";
+  const suf = openEnd ? `${slice.endsWith("\n") ? "" : "\n"}${openEnd.marker}` : "";
+  return pre + slice + suf;
+}
+
+function chunks(text, limit = MAX_MESSAGE) {
+  const str = String(text || "（无内容）");
+  if (str.length <= limit) return [str];
+  const parts = [];
+  let from = 0;
+  while (from < str.length) {
+    if (str.length - from <= limit) {
+      parts.push(renderChunk(str, from, str.length));
+      break;
+    }
+    const target = from + limit;
+    let cut = str.lastIndexOf("\n\n", target);
+    if (cut <= from || cut < target - 500) cut = str.lastIndexOf("\n", target);
+    if (cut <= from) cut = target;
+    parts.push(renderChunk(str, from, cut));
+    from = cut + (str[cut] === "\n" ? 1 : 0);
+  }
+  return parts;
+}
+
+function contentText(content, includeThinking = false) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    if (part.type === "text") return part.text;
+    if (includeThinking && part.type === "thinking") return `💭 ${part.thinking}`;
+    if (part.type === "toolCall") return `🔧 ${part.name} ${JSON.stringify(part.arguments)}`;
+    if (part.type === "image") return "[图片]";
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function assistantText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => (part.type === "text" ? part.text : "")).filter(Boolean).join("\n");
+}
+
+function toolSummary(name, args = {}) {
+  if (typeof args?.command === "string") return `${name}: ${args.command}`;
+  if (typeof args?.path === "string") return `${name}: ${args.path}`;
+  if (typeof args?.pattern === "string") return `${name}: ${args.pattern}`;
+  if (typeof args?.query === "string") return `${name}: ${args.query}`;
+  if (Array.isArray(args?.queries) && args.queries.length) return `${name}: ${args.queries.join(", ")}`;
+  if (typeof args?.url === "string") return `${name}: ${args.url}`;
+  const firstVal = Object.values(args || {}).find((v) => typeof v === "string");
+  if (firstVal) return `${name}: ${firstVal}`;
+  const json = JSON.stringify(args || {});
+  return json && json !== "{}" ? `${name} ${json}` : name;
+}
+
+function renderToolPanel(tools, isSettled = false, now = Date.now()) {
+  if (!tools.length) return "";
+  const total = tools.length;
+  const done = tools.filter((t) => t.status !== "running").length;
+  const header = isSettled ? `🛠 已完成 ${total} 项操作` : `⚙️ 正在执行操作 (${done}/${total})…`;
+  const recent = tools.slice(-6).map((t) => {
+    const icon = t.status === "running" ? "⏳" : t.status === "error" ? "❌" : "✅";
+    const summary = t.summary.length > 80 ? `${t.summary.slice(0, 77)}…` : t.summary;
+    const seconds = t.startedAt ? Math.floor((now - t.startedAt) / 1000) : 0;
+    const elapsed = t.status === "running" && seconds >= 30 ? ` · ${Math.floor(seconds / 60)}m ${seconds % 60}s` : "";
+    return `• ${icon} ${summary}${elapsed}`;
+  });
+  const hidden = tools.length - recent.length;
+  const prefix = hidden > 0 ? [`… 之前已完成 ${hidden} 项`] : [];
+  return [header, ...prefix, ...recent].join("\n");
+}
+
+function entryText(entry) {
+  if (entry.type === "message") {
+    const message = entry.message;
+    const labels = { user: "👤", assistant: "🤖", toolResult: "🔧", bashExecution: "⌨️" };
+    const body = message.role === "bashExecution"
+      ? `${message.command}\n${message.output}`
+      : contentText(message.content);
+    return `${labels[message.role] ?? message.role}: ${body || "（无文本内容）"}`;
+  }
+  if (entry.type === "compaction") return `📦 压缩：${entry.summary}`;
+  if (entry.type === "branch_summary") return `🌿 分支摘要：${entry.summary}`;
+  if (entry.type === "custom_message") return `📎 ${contentText(entry.content)}`;
+  return "";
+}
+
+function loadConfig() {
+  const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
+  let file = {};
+  if (existsSync(path)) file = JSON.parse(requireText(path));
+  const config = {
+    botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
+    allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
+    cwd: resolve(process.env.PI_CWD || file.cwd || process.cwd()),
+    configPath: path,
+    devRoot: join(homedir(), "dev"),
+    piBin: process.env.PI_BIN || file.piBin || "pi",
+    stateDir: resolve(file.stateDir || join(homedir(), ".local", "var", "remote-pi")),
+    logFile: resolve(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log")),
+    approve: file.approve !== false,
+  };
+  config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
+  if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
+  if (!existsSync(config.cwd)) throw new Error(`Pi working directory does not exist: ${config.cwd}`);
+  if (!existsSync(config.devRoot)) throw new Error(`Project directory does not exist: ${config.devRoot}`);
+  return config;
+}
+
+function requireText(path) {
+  // Config is tiny and startup is synchronous by design.
+  return readFileSync(path, "utf8");
+}
+
+let rotatingLog = false;
+async function rotateLog(logFile, maxSize = MAX_LOG_SIZE) {
+  if (!logFile || rotatingLog) return;
+  rotatingLog = true;
+  try {
+    const s = await stat(logFile);
+    if (s.size >= maxSize) {
+      await copyFile(logFile, `${logFile}.1`);
+      await truncate(logFile, 0);
+    }
+  } catch {
+  } finally {
+    rotatingLog = false;
+  }
+}
+
+class Telegram {
+  constructor(token, offsetPath) {
+    this.base = `https://api.telegram.org/bot${token}`;
+    this.fileBase = `https://api.telegram.org/file/bot${token}`;
+    this.offsetPath = offsetPath;
+  }
+
+  async call(method, body = {}, timeout = 35_000, maxAttempts = 3) {
+    let lastError;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let response;
+      let data;
+      try {
+        response = await fetch(`${this.base}/${method}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeout),
+        });
+        data = await response.json();
+      } catch (error) {
+        lastError = error;
+        if (attempt === maxAttempts - 1) throw error;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, (attempt + 1) * 1000));
+        continue;
+      }
+      if (response.ok && data.ok) return data.result;
+      lastError = new Error(`Telegram ${method}: ${data.description || response.status}`);
+      if (!retryableTelegramStatus(response.status) || attempt === maxAttempts - 1) throw lastError;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, (data.parameters?.retry_after || attempt + 1) * 1000));
+    }
+    throw lastError;
+  }
+
+  async sendOne(chatId, text, extra = {}) {
+    const plain = String(text || "（无内容）");
+    try {
+      return await this.call("sendMessage", { chat_id: chatId, text: telegramMarkdown(plain), parse_mode: "MarkdownV2", ...extra });
+    } catch (error) {
+      if (!error.message.includes("can't parse entities")) throw error;
+      console.error("Markdown parse fallback:", error.message);
+      return this.call("sendMessage", { chat_id: chatId, text: plain, ...extra });
+    }
+  }
+
+  async send(chatId, text, extra = {}) {
+    let last;
+    const parts = chunks(text);
+    for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : {});
+    return last;
+  }
+
+  async edit(chatId, messageId, text, ephemeral = false) {
+    const plain = String(text || "（无内容）");
+    const timeout = ephemeral ? 10_000 : 35_000;
+    const maxAttempts = ephemeral ? 1 : 3;
+    try {
+      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramMarkdown(plain), parse_mode: "MarkdownV2" }, timeout, maxAttempts);
+    } catch (error) {
+      if (error.message.includes("can't parse entities")) {
+        console.error("Markdown parse fallback:", error.message);
+        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain }, timeout, maxAttempts);
+      }
+      if (!error.message.includes("message is not modified")) throw error;
+    }
+  }
+
+  answer(callbackQueryId, text = "") {
+    return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch(console.error);
+  }
+
+  async sendChatAction(chatId, action = "typing") {
+    try {
+      await fetch(`${this.base}/sendChatAction`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, action }),
+        signal: AbortSignal.timeout(4_000),
+      });
+    } catch {
+      // Best-effort UI hint
+    }
+  }
+
+  async sendDocument(chatId, path) {
+    const form = new FormData();
+    form.set("chat_id", String(chatId));
+    form.set("document", new Blob([await readFile(path)]), basename(path));
+    const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
+  }
+
+  async download(fileId) {
+    const file = await this.call("getFile", { file_id: fileId });
+    const response = await fetch(`${this.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(60_000) });
+    if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
+    return Buffer.from(await response.arrayBuffer()).toString("base64");
+  }
+
+  async poll(handler) {
+    let offset = Number(await readFile(this.offsetPath, "utf8").catch(() => "0")) || 0;
+    for (;;) {
+      try {
+        const updates = await this.call("getUpdates", {
+          offset, timeout: 50, allowed_updates: ["message", "callback_query"],
+        }, 60_000);
+        for (const update of updates) {
+          // At-most-once is safer than running a coding instruction twice after a crash.
+          offset = update.update_id + 1;
+          const tmp = `${this.offsetPath}.tmp`;
+          await writeFile(tmp, String(offset), { mode: 0o600 });
+          await rename(tmp, this.offsetPath);
+          await handler(update);
+        }
+      } catch (error) {
+        console.error(new Date().toISOString(), error.message);
+        if (error.message?.includes("Conflict")) {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 15_000));
+          continue;
+        }
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 3000));
+      }
+    }
+  }
+}
+
+class PiRpc {
+  constructor(config, onEvent) {
+    this.config = config;
+    this.onEvent = onEvent;
+    this.pending = new Map();
+    this.sequence = 0;
+    this.closing = false;
+  }
+
+  async start() {
+    const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
+    if (this.config.approve) args.push("--approve");
+    const env = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
+    this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    this.proc.stderr.pipe(process.stderr);
+    await new Promise((resolveSpawn, reject) => {
+      this.proc.once("spawn", resolveSpawn);
+      this.proc.once("error", reject);
+    });
+
+    const decoder = new StringDecoder("utf8");
+    let buffer = "";
+    this.proc.stdout.on("data", (chunk) => {
+      buffer += decoder.write(chunk);
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        let line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line) this.handleLine(line);
+      }
+    });
+    this.proc.on("close", (code, signal) => {
+      for (const { reject, timer } of this.pending.values()) {
+        clearTimeout(timer);
+        reject(new Error(`Pi exited (${code ?? signal})`));
+      }
+      this.pending.clear();
+      if (!this.closing) {
+        console.error(`Pi exited (${code ?? signal}); exiting so launchd can restart both.`);
+        process.exitCode = 1;
+        setTimeout(() => process.exit(1), 100);
+      }
+    });
+  }
+
+  handleLine(line) {
+    let value;
+    try { value = JSON.parse(line); }
+    catch { console.error("Invalid Pi RPC line:", line.slice(0, 500)); return; }
+    if (value.type === "response" && value.id && this.pending.has(value.id)) {
+      const pending = this.pending.get(value.id);
+      this.pending.delete(value.id);
+      clearTimeout(pending.timer);
+      value.success ? pending.resolve(value.data) : pending.reject(new Error(value.error || `${value.command} failed`));
+    } else {
+      this.onEvent(value);
+    }
+  }
+
+  request(type, fields = {}, timeout = 600_000) {
+    const id = `tg-${++this.sequence}`;
+    return new Promise((resolveRequest, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Pi RPC ${type} timed out`));
+      }, timeout);
+      this.pending.set(id, { resolve: resolveRequest, reject, timer });
+      this.write({ id, type, ...fields });
+    });
+  }
+
+  write(value) {
+    if (!this.proc?.stdin?.writable) throw new Error("Pi RPC is not running");
+    this.proc.stdin.write(`${JSON.stringify(value)}\n`);
+  }
+
+  async stop() {
+    this.closing = true;
+    if (!this.proc) return;
+    const proc = this.proc;
+    proc.kill("SIGTERM");
+    await new Promise((resolveClose) => {
+      if (proc.killed || proc.exitCode !== null) return resolveClose();
+      proc.once("close", resolveClose);
+      setTimeout(resolveClose, 2000);
+    });
+  }
+}
+
+class Gateway {
+  constructor(config) {
+    this.config = config;
+    this.chatId = config.allowedUserId;
+    this.chatReady = false;
+    this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
+    this.pi = new PiRpc(config, (event) => this.queueEvent(event));
+    this.actions = new Map();
+    this.commandAliases = new Map();
+    this.toolPanel = null;
+    this.thinkingText = "";
+    this.thinkingMessageId = null;
+    this.thinkingTimer = null;
+    this.thinkingInFlight = false;
+    this.mediaGroups = new Map();
+    this.queue = { steering: [], followUp: [] };
+    this.isStreaming = false;
+    this.typingTimer = null;
+    this.eventChain = Promise.resolve();
+    this.telegramChain = Promise.resolve();
+  }
+
+  async start() {
+    await rotateLog(this.config.logFile);
+    this.logTimer = setInterval(() => { rotateLog(this.config.logFile).catch(() => {}); }, 60_000);
+    this.logTimer.unref();
+    await Promise.all([
+      mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
+      mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
+    ]);
+    await this.acquireLock();
+    const me = await this.telegram.call("getMe");
+    try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
+    catch (error) { if (!error.message.includes("chat not found")) throw error; }
+    await this.pi.start();
+    const state = await this.pi.request("get_state");
+    await this.registerBotCommands();
+    console.log(`${new Date().toISOString()} @${me.username} ready; Pi session ${state.sessionId}`);
+    await this.telegram.poll((update) => this.handleUpdate(update));
+  }
+
+  // ponytail: check-then-write 有竞态窗口，防的是人手双开（相隔几秒），不是毫秒级并发
+  async acquireLock() {
+    const pidFile = join(this.config.stateDir, "gateway.pid");
+    const pid = Number(await readFile(pidFile, "utf8").catch(() => 0));
+    if (pid && pid !== process.pid) {
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; } catch {}
+      if (alive) throw new Error(`另一个 gateway 正在运行 (pid ${pid})。先 ./install.sh stop`);
+    }
+    await writeFile(pidFile, String(process.pid), { mode: 0o600 });
+    this.pidFile = pidFile;
+  }
+
+  queueEvent(event) {
+    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error("Pi event:", error));
+  }
+
+  queueTelegram(work) {
+    const next = this.telegramChain.then(work);
+    this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
+    return next;
+  }
+
+  isAllowed(from, chat) {
+    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
+  }
+
+  async handleUpdate(update) {
+    try {
+      if (update.message) {
+        if (!this.isAllowed(update.message.from, update.message.chat)) return;
+        this.chatReady = true;
+        await this.handleMessage(update.message);
+      } else if (update.callback_query) {
+        const callback = update.callback_query;
+        if (!this.isAllowed(callback.from, callback.message?.chat)) return;
+        this.chatReady = true;
+        await this.handleCallback(callback);
+      }
+    } catch (error) {
+      console.error("Telegram input:", error);
+      await this.telegram.send(this.chatId, `❌ ${error.message}`);
+    }
+  }
+
+  async handleMessage(message) {
+    if (this.pendingUi && !message.text?.startsWith("/")) {
+      const pending = this.pendingUi;
+      this.pendingUi = null;
+      this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
+      await this.telegram.send(this.chatId, "已提交。 ");
+      return;
+    }
+
+    if (message.media_group_id) {
+      const key = `${this.chatId}:${message.media_group_id}`;
+      const group = this.mediaGroups.get(key) || { messages: [], timer: null };
+      group.messages.push(message);
+      if (group.timer) clearTimeout(group.timer);
+      group.timer = setTimeout(async () => {
+        this.mediaGroups.delete(key);
+        await this.handleMediaGroup(group.messages).catch((err) => {
+          console.error("Media group error:", err);
+          this.telegram.send(this.chatId, `❌ 处理图片组失败: ${err.message}`);
+        });
+      }, 1200);
+      this.mediaGroups.set(key, group);
+      return;
+    }
+
+    if (message.photo?.length) {
+      const image = message.photo.at(-1);
+      const data = await this.telegram.download(image.file_id);
+      await this.prompt(message.caption || "请查看这张图片。", [{ type: "image", data, mimeType: "image/jpeg" }]);
+      return;
+    }
+
+    if (message.document) {
+      const doc = message.document;
+      const isImage = doc.mime_type?.startsWith("image/");
+      if (isImage) {
+        const data = await this.telegram.download(doc.file_id);
+        await this.prompt(message.caption || "请查看这张图片。", [{ type: "image", data, mimeType: doc.mime_type || "image/jpeg" }]);
+        return;
+      }
+      if (doc.file_size && doc.file_size > 500 * 1024) {
+        await this.telegram.send(this.chatId, "❌ 文件过大，目前仅支持 500KB 以内的文本/代码文件。");
+        return;
+      }
+      const b64 = await this.telegram.download(doc.file_id);
+      const rawBuf = Buffer.from(b64, "base64");
+      if (rawBuf.includes(0)) {
+        await this.telegram.send(this.chatId, `❌ 不支持二进制文件：${doc.file_name || "file"}`);
+        return;
+      }
+      const text = rawBuf.toString("utf8");
+      const promptText = `[用户上传了文件 ${doc.file_name || "file"}]:\n\`\`\`\n${text}\n\`\`\`${message.caption ? `\n\n${message.caption}` : ""}`;
+      await this.prompt(promptText);
+      return;
+    }
+
+    const text = message.text?.trim();
+    if (!text) return;
+    const command = parseCommand(text);
+    if (command) await this.handleCommand(command, text);
+    else await this.prompt(text);
+  }
+
+  async handleMediaGroup(messages) {
+    const images = [];
+    let caption = "";
+    for (const m of messages) {
+      if (m.caption) caption = m.caption;
+      if (m.photo?.length) {
+        const image = m.photo.at(-1);
+        const data = await this.telegram.download(image.file_id);
+        images.push({ type: "image", data, mimeType: "image/jpeg" });
+      } else if (m.document?.mime_type?.startsWith("image/")) {
+        const data = await this.telegram.download(m.document.file_id);
+        images.push({ type: "image", data, mimeType: m.document.mime_type || "image/jpeg" });
+      }
+    }
+    if (images.length) {
+      await this.prompt(caption || "请查看这组图片。", images);
+    } else if (caption) {
+      await this.prompt(caption);
+    }
+  }
+
+  startTyping() {
+    if (this.typingTimer) return;
+    this.telegram.sendChatAction(this.chatId, "typing");
+    this.typingTimer = setInterval(() => {
+      this.telegram.sendChatAction(this.chatId, "typing");
+    }, 4500);
+    this.typingTimer.unref();
+  }
+
+  stopTyping() {
+    if (this.typingTimer) {
+      clearInterval(this.typingTimer);
+      this.typingTimer = null;
+    }
+  }
+
+  resetSessionState() {
+    this.isStreaming = false;
+    this.stopTyping();
+    this.pendingUi = null;
+    this.thinkingText = "";
+    this.thinkingMessageId = null;
+    this.thinkingInFlight = false;
+    for (const group of this.mediaGroups.values()) {
+      if (group.timer) clearTimeout(group.timer);
+    }
+    this.mediaGroups.clear();
+    if (this.thinkingTimer) {
+      clearTimeout(this.thinkingTimer);
+      this.thinkingTimer = null;
+    }
+    if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
+    if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
+    this.toolPanel = null;
+    if (this.draft?.timer) clearTimeout(this.draft.timer);
+    this.draft = null;
+    this.queue = { steering: [], followUp: [] };
+  }
+
+  async prompt(message, images, streamingBehavior) {
+    this.startTyping();
+    try {
+      const state = await this.pi.request("get_state").catch(() => null);
+      if (state) this.isStreaming = state.isStreaming;
+      const fields = { message };
+      if (images) fields.images = images;
+      const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
+      if (behavior) fields.streamingBehavior = behavior;
+      try {
+        await this.pi.request("prompt", fields);
+      } catch (error) {
+        if (!behavior && /streaming/i.test(error.message)) {
+          fields.streamingBehavior = "steer";
+          await this.pi.request("prompt", fields);
+          this.isStreaming = true;
+        } else {
+          throw error;
+        }
+      }
+      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ 已加入 follow-up 队列");
+    } catch (error) {
+      this.stopTyping();
+      throw error;
+    }
+  }
+
+  async handleCommand({ name, argument }, original) {
+    switch (name) {
+      case "start": case "help": return this.telegram.send(this.chatId, HELP);
+      case "commands": return this.showCommands();
+      case "cwd": return this.showCwds();
+      case "model": return this.showModels(argument);
+      case "thinking": return this.showThinking(argument);
+      case "resume": return this.showSessions();
+      case "new": {
+        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+        this.resetSessionState();
+        const result = await this.pi.request("new_session");
+        return this.telegram.send(this.chatId, result.cancelled ? "新会话已取消" : "✅ 已创建新会话");
+      }
+      case "name": {
+        if (!argument) return this.telegram.send(this.chatId, "用法：/name <名称>");
+        await this.pi.request("set_session_name", { name: argument });
+        return this.telegram.send(this.chatId, `✅ 会话名：${argument}`);
+      }
+      case "session": case "status": return this.showSession();
+      case "history": return this.showHistory(argument);
+      case "tree": return this.showTree();
+      case "fork": return this.showForks();
+      case "clone": {
+        const result = await this.pi.request("clone");
+        return this.telegram.send(this.chatId, result.cancelled ? "克隆已取消" : "✅ 已克隆当前分支");
+      }
+      case "compact": {
+        this.startTyping();
+        try {
+          const result = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
+          return this.telegram.send(this.chatId, `✅ 已压缩：${result.tokensBefore} → 约 ${result.estimatedTokensAfter} tokens`);
+        } finally {
+          this.stopTyping();
+        }
+      }
+      case "export": {
+        const result = await this.pi.request("export_html");
+        await this.telegram.sendDocument(this.chatId, result.path);
+        return;
+      }
+      case "sh": case "bash": {
+        if (!argument) return this.telegram.send(this.chatId, "用法：/sh <命令>");
+        this.startTyping();
+        try {
+          const res = await this.pi.request("bash", { command: argument });
+          const output = res.output ? res.output.trim() : "（命令无输出）";
+          return this.telegram.send(this.chatId, output);
+        } catch (error) {
+          return this.telegram.send(this.chatId, `❌ ${error.message}`);
+        } finally {
+          this.stopTyping();
+        }
+      }
+      case "get": {
+        if (!argument) return this.telegram.send(this.chatId, "用法：/get <相对路径>");
+        const filePath = resolve(this.config.cwd, argument);
+        try {
+          const s = await stat(filePath);
+          if (!s.isFile()) return this.telegram.send(this.chatId, "❌ 指定路径不是普通文件");
+          if (s.size > 20 * 1024 * 1024) return this.telegram.send(this.chatId, "❌ 文件超过 20MB 限制");
+          await this.telegram.sendDocument(this.chatId, filePath);
+        } catch (error) {
+          return this.telegram.send(this.chatId, `❌ 文件不存在或无法访问: ${error.message}`);
+        }
+        return;
+      }
+      case "followup": {
+        if (!argument) return this.telegram.send(this.chatId, "用法：/followup <消息>");
+        return this.prompt(argument, undefined, "followUp");
+      }
+      case "abort": {
+        if (this.pendingUi) {
+          this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
+        }
+        await this.pi.request("clear_queue").catch(() => {});
+        await this.pi.request("abort").catch(() => {});
+        this.resetSessionState();
+        return this.telegram.send(this.chatId, "⏹ 已停止");
+      }
+      case "restart": {
+        await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
+        this.pi.stop();
+        setTimeout(() => process.exit(0), 100);
+        return;
+      }
+      case "queue": {
+        if (argument === "clear") {
+          const removed = await this.pi.request("clear_queue");
+          this.queue = { steering: [], followUp: [] };
+          return this.telegram.send(this.chatId, `已清空\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
+        }
+        return this.telegram.send(this.chatId, `steering:\n${this.queue.steering.join("\n") || "（空）"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "（空）"}`);
+      }
+      default: {
+        const alias = this.commandAliases.get(name);
+        if (alias) return this.prompt(`/${alias}${argument ? ` ${argument}` : ""}`);
+        const commands = await this.pi.request("get_commands");
+        if (commands.commands.some((item) => item.name.toLowerCase() === name)) return this.prompt(original);
+        return this.telegram.send(this.chatId, `未知命令：/${name}\n使用 /help 或 /commands`);
+      }
+    }
+  }
+
+  async registerBotCommands() {
+    const data = await this.pi.request("get_commands");
+    const commands = [...BOT_COMMANDS];
+    for (const command of data.commands.filter((item) => item.source === "skill")) {
+      const telegramName = telegramSkillName(command.name);
+      if (commands.some((item) => item.command === telegramName)) continue;
+      commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
+      this.commandAliases.set(telegramName, command.name);
+      this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
+    }
+    await this.telegram.call("setMyCommands", { commands });
+    await this.telegram.call("setMyCommands", { commands, scope: { type: "all_private_chats" } });
+  }
+
+  async showCommands() {
+    const data = await this.pi.request("get_commands");
+    const text = data.commands.length
+      ? data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n")
+      : "没有加载扩展命令、Prompt Template 或 Skill。";
+    await this.telegram.send(this.chatId, text);
+  }
+
+  async showCwds() {
+    const projects = (await readdir(this.config.devRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择 ~/dev 下的项目：`, this.keyboard(projects.map((entry) => ({
+      label: `${join(this.config.devRoot, entry.name) === this.config.cwd ? "●" : "○"} ${entry.name}`,
+      action: { type: "cwd", path: join(this.config.devRoot, entry.name) },
+    }))));
+  }
+
+  action(payload) {
+    const now = Date.now();
+    for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
+    const token = randomBytes(6).toString("base64url");
+    this.actions.set(token, { ...payload, expires: now + 10 * 60_000 });
+    return `a:${token}`;
+  }
+
+  keyboard(items) {
+    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } };
+  }
+
+  async showModels(query) {
+    const data = await this.pi.request("get_available_models");
+    const models = data.models;
+    if (query) {
+      const exact = models.find((model) => `${model.provider}/${model.id}` === query || model.id === query);
+      if (exact) {
+        await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
+        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}`);
+      }
+    }
+    const filtered = models.filter((model) => !query || `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query.toLowerCase()));
+    if (!filtered.length) return this.telegram.send(this.chatId, `没有匹配模型：${query}`);
+    const display = filtered.slice(0, 18);
+    const suffix = filtered.length > 18 ? `\n\n（共 ${filtered.length} 个模型，仅显示前 18 个，可用 /model 关键词 过滤）` : "";
+    return this.telegram.send(this.chatId, `选择模型：${suffix}`, this.keyboard(display.map((model) => ({
+      label: `${model.provider}/${model.id}`,
+      action: { type: "model", provider: model.provider, modelId: model.id },
+    }))));
+  }
+
+  async showThinking(argument) {
+    const data = await this.pi.request("get_available_thinking_levels");
+    if (argument) {
+      if (!data.levels.includes(argument)) return this.telegram.send(this.chatId, `可用级别：${data.levels.join(", ")}`);
+      await this.pi.request("set_thinking_level", { level: argument });
+      return this.telegram.send(this.chatId, `✅ thinking: ${argument}`);
+    }
+    return this.telegram.send(this.chatId, "选择 thinking level：", this.keyboard(data.levels.map((level) => ({
+      label: level, action: { type: "thinking", level },
+    }))));
+  }
+
+  async sessionFiles() {
+    if (!existsSync(this.config.sessionDir)) return [];
+    const names = (await readdir(this.config.sessionDir)).filter((name) => name.endsWith(".jsonl"));
+    const files = await Promise.all(names.map(async (name) => {
+      const path = join(this.config.sessionDir, name);
+      const info = await stat(path).catch(() => null);
+      return info ? { path, name, mtime: info.mtimeMs } : null;
+    }));
+    const sorted = files.filter(Boolean).sort((a, b) => b.mtime - a.mtime).slice(0, 15);
+    const sessions = [];
+    for (const { path, name, mtime } of sorted) {
+      try {
+        const raw = await readFile(path, "utf8");
+        let header;
+        let title = "";
+        for (const line of raw.split("\n")) {
+          if (!line) continue;
+          let entry;
+          try { entry = JSON.parse(line); } catch { continue; }
+          if (entry.type === "session") header = entry;
+          if (entry.type === "session_info" && entry.name) title = entry.name;
+          if (!title && entry.type === "message" && entry.message?.role === "user") title = contentText(entry.message.content).slice(0, 60);
+        }
+        if (header?.cwd === this.config.cwd) sessions.push({ path, id: header.id, title: title || name, mtime });
+      } catch (error) { console.error(`Skipping session ${path}:`, error.message); }
+    }
+    return sessions;
+  }
+
+  async showSessions() {
+    const sessions = (await this.sessionFiles()).slice(0, 12);
+    if (!sessions.length) return this.telegram.send(this.chatId, "当前目录还没有历史 Session。 ");
+    return this.telegram.send(this.chatId, "选择 Session：", this.keyboard(sessions.map((session) => ({
+      label: session.title,
+      action: { type: "resume", path: session.path },
+    }))));
+  }
+
+  async showSession() {
+    const [state, stats] = await Promise.all([this.pi.request("get_state"), this.pi.request("get_session_stats")]);
+    const model = state.model ? `${state.model.provider}/${state.model.id}` : "未选择";
+    const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "暂无";
+    await this.telegram.send(this.chatId, [
+      `名称：${state.sessionName || "（未命名）"}`, `模型：${model}`, `Thinking：${state.thinkingLevel}`,
+      `状态：${state.isStreaming ? "working" : "idle"}`, `消息：${stats.totalMessages}`, `上下文：${context}`,
+      `费用：$${Number(stats.cost || 0).toFixed(4)}`, `Session：${state.sessionId}`, `文件：${state.sessionFile || "未持久化"}`,
+    ].join("\n"));
+  }
+
+  async showHistory(argument) {
+    const count = Math.min(Math.max(Number(argument) || 20, 1), 50);
+    const data = await this.pi.request("get_entries");
+    const formatted = data.entries.map(entryText).filter(Boolean).slice(-count);
+    await this.telegram.send(this.chatId, formatted.join("\n\n") || "暂无历史消息。 ");
+  }
+
+  async showTree() {
+    const data = await this.pi.request("get_tree");
+    const lines = [];
+    const visit = (node, depth) => {
+      if (lines.length >= 80) return;
+      const entry = node.entry;
+      const summary = entryText(entry).replaceAll("\n", " ").slice(0, 100) || entry.type;
+      lines.push(`${"  ".repeat(depth)}${entry.id === data.leafId ? "●" : "○"} ${entry.id} ${summary}`);
+      for (const child of node.children || []) visit(child, depth + 1);
+    };
+    for (const root of data.tree) visit(root, 0);
+    if (lines.length >= 80) lines.push("…仅显示前 80 个节点");
+    await this.telegram.send(this.chatId, lines.join("\n") || "Session 树为空。 ");
+  }
+
+  async showForks() {
+    const data = await this.pi.request("get_fork_messages");
+    const messages = data.messages.slice(-12).reverse();
+    if (!messages.length) return this.telegram.send(this.chatId, "没有可分支的用户消息。 ");
+    return this.telegram.send(this.chatId, "从哪条消息创建分支？", this.keyboard(messages.map((message) => ({
+      label: message.text.replaceAll("\n", " ").slice(0, 60),
+      action: { type: "fork", entryId: message.entryId },
+    }))));
+  }
+
+  async handleCallback(callback) {
+    const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
+    const action = this.actions.get(token);
+    this.actions.delete(token);
+    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "操作已过期");
+    try {
+      if (action.type === "model") {
+        await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
+        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
+      } else if (action.type === "thinking") {
+        await this.pi.request("set_thinking_level", { level: action.level });
+        await this.telegram.send(this.chatId, `✅ thinking: ${action.level}`);
+      } else if (action.type === "resume") {
+        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+        this.resetSessionState();
+        const result = await this.pi.request("switch_session", { sessionPath: action.path });
+        await this.telegram.send(this.chatId, result.cancelled ? "恢复已取消" : "✅ 已恢复 Session");
+      } else if (action.type === "fork") {
+        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+        this.resetSessionState();
+        const result = await this.pi.request("fork", { entryId: action.entryId });
+        await this.telegram.send(this.chatId, result.cancelled ? "分支已取消" : `✅ 已从「${result.text.slice(0, 80)}」创建分支`);
+      } else if (action.type === "cwd") {
+        await this.switchCwd(action.path, callback.id);
+        return;
+      } else if (action.type === "ui") {
+        this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
+      }
+      await this.telegram.answer(callback.id, "完成");
+    } catch (error) {
+      await this.telegram.answer(callback.id, "失败");
+      await this.telegram.send(this.chatId, `❌ ${error.message}`);
+    }
+  }
+
+  async switchCwd(path, callbackId) {
+    const [root, target] = await Promise.all([realpath(this.config.devRoot), realpath(path)]);
+    if (!isDirectChild(root, target) || !(await stat(target)).isDirectory()) throw new Error("只能切换到 ~/dev 的一级子目录");
+    if (target === this.config.cwd) {
+      await this.telegram.answer(callbackId, "已经在此目录");
+      return;
+    }
+
+    const config = JSON.parse(await readFile(this.config.configPath, "utf8"));
+    config.cwd = target;
+    const temporary = `${this.config.configPath}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, this.config.configPath);
+    await this.telegram.answer(callbackId, "正在切换");
+    await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
+    await this.pi.stop();
+    this.config.cwd = target;
+    this.config.sessionDir = join(this.config.stateDir, "sessions", target.replace(/^\//, "").replaceAll("/", "-"));
+    await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
+    this.resetSessionState();
+    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event));
+    await this.pi.start();
+    await this.registerBotCommands();
+    const state = await this.pi.request("get_state");
+    await this.telegram.send(this.chatId, `✅ Pi 已就绪；Session: ${state.sessionId}`);
+  }
+
+  async handleEvent(event) {
+    if (event.type === "agent_start") {
+      this.isStreaming = true;
+      this.pendingUi = null;
+      this.repliedInRun = false;
+      this.startTyping();
+      this.thinkingText = "";
+      this.thinkingMessageId = null;
+      if (this.thinkingTimer) {
+        clearTimeout(this.thinkingTimer);
+        this.thinkingTimer = null;
+      }
+      if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
+      if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
+      this.toolPanel = null;
+    }
+    if (event.type === "agent_settled") {
+      this.isStreaming = false;
+      this.pendingUi = null;
+      this.stopTyping();
+      if (this.thinkingTimer) {
+        clearTimeout(this.thinkingTimer);
+        this.thinkingTimer = null;
+      }
+      if (this.thinkingText && this.thinkingMessageId) {
+        this.queueTelegram(() => this.flushThinkingBox(true));
+      }
+      if (this.toolPanel && this.toolPanel.tools.length) {
+        if (this.toolPanel.heartbeat) clearInterval(this.toolPanel.heartbeat);
+        for (const tool of this.toolPanel.tools) {
+          if (tool.status === "running") tool.status = "done";
+        }
+        this.scheduleToolPanelUpdate(true, true);
+      }
+      if (this.draft?.text) {
+        this.repliedInRun = true;
+        const draft = this.draft;
+        this.draft = null;
+        if (draft.timer) clearTimeout(draft.timer);
+        this.queueTelegram(() => this.finishDraft(draft));
+      }
+      if (!this.repliedInRun) {
+        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复（可能是上游请求超时）。可使用 /model 切换模型或重试。"));
+      }
+    }
+    if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
+    if (!this.chatReady) return;
+
+    if (event.type === "auto_retry_start") {
+      await this.telegram.send(this.chatId, `⏳ 模型响应异常，正在自动重试 (${event.attempt}/${event.maxAttempts})…`);
+    }
+    if (event.type === "compaction_end" && event.errorMessage) {
+      await this.telegram.send(this.chatId, `⚠️ 上下文压缩失败: ${event.errorMessage}`);
+    }
+
+    if (event.type === "message_start" && event.message?.role === "assistant") {
+      this.draft = { text: "", messageId: null, timer: null };
+      if (this.toolPanel?.messageId && !this.toolPanel.tools.some((t) => t.status === "running")) {
+        if (this.toolPanel.timer) clearTimeout(this.toolPanel.timer);
+        if (this.toolPanel.heartbeat) clearInterval(this.toolPanel.heartbeat);
+        this.toolPanel = null;
+      }
+    }
+    if (event.type === "message_update") {
+      const update = event.assistantMessageEvent;
+      if (update?.type === "text_delta" && this.draft) {
+        this.draft.text += update.delta;
+        if (!this.draft.timer) {
+          const draft = this.draft;
+          draft.timer = setTimeout(() => {
+            draft.timer = null;
+            this.queueTelegram(() => this.flushDraft(draft));
+          }, 1200);
+        }
+      } else if (update?.type === "thinking_delta" || update?.type === "thinking_start") {
+        if (update?.delta) {
+          this.thinkingText = (this.thinkingText || "") + update.delta;
+          this.scheduleThinkingUpdate();
+        }
+      }
+    }
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      const draft = this.draft || { text: "", messageId: null, timer: null };
+      this.draft = null;
+      if (draft.timer) clearTimeout(draft.timer);
+      const content = assistantText(event.message.content);
+      if (content) draft.text = content;
+      if (event.message.stopReason === "error" || event.message.errorMessage) {
+        const errText = formatAssistantError(event.message.errorMessage);
+        draft.text = draft.text ? `${draft.text}\n\n${errText}` : errText;
+      }
+      if (draft.text) {
+        this.repliedInRun = true;
+        this.queueTelegram(() => this.finishDraft(draft));
+      }
+    }
+
+    if (event.type === "tool_execution_start") {
+      if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, heartbeat: null, sending: false };
+      this.toolPanel.tools.push({
+        id: event.toolCallId,
+        summary: toolSummary(event.toolName, event.args),
+        status: "running",
+        startedAt: Date.now(),
+      });
+      if (!this.toolPanel.heartbeat) {
+        const panel = this.toolPanel;
+        panel.heartbeat = setInterval(() => {
+          if (this.toolPanel === panel) this.queueTelegram(() => this.flushToolPanel(false));
+        }, 30_000);
+        panel.heartbeat.unref();
+      }
+      this.scheduleToolPanelUpdate(false, false);
+    }
+    if (event.type === "tool_execution_end") {
+      if (this.toolPanel) {
+        const tool = this.toolPanel.tools.find((item) => item.id === event.toolCallId);
+        if (tool) tool.status = event.isError ? "error" : "done";
+        if (!this.toolPanel.tools.some((item) => item.status === "running") && this.toolPanel.heartbeat) {
+          clearInterval(this.toolPanel.heartbeat);
+          this.toolPanel.heartbeat = null;
+        }
+        this.scheduleToolPanelUpdate(false, false);
+      }
+    }
+    if (event.type === "extension_ui_request") await this.handleUiRequest(event);
+    if (event.type === "extension_error") await this.telegram.send(this.chatId, `❌ Extension ${event.extensionPath}: ${event.error}`);
+  }
+
+  scheduleThinkingUpdate() {
+    if (this.thinkingTimer) return;
+    this.thinkingTimer = setTimeout(() => {
+      this.thinkingTimer = null;
+      this.queueTelegram(() => this.flushThinkingBox());
+    }, 1200);
+  }
+
+  async flushThinkingBox(isSettled = false) {
+    if (!this.thinkingText || this.thinkingFlushing) return;
+    this.thinkingFlushing = true;
+    try {
+      const text = formatThinkingStream(this.thinkingText, 5, isSettled);
+      if (!text) return;
+      if (this.thinkingMessageId) {
+        await this.telegram.edit(this.chatId, this.thinkingMessageId, text, !isSettled);
+      } else {
+        const sent = await this.telegram.sendOne(this.chatId, text);
+        this.thinkingMessageId = sent.message_id;
+      }
+    } catch (error) {
+      console.error("Thinking update error:", error.message);
+    } finally {
+      this.thinkingFlushing = false;
+    }
+  }
+
+  scheduleToolPanelUpdate(force = false, isSettled = false) {
+    if (!this.toolPanel) return;
+    if (force) {
+      if (this.toolPanel.timer) {
+        clearTimeout(this.toolPanel.timer);
+        this.toolPanel.timer = null;
+      }
+      this.queueTelegram(() => this.flushToolPanel(isSettled));
+      return;
+    }
+    if (!this.toolPanel.messageId && !this.toolPanel.sending) {
+      this.toolPanel.sending = true;
+      this.queueTelegram(() => this.flushToolPanel(false));
+      return;
+    }
+    if (!this.toolPanel.timer) {
+      this.toolPanel.timer = setTimeout(() => {
+        if (this.toolPanel) {
+          this.toolPanel.timer = null;
+          this.queueTelegram(() => this.flushToolPanel(false));
+        }
+      }, 1200);
+    }
+  }
+
+  async flushToolPanel(isSettled = false) {
+    if (!this.toolPanel || !this.toolPanel.tools.length) return;
+    const text = renderToolPanel(this.toolPanel.tools, isSettled);
+    if (!text) return;
+    try {
+      if (this.toolPanel.messageId) {
+        await this.telegram.edit(this.chatId, this.toolPanel.messageId, text);
+      } else {
+        const sent = await this.telegram.sendOne(this.chatId, text);
+        if (this.toolPanel) this.toolPanel.messageId = sent.message_id;
+      }
+    } finally {
+      if (this.toolPanel) this.toolPanel.sending = false;
+    }
+  }
+
+  async flushDraft(draft) {
+    if (!draft.text || draft.flushing) return;
+    draft.flushing = true;
+    try {
+      const isOver = draft.text.length > MAX_MESSAGE;
+      const text = [...draft.text].slice(0, MAX_MESSAGE).join("") + (isOver ? "\n\n*(内容较长，输出中…)*" : "");
+      if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, text, true);
+      else draft.messageId = (await this.telegram.sendOne(this.chatId, text)).message_id;
+    } catch {
+    } finally {
+      draft.flushing = false;
+    }
+  }
+
+  async finishDraft(draft) {
+    if (!draft.text) return;
+    const parts = chunks(draft.text);
+    if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, parts.shift());
+    for (const part of parts) await this.telegram.sendOne(this.chatId, part);
+  }
+
+  async handleUiRequest(request) {
+    if (["select", "confirm"].includes(request.method)) {
+      const options = request.method === "confirm" ? [
+        { label: "确认", response: { confirmed: true } }, { label: "取消", response: { confirmed: false } },
+      ] : request.options.map((value) => ({ label: value, response: { value } }));
+      await this.telegram.send(this.chatId, [request.title, request.message].filter(Boolean).join("\n"), this.keyboard(options.map((option) => ({
+        label: option.label, action: { type: "ui", requestId: request.id, response: option.response },
+      }))));
+    } else if (["input", "editor"].includes(request.method)) {
+      this.pendingUi = request;
+      await this.telegram.send(this.chatId, [request.title, request.placeholder || request.prefill].filter(Boolean).join("\n"));
+    } else if (request.method === "notify") {
+      await this.telegram.send(this.chatId, request.message);
+    }
+  }
+
+  stop() {
+    this.stopTyping();
+    try { if (existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) unlinkSync(this.pidFile); } catch {}
+    for (const group of this.mediaGroups.values()) {
+      if (group.timer) clearTimeout(group.timer);
+    }
+    this.mediaGroups.clear();
+    if (this.logTimer) clearInterval(this.logTimer);
+    if (this.thinkingTimer) clearTimeout(this.thinkingTimer);
+    if (this.draft?.timer) clearTimeout(this.draft.timer);
+    if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
+    if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
+    this.pi.stop();
+  }
+}
+
+async function selfTest() {
+  assert.deepEqual(parseCommand("/model openai/gpt-5"), { name: "model", argument: "openai/gpt-5" });
+  assert.deepEqual(parseCommand("/help@my_bot"), { name: "help", argument: "" });
+  assert.deepEqual(parseCommand("/sh ls -la"), { name: "sh", argument: "ls -la" });
+  assert.deepEqual(parseCommand("/get README.md"), { name: "get", argument: "README.md" });
+  assert.deepEqual(parseCommand("/followup check tests"), { name: "followup", argument: "check tests" });
+  assert.equal(parseCommand("hello"), null);
+  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project"), true);
+  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project/nested"), false);
+  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/other"), false);
+  assert.equal(telegramSkillName("skill:grill-me"), "skill_grill_me");
+  assert.equal(telegramSkillName(`skill:${"a".repeat(40)}`).length, 32);
+  assert.equal(telegramMarkdown("### Status!\n- **ready** and `a_b`"), "*Status\\!*\n• *ready* and `a_b`");
+  assert.equal(formatThinkingStream(""), "💭 正在思考…");
+  assert.ok(formatThinkingStream("analyzing problem").includes("> analyzing problem"));
+  const tenLines = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n");
+  const streamFormatted = formatThinkingStream(tenLines);
+  assert.ok(streamFormatted.includes("> …\n> line 6\n> line 7\n> line 8\n> line 9\n> line 10"));
+  assert.ok(!streamFormatted.includes("> line 5"));
+  assert.equal(telegramMarkdown("```js\na_b();\n```"), "```js\na_b();\n```");
+  assert.ok(telegramMarkdown("| A | B |\n|---|---|\n| 1 | 2 |").includes("```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"));
+  assert.equal(
+    telegramMarkdown("- code: `/```([^\\n]*)\\n?([\\s\\S]*?)```/` and ```` ```lang ````"),
+    "• code: `/\\`\\`\\`([^\\\\n]*)\\\\n?([\\\\s\\\\S]*?)\\`\\`\\`/` and `\\`\\`\\`lang`"
+  );
+  assert.equal(telegramMarkdown("**`code`**"), "*`code`*");
+  assert.ok(formatAssistantError("Codex error: The usage limit has been reached").includes("额度已用尽"));
+  assert.ok(formatAssistantError("Rate limit exceeded").includes("速率限制"));
+  assert.equal(formatAssistantError("Network failure"), "❌ Network failure");
+  assert.equal(retryableTelegramStatus(429), true);
+  assert.equal(retryableTelegramStatus(500), true);
+  assert.equal(retryableTelegramStatus(400), false);
+  const original = "a".repeat(4000) + "🐈";
+  assert.equal(chunks(original).join(""), original);
+  assert.ok(chunks(original).every((part) => [...part].length <= MAX_MESSAGE));
+  const fenced = "```js\n" + "const a = 1;\n".repeat(10) + "```";
+  const fencedChunks = chunks(fenced, 60);
+  assert.ok(fencedChunks.length > 1);
+  assert.ok(fencedChunks[0].endsWith("```"));
+  assert.ok(fencedChunks[1].startsWith("```js\n"));
+  assert.equal(contentText([{ type: "text", text: "hi" }, { type: "toolCall", name: "read", arguments: { path: "x" } }]), 'hi\n🔧 read {"path":"x"}');
+  assert.equal(assistantText([{ type: "text", text: "hi" }, { type: "toolCall", name: "read", arguments: { path: "x" } }]), "hi");
+  assert.equal(toolSummary("bash", { command: "git status" }), "bash: git status");
+  assert.equal(toolSummary("read", { path: "foo.txt" }), "read: foo.txt");
+  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("⏳"));
+  assert.ok(renderToolPanel([{ summary: "web_search", status: "running", startedAt: 1_000 }], false, 66_000).includes("1m 5s"));
+  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("🛠 已完成 1 项操作"));
+  console.log("self-test: ok");
+  const tmpLog = join(tmpdir(), `test-remote-pi-rot-${Date.now()}.log`);
+  await writeFile(tmpLog, "x".repeat(20));
+  await rotateLog(tmpLog, 10);
+  assert.equal((await stat(tmpLog)).size, 0);
+  assert.equal((await stat(`${tmpLog}.1`)).size, 20);
+  await unlink(tmpLog);
+  await unlink(`${tmpLog}.1`);
+}
+
+if (import.meta.main) {
+  if (process.argv.includes("--self-test")) {
+    await selfTest();
+  } else {
+    const gateway = new Gateway(loadConfig());
+    for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { gateway.stop(); process.exit(0); });
+    gateway.start().catch((error) => { console.error(error); gateway.stop(); process.exit(1); });
+  }
+}
