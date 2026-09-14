@@ -331,6 +331,7 @@ class Telegram {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let response;
       let data;
+      const t0 = performance.now();
       try {
         response = await fetch(`${this.base}/${method}`, {
           method: "POST",
@@ -340,13 +341,22 @@ class Telegram {
         });
         data = await response.json();
       } catch (error) {
+        const ms = Math.round(performance.now() - t0);
+        console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed in ${ms}ms:`, error.message);
         lastError = error;
         if (attempt === maxAttempts - 1) throw error;
         await sleep((attempt + 1) * 1000);
         continue;
       }
-      if (response.ok && data.ok) return data.result;
+      const ms = Math.round(performance.now() - t0);
+      if (response.ok && data.ok) {
+        if (method !== "getUpdates" || (Array.isArray(data.result) && data.result.length > 0) || ms > 1500) {
+          console.log(`${new Date().toISOString()} [tg:call] ${method} ok in ${ms}ms${method === "getUpdates" ? ` (updates: ${data.result.length})` : ""}`);
+        }
+        return data.result;
+      }
       lastError = new Error(`Telegram ${method}: ${data.description || response.status}`);
+      console.error(`${new Date().toISOString()} [tg:call] ${method} HTTP ${response.status} in ${ms}ms: ${data.description || ""}`);
       if (!retryableTelegramStatus(response.status) || attempt === maxAttempts - 1) throw lastError;
       await sleep((data.parameters?.retry_after || attempt + 1) * 1000);
     }
@@ -404,36 +414,38 @@ class Telegram {
   }
 
   async sendDocument(chatId, path) {
+    const t0 = performance.now();
     const form = new FormData();
     form.set("chat_id", String(chatId));
     form.set("document", await openAsBlob(path), basename(path));
     const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
+    console.log(`${new Date().toISOString()} [tg:call] sendDocument ok in ${Math.round(performance.now() - t0)}ms`);
   }
 
   async sendDraft(chatId, draftId, text) {
-    await this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text, can_stop: true }, 10_000, 1);
+    const plain = String(text || "");
+    try {
+      return await this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: telegramHtml(plain), parse_mode: "HTML", can_stop: true }, 10_000, 2);
+    } catch (error) {
+      if (!error.message.includes("can't parse entities")) throw error;
+      console.error("Draft HTML parse fallback:", error.message);
+      return this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: plain, can_stop: true }, 10_000, 2);
+    }
   }
 
   async deleteMessage(chatId, messageId) {
     await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, 10_000, 1);
   }
 
-  async setReaction(chatId, messageId, emojis) {
+  async setReaction(chatId, messageId, emoji) {
     if (!messageId) return null;
-    const list = !emojis ? [] : Array.isArray(emojis) ? emojis : [emojis];
-    const reaction = list.map((e) => (typeof e === "string" ? { type: "emoji", emoji: e } : e));
+    // ponytail: 单 emoji——Bot 对每条消息多 emoji 会稳定 400 REACTIONS_TOO_MANY
+    const reaction = emoji ? [{ type: "emoji", emoji: String(emoji) }] : [];
     try {
       return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction }, 5000, 1);
     } catch {
-      if (reaction.length > 1) {
-        try {
-          return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: [reaction.at(-1)] }, 5000, 1);
-        } catch {
-          return null;
-        }
-      }
       return null;
     }
   }
@@ -453,7 +465,7 @@ class Telegram {
           await handler(update);
         }
       } catch (error) {
-        console.error(new Date().toISOString(), error.message);
+        console.error(`${new Date().toISOString()} [tg:poll] error:`, error.message);
         if (error.message?.includes("Conflict")) {
           await sleep(15_000);
           continue;
@@ -529,12 +541,27 @@ class PiRpc {
   async request(type, fields = {}, timeout = 600_000) {
     await this.ensureStarted();
     const id = `tg-${++this.sequence}`;
+    const t0 = performance.now();
     return new Promise((resolveRequest, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        const ms = Math.round(performance.now() - t0);
+        console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} timed out after ${ms}ms`);
         reject(new Error(`Pi RPC ${type} timed out`));
       }, timeout);
-      this.pending.set(id, { resolve: resolveRequest, reject, timer });
+      this.pending.set(id, {
+        resolve: (data) => {
+          const ms = Math.round(performance.now() - t0);
+          console.log(`${new Date().toISOString()} [pi:rpc] ${type} #${id} ok in ${ms}ms`);
+          resolveRequest(data);
+        },
+        reject: (err) => {
+          const ms = Math.round(performance.now() - t0);
+          console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} failed in ${ms}ms: ${err.message}`);
+          reject(err);
+        },
+        timer,
+      });
       this.write({ id, type, ...fields });
     });
   }
@@ -572,9 +599,13 @@ class Gateway {
     this.draftSupport = "unknown";
     this.nextDraftId = 0;
     this.activeMessageIds = [];
+    this.runStartedAt = null;
+    this.runFirstTokenAt = null;
+    this.runFirstUiAt = null;
   }
 
   async start() {
+    const t0 = performance.now();
     // launchd 以 O_APPEND 持有日志 fd，启动时截断即可防无限增长（newsyslog 处理不了这种 fd）
     await stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
     await Promise.all([
@@ -589,11 +620,12 @@ class Gateway {
     await this.pi.start();
     const state = await this.pi.request("get_state");
     await this.registerBotCommands();
-    console.log(`${new Date().toISOString()} @${me.username} ready; Pi session ${state.sessionId}`);
+    console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
     await this.telegram.poll((update) => this.handleUpdate(update));
   }
 
   async saveDownload(fileId, name, needsBase64 = false) {
+    const t0 = performance.now();
     const file = await this.telegram.call("getFile", { file_id: fileId });
     const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
@@ -601,6 +633,7 @@ class Gateway {
     const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
     const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
     await writeFile(path, buffer);
+    console.log(`${new Date().toISOString()} [download] ${name} (${buffer.length} bytes) in ${Math.round(performance.now() - t0)}ms`);
     return { path, data: needsBase64 ? buffer.toString("base64") : null };
   }
 
@@ -620,28 +653,37 @@ class Gateway {
 
   settleActiveReactions() {
     for (const id of this.activeMessageIds.splice(0)) {
-      this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
+      this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, this.config.doneEmoji));
     }
   }
 
   async handleUpdate(update) {
+    const t0 = performance.now();
     try {
       if (update.message) {
         if (!this.isAllowed(update.message.from, update.message.chat)) return;
         this.chatReady = true;
+        const m = update.message;
+        const lag = m.date ? `${Date.now() - m.date * 1000}ms` : "0ms";
+        const preview = (m.text || m.caption || (m.photo ? "[photo]" : m.voice ? "[voice]" : "[file]")).slice(0, 50).replace(/\n/g, " ");
+        console.log(`${new Date().toISOString()} [update] msg #${m.message_id} (tg lag: ${lag}): ${preview}`);
         await this.handleMessage(update.message);
       } else if (update.callback_query) {
         const callback = update.callback_query;
         if (!this.isAllowed(callback.from, callback.message?.chat)) return;
         this.chatReady = true;
+        console.log(`${new Date().toISOString()} [update] callback #${callback.id}: ${callback.data}`);
         await this.handleCallback(callback);
       } else if (update.stopped_message_generation) {
+        console.log(`${new Date().toISOString()} [update] stopped_message_generation`);
         await this.handleCommand({ name: "abort", argument: "" }, "/abort");
       }
     } catch (error) {
       console.error("Telegram input:", error);
       this.settleActiveReactions();
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [update] #${update.update_id} finished in ${Math.round(performance.now() - t0)}ms`);
     }
   }
 
@@ -667,7 +709,7 @@ class Gateway {
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await this.telegram.send(this.chatId, "已提交。");
-      await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
+      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       return;
     }
 
@@ -693,8 +735,13 @@ class Gateway {
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       if (message.voice && this.config.sttCommand) {
         try {
+          const tStt = performance.now();
           const transcript = await runStt(this.config.sttCommand, media.saved.path);
+          console.log(`${new Date().toISOString()} [stt] transcribed voice in ${Math.round(performance.now() - tStt)}ms`);
           this.activeMessageIds.push(message.message_id);
+          this.runStartedAt = performance.now();
+          this.runFirstTokenAt = null;
+          this.runFirstUiAt = null;
           await this.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
           return;
         } catch (error) {
@@ -702,6 +749,9 @@ class Gateway {
         }
       }
       this.activeMessageIds.push(message.message_id);
+      this.runStartedAt = performance.now();
+      this.runFirstTokenAt = null;
+      this.runFirstUiAt = null;
       await this.prompt(attachmentPrompt(message.caption || `用户发送了${media.label}。`, [media.saved]), media.image ? [media.image] : undefined);
       return;
     }
@@ -716,10 +766,13 @@ class Gateway {
       if (command.name === "followup") this.activeMessageIds.push(message.message_id);
       await this.handleCommand(command, text);
       if (command.name !== "followup") {
-        await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
+        await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       }
     } else {
       this.activeMessageIds.push(message.message_id);
+      this.runStartedAt = performance.now();
+      this.runFirstTokenAt = null;
+      this.runFirstUiAt = null;
       await this.prompt(text);
     }
   }
@@ -737,6 +790,9 @@ class Gateway {
       if (media.image) images.push(media.image);
     }
     for (const m of messages) this.activeMessageIds.push(m.message_id);
+    this.runStartedAt = performance.now();
+    this.runFirstTokenAt = null;
+    this.runFirstUiAt = null;
     if (files.length) {
       await this.prompt(attachmentPrompt(caption || "请查看这组文件。", files), images.length ? images : undefined);
     } else if (caption) {
@@ -764,6 +820,9 @@ class Gateway {
     this.isStreaming = false;
     this.stopTyping();
     this.pendingUi = null;
+    this.runStartedAt = null;
+    this.runFirstTokenAt = null;
+    this.runFirstUiAt = null;
     for (const group of this.mediaGroups.values()) {
       if (group.timer) clearTimeout(group.timer);
     }
@@ -772,9 +831,8 @@ class Gateway {
     this.toolPanel = null;
     if (this.draft) {
       if (this.draft.timer) clearTimeout(this.draft.timer);
-      if (this.draft.draftId !== null && this.draftSupport === "supported") {
-        this.telegram.sendDraft(this.chatId, this.draft.draftId, "").catch(() => {});
-      }
+      // ponytail: 不发空文本“清除”（协议里是 Thinking 占位）；停止更新让 30s 预览自然过期
+      this.draft.closed = true;
       if (this.draft.messageId) this.telegram.deleteMessage(this.chatId, this.draft.messageId).catch(() => {});
     }
     this.draft = null;
@@ -782,12 +840,14 @@ class Gateway {
   }
 
   async prompt(message, images, streamingBehavior) {
+    const t0 = performance.now();
     this.startTyping();
     try {
       const fields = { message };
       if (images) fields.images = images;
       const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
       if (behavior) fields.streamingBehavior = behavior;
+      console.log(`${new Date().toISOString()} [prompt] sending to Pi (behavior=${behavior || "initial"}, chars=${message.length})`);
       try {
         await this.pi.request("prompt", fields);
       } catch (error) {
@@ -799,6 +859,7 @@ class Gateway {
           throw error;
         }
       }
+      console.log(`${new Date().toISOString()} [prompt] accepted by Pi in ${Math.round(performance.now() - t0)}ms`);
       if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ 已加入 follow-up 队列", { disable_notification: true });
     } catch (error) {
       this.stopTyping();
@@ -807,7 +868,9 @@ class Gateway {
   }
 
   async handleCommand({ name, argument }, original) {
-    switch (name) {
+    const t0 = performance.now();
+    try {
+      switch (name) {
       case "start": case "help": return this.telegram.send(this.chatId, HELP);
       case "commands": return this.showCommands();
       case "cwd": return this.showCwds();
@@ -925,9 +988,13 @@ class Gateway {
         return this.telegram.send(this.chatId, `未知命令：/${name}\n使用 /help 或 /commands`);
       }
     }
+    } finally {
+      console.log(`${new Date().toISOString()} [cmd] /${name} finished in ${Math.round(performance.now() - t0)}ms`);
+    }
   }
 
   async registerBotCommands() {
+    const t0 = performance.now();
     const data = await this.pi.request("get_commands");
     const commands = [...BOT_COMMANDS];
     for (const command of data.commands) {
@@ -945,6 +1012,7 @@ class Gateway {
       this.telegram.call("setMyCommands", { commands: finalCommands }),
       this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
     ]);
+    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length}) in ${Math.round(performance.now() - t0)}ms`);
   }
 
   async showCommands() {
@@ -1080,11 +1148,13 @@ class Gateway {
   }
 
   async handleCallback(callback) {
+    const t0 = performance.now();
     const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
     const action = this.actions.get(token);
     this.actions.delete(token);
     if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "操作已过期");
     try {
+      console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
       if (action.type === "model") {
         await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
         await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
@@ -1115,6 +1185,8 @@ class Gateway {
     } catch (error) {
       await this.telegram.answer(callback.id, "失败");
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [callback] ${action.type} finished in ${Math.round(performance.now() - t0)}ms`);
     }
   }
 
@@ -1153,11 +1225,15 @@ class Gateway {
       this.startTyping();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       this.toolPanel = null;
+      const since = this.runStartedAt ? ` (+${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
+      console.log(`${new Date().toISOString()} [run] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
       this.isStreaming = false;
       this.pendingUi = null;
       this.stopTyping();
+      const since = this.runStartedAt ? ` (total: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
+      console.log(`${new Date().toISOString()} [run] agent_settled${since}`);
       if (this.toolPanel && this.toolPanel.tools.length) {
         for (const tool of this.toolPanel.tools) {
           if (tool.status === "running") tool.status = "done";
@@ -1169,12 +1245,16 @@ class Gateway {
         const draft = this.draft;
         this.draft = null;
         if (draft.timer) clearTimeout(draft.timer);
+        draft.closed = true;
         this.queueTelegram(() => this.finishDraft(draft));
       }
       if (!this.repliedInRun) {
         this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复（可能是上游请求超时）。可使用 /model 切换模型或重试。"));
       }
       this.settleActiveReactions();
+      this.runStartedAt = null;
+      this.runFirstTokenAt = null;
+      this.runFirstUiAt = null;
     }
     if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
     if (!this.chatReady) return;
@@ -1187,17 +1267,28 @@ class Gateway {
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
-      this.draft = { text: "", messageId: null, timer: null, draftId: null };
+      this.draft = { text: "", messageId: null, timer: null, draftId: null, closed: false };
     }
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
       if (update?.type === "text_delta" && this.draft) {
+        if (!this.runFirstTokenAt) {
+          this.runFirstTokenAt = performance.now();
+          const ttft = this.runStartedAt ? ` (TTFT: ${Math.round(this.runFirstTokenAt - this.runStartedAt)}ms)` : "";
+          console.log(`${new Date().toISOString()} [run] first token received${ttft}`);
+        }
         this.draft.text += update.delta;
         if (!this.draft.timer) {
           const draft = this.draft;
           draft.timer = setTimeout(() => {
             draft.timer = null;
-            this.queueTelegram(() => this.flushDraft(draft));
+            // 合并：链上同一草稿最多挂一个待执行刷新，执行时读最新文本，防链阻塞时堆积
+            if (draft.flushQueued) return;
+            draft.flushQueued = true;
+            this.queueTelegram(() => {
+              draft.flushQueued = false;
+              return this.flushDraft(draft);
+            });
           }, 1200);
         }
       }
@@ -1206,12 +1297,15 @@ class Gateway {
       const draft = this.draft || { text: "", messageId: null, timer: null };
       this.draft = null;
       if (draft.timer) clearTimeout(draft.timer);
+      draft.closed = true;
       const content = extractText(event.message.content);
       if (content) draft.text = content;
       if (event.message.stopReason === "error" || event.message.errorMessage) {
         const errText = formatAssistantError(event.message.errorMessage);
         draft.text = draft.text ? `${draft.text}\n\n${errText}` : errText;
       }
+      const outTok = event.message.usage?.output;
+      console.log(`${new Date().toISOString()} [run] message_end (${outTok ? `${outTok} tokens` : "assistant"}${event.message.stopReason ? `, reason: ${event.message.stopReason}` : ""})`);
       if (draft.text) {
         this.repliedInRun = true;
         this.queueTelegram(() => this.finishDraft(draft));
@@ -1220,9 +1314,11 @@ class Gateway {
 
     if (event.type === "tool_execution_start") {
       if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, sending: false };
+      const summary = toolSummary(event.toolName, event.args);
+      console.log(`${new Date().toISOString()} [tool] start: ${summary}`);
       this.toolPanel.tools.push({
         id: event.toolCallId,
-        summary: toolSummary(event.toolName, event.args),
+        summary,
         status: "running",
         startedAt: Date.now(),
       });
@@ -1232,6 +1328,8 @@ class Gateway {
       if (this.toolPanel) {
         const tool = this.toolPanel.tools.find((item) => item.id === event.toolCallId);
         if (tool) tool.status = event.isError ? "error" : "done";
+        const dur = tool ? `${Date.now() - tool.startedAt}ms` : "?";
+        console.log(`${new Date().toISOString()} [tool] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
         this.scheduleToolPanelUpdate(false, false);
       }
       if (event.toolName === "telegram_attach" && !event.isError) {
@@ -1277,12 +1375,17 @@ class Gateway {
     if (!this.toolPanel || !this.toolPanel.tools.length) return;
     const text = renderToolPanel(this.toolPanel.tools, isSettled);
     if (!text) return;
+    const t0 = performance.now();
     try {
       if (this.toolPanel.messageId) {
         await this.telegram.edit(this.chatId, this.toolPanel.messageId, text);
       } else {
         const sent = await this.telegram.sendOne(this.chatId, text, { disable_notification: true });
         if (this.toolPanel) this.toolPanel.messageId = sent.message_id;
+        if (!this.runFirstUiAt && this.runStartedAt) {
+          this.runFirstUiAt = performance.now();
+          console.log(`${new Date().toISOString()} [ui] first tool panel visible (TTFE: ${Math.round(this.runFirstUiAt - this.runStartedAt)}ms, send took ${Math.round(performance.now() - t0)}ms)`);
+        }
       }
     } finally {
       if (this.toolPanel) this.toolPanel.sending = false;
@@ -1290,15 +1393,19 @@ class Gateway {
   }
 
   async flushDraft(draft) {
-    if (!draft.text || draft.flushing) return;
+    if (!draft.text || draft.flushing || draft.closed) return;
     draft.flushing = true;
+    const t0 = performance.now();
     try {
       const text = previewText(draft.text);
+      if (text === draft.sentPreview) return; // 去重：冻结预览不再每 1.2s 重发（循环播放的根因）
       if (this.draftSupport !== "unsupported") {
         if (draft.draftId === null) draft.draftId = ++this.nextDraftId;
         try {
           await this.telegram.sendDraft(this.chatId, draft.draftId, text);
           this.draftSupport = "supported";
+          draft.sentPreview = text;
+          this.logFirstUi(t0, "draft");
           return;
         } catch (error) {
           const msg = String(error.message || "");
@@ -1311,21 +1418,44 @@ class Gateway {
           }
         }
       }
-      if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, text, true);
-      else draft.messageId = (await this.telegram.sendOne(this.chatId, text, { disable_notification: true })).message_id;
+      if (draft.messageId) {
+        await this.telegram.edit(this.chatId, draft.messageId, text, true);
+      } else {
+        draft.messageId = (await this.telegram.sendOne(this.chatId, text, { disable_notification: true })).message_id;
+      }
+      draft.sentPreview = text;
+      this.logFirstUi(t0, "edit");
     } catch {
     } finally {
       draft.flushing = false;
     }
   }
 
+  logFirstUi(t0, mode) {
+    if (!this.runFirstUiAt && this.runStartedAt) {
+      this.runFirstUiAt = performance.now();
+      const ttfe = Math.round(this.runFirstUiAt - this.runStartedAt);
+      const api = Math.round(performance.now() - t0);
+      console.log(`${new Date().toISOString()} [ui] first preview visible (TTFE: ${ttfe}ms, api took ${api}ms, mode: ${mode})`);
+    }
+  }
+
   async finishDraft(draft) {
     if (!draft.text) return;
-    if (this.draftSupport === "supported" && draft.draftId !== null) {
-      await this.telegram.sendDraft(this.chatId, draft.draftId, "").catch(() => {});
+    draft.closed = true;
+    const t0 = performance.now();
+    try {
+      // 先交付最终回复，成功后再清理预览；失败时预览保留为可恢复副本
+      const parts = chunks(draft.text);
+      for (const part of parts) await this.telegram.sendOne(this.chatId, part);
+      if (draft.messageId) await this.telegram.deleteMessage(this.chatId, draft.messageId).catch(() => {});
+      const apiMs = Math.round(performance.now() - t0);
+      const turnMs = this.runStartedAt ? ` (total turn: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
+      console.log(`${new Date().toISOString()} [ui] final reply sent (${parts.length} parts, took ${apiMs}ms)${turnMs}`);
+    } catch (error) {
+      console.error(`${new Date().toISOString()} [ui] final reply delivery failed:`, error.message);
+      await this.telegram.send(this.chatId, `❌ 回复交付失败：${error.message}`).catch(() => {});
     }
-    if (draft.messageId) await this.telegram.deleteMessage(this.chatId, draft.messageId).catch(() => {});
-    for (const part of chunks(draft.text)) await this.telegram.sendOne(this.chatId, part);
   }
 
   async handleUiRequest(request) {
@@ -1421,6 +1551,7 @@ async function selfTest() {
 
   {
     const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    gw.telegram.edit = async () => {};
     gw.telegram.sendDraft = async () => { throw new Error("fetch failed"); };
     gw.telegram.sendOne = async () => ({ message_id: 123 });
     const draft = { text: "hello", flushing: false, draftId: null, messageId: null };
@@ -1428,8 +1559,32 @@ async function selfTest() {
     assert.equal(gw.draftSupport, "unknown");
 
     gw.telegram.sendDraft = async () => { throw new Error("Telegram sendMessageDraft: Not Found"); };
+    draft.text = "hello world";
     await gw.flushDraft(draft);
     assert.equal(gw.draftSupport, "unsupported");
+
+    // 回归：预览内容不变时跳过重复发送（冻结预览不再每 1.2s 重发）
+    let draftCalls = 0;
+    gw.draftSupport = "unknown";
+    gw.telegram.sendDraft = async () => { draftCalls++; };
+    draft.text = "hello world again";
+    await gw.flushDraft(draft);
+    assert.equal(draftCalls, 1);
+    draft.text += "!";
+    await gw.flushDraft(draft);
+    assert.equal(draftCalls, 2);
+    await gw.flushDraft(draft);
+    assert.equal(draftCalls, 2);
+
+    // 回归：最终交付不再发送空文本清除草稿；closed 拦截过期刷新
+    const sentParts = [];
+    gw.telegram.sendOne = async (_chat, text) => { sentParts.push(text); return { message_id: 1 }; };
+    gw.telegram.deleteMessage = async () => {};
+    await gw.finishDraft({ text: "final answer", messageId: 9, draftId: 4 });
+    assert.deepEqual(sentParts, ["final answer"]);
+    assert.equal(draftCalls, 2);
+    await gw.flushDraft({ text: "stale", closed: true });
+    assert.equal(draftCalls, 2);
 
     // Test telegram_attach auto delivery via tool_execution_end
     gw.chatReady = true;
@@ -1470,31 +1625,14 @@ async function selfTest() {
   {
     const tg = new Telegram("123456:fake-token", "/tmp/fake-offset");
     const calls = [];
-    tg.call = async (method, body) => {
-      calls.push({ method, body });
-      if (body.reaction?.length > 1 && body.reaction[0].emoji === "fail_multi") {
-        throw new Error("Telegram setMessageReaction: too many reactions");
-      }
-      return true;
-    };
-
-    await tg.setReaction(123, 456, "👀");
+    tg.call = async (method, body) => { calls.push({ method, body }); return true; };
+    await tg.setReaction(123, 456, "🫡");
     assert.deepEqual(calls[0], {
-      method: "setMessageReaction",
-      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }] },
-    });
-
-    await tg.setReaction(123, 456, ["👀", "🫡"]);
-    assert.deepEqual(calls[1], {
-      method: "setMessageReaction",
-      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }, { type: "emoji", emoji: "🫡" }] },
-    });
-
-    await tg.setReaction(123, 456, ["fail_multi", "🫡"]);
-    assert.deepEqual(calls[3], {
       method: "setMessageReaction",
       body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "🫡" }] },
     });
+    assert.equal(await tg.setReaction(123, 0, "🫡"), null);
+    assert.equal(calls.length, 1);
   }
 
   console.log("self-test: ok");

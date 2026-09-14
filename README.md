@@ -53,7 +53,7 @@ Telegram 发送的图片、文件、视频、语音均可作为上下文：文�
 
 助手回复用 Telegram 原生流式草稿（`sendMessageDraft`，聊天中可直接点停止按钮中止生成），API 不支持时自动回退为静音预览消息 + 编辑。工具面板、队列提示等中间消息全部静音（`disable_notification`），只有最终回复会响铃。
 
-- **消息即时反馈（Reaction ACK）**：收到用户消息时，Bot 立即在原消息贴上“已接收”表情（默认 `👀`，消除等待焦虑）；任务或命令完成后，在同一条消息上添加或更新为“完成”表情（默认 `👍`）。可通过配置文件或环境变量 `TELEGRAM_ACK_EMOJI` 与 `TELEGRAM_DONE_EMOJI` 自定义。
+- **消息即时反馈（Reaction ACK）**：收到用户消息时，Bot 立即在原消息贴上“已接收”表情（默认 `👀`，消除等待焦虑）；任务或命令完成后，在同一条消息上把表情替换为“完成”（默认 `👍`）。可通过配置文件或环境变量 `TELEGRAM_ACK_EMOJI` 与 `TELEGRAM_DONE_EMOJI` 自定义。
 - **可折叠长输出（Expandable Blockquote）**：支持 Telegram 7.2+ 原生可折叠引用块。`/sh` 执行结果超过 3 行时自动折叠显示，工具面板操作步骤也会自动折叠，保持手机端界面清爽。
 
 ## Service
