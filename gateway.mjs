@@ -338,6 +338,7 @@ class Telegram {
     this.base = `https://api.telegram.org/bot${token}`;
     this.fileBase = `https://api.telegram.org/file/bot${token}`;
     this.offsetPath = offsetPath;
+    this.retryNotBefore = 0; // ref: Telegram ResponseParameters retry_after (https://core.telegram.org/bots/api#responseparameters)
   }
 
   async call(method, body = {}, timeout = 35_000, maxAttempts = 3) {
@@ -369,6 +370,10 @@ class Telegram {
         }
         return data.result;
       }
+      if (response.status === 429) {
+        const retrySec = data?.parameters?.retry_after || attempt + 1;
+        this.retryNotBefore = Math.max(this.retryNotBefore, Date.now() + retrySec * 1000);
+      }
       lastError = new Error(`Telegram ${method}: ${data.description || response.status}`);
       console.error(`${new Date().toISOString()} [tg:call] ${method} HTTP ${response.status} in ${ms}ms: ${data.description || ""}`);
       if (!retryableTelegramStatus(response.status) || attempt === maxAttempts - 1) throw lastError;
@@ -382,8 +387,19 @@ class Telegram {
     try {
       return await this.call("sendMessage", { chat_id: chatId, text: telegramHtml(plain), parse_mode: "HTML", ...extra });
     } catch (error) {
-      if (!error.message.includes("can't parse entities")) throw error;
-      console.error("HTML parse fallback:", error.message);
+      const msg = String(error.message || "");
+      // ref: Telegram Bot API sendMessage parse error & length limits (https://core.telegram.org/bots/api#sendmessage)
+      if (!msg.includes("can't parse entities") && !msg.includes("message is too long")) throw error;
+      console.error("HTML parse/length fallback:", error.message);
+      if (plain.length > 4000) {
+        const slices = [];
+        for (let i = 0; i < plain.length; i += 4000) slices.push(plain.slice(i, i + 4000));
+        let lastMsg;
+        for (let i = 0; i < slices.length; i++) {
+          lastMsg = await this.call("sendMessage", { chat_id: chatId, text: slices[i], ...(i === slices.length - 1 ? extra : {}) });
+        }
+        return lastMsg;
+      }
       return this.call("sendMessage", { chat_id: chatId, text: plain, ...extra });
     }
   }
@@ -402,9 +418,10 @@ class Telegram {
     try {
       return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramHtml(plain), parse_mode: "HTML" }, timeout, maxAttempts);
     } catch (error) {
-      if (error.message.includes("can't parse entities")) {
-        console.error("HTML parse fallback:", error.message);
-        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain }, timeout, maxAttempts);
+      const msg = String(error.message || "");
+      if (msg.includes("can't parse entities") || msg.includes("message is too long")) {
+        console.error("HTML parse/length fallback:", error.message);
+        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain.slice(0, 4000) }, timeout, maxAttempts);
       }
       if (!error.message.includes("message is not modified")) throw error;
     }
@@ -501,14 +518,16 @@ class Telegram {
 }
 
 class PiRpc {
-  constructor(config, onEvent) {
+  constructor(config, onEvent, onClose) {
     this.config = config;
     this.onEvent = onEvent;
+    this.onClose = onClose;
     this.pending = new Map();
     this.sequence = 0;
     this.proc = null;
     this.pingTimer = null;
     this.missedPings = 0;
+    this.stopping = false;
   }
 
   async ensureStarted() {
@@ -516,6 +535,8 @@ class PiRpc {
   }
 
   async start() {
+    this.stopping = false;
+    this.missedPings = 0; // 新进程从零计失联，避免上个进程被杀后的余数误杀新进程
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
     const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
@@ -542,6 +563,7 @@ class PiRpc {
       }
     });
     this.proc.on("close", (code, signal) => {
+      const wasStopping = this.stopping;
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = null;
       for (const { reject, timer } of this.pending.values()) {
@@ -550,6 +572,8 @@ class PiRpc {
       }
       this.pending.clear();
       this.proc = null;
+      // ref: Node.js child_process close lifecycle (https://nodejs.org/api/child_process.html#event-close)
+      if (this.onClose) this.onClose({ code, signal, expected: wasStopping });
     });
 
     // MCP 式 ping（spec: utilities/ping）：挂而不死的 Pi 连续 2 次失联后强杀，走 close→respawn 路径
@@ -616,6 +640,7 @@ class PiRpc {
   }
 
   stop() {
+    this.stopping = true;
     if (this.pingTimer) clearInterval(this.pingTimer);
     if (this.proc) {
       const proc = this.proc;
@@ -631,13 +656,14 @@ class Gateway {
     this.chatId = config.allowedUserId;
     this.chatReady = false;
     this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
-    this.pi = new PiRpc(config, (event) => this.queueEvent(event));
+    this.pi = new PiRpc(config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
     this.actions = new Map();
     this.commandAliases = new Map();
     this.toolPanel = null;
     this.mediaGroups = new Map();
     this.queue = { steering: [], followUp: [] };
     this.isStreaming = false;
+    this.abortedRun = false;
     this.typingTimer = null;
     this.als = new AsyncLocalStorage();
     this.updateChain = Promise.resolve();
@@ -717,6 +743,18 @@ class Gateway {
     return next;
   }
 
+  handlePiExit({ code, signal, expected }) {
+    if (expected) return;
+    const wasStreaming = this.isStreaming;
+    const pendingUi = this.pendingUi;
+    this.resetSessionState();
+    this.settleActiveReactions();
+    if (wasStreaming || pendingUi) {
+      console.error(`${new Date().toISOString()} [pi] process exited unexpectedly (${code ?? signal})`);
+      this.queueTelegram(() => this.telegram.send(this.chatId, `⚠️ Pi 进程异常退出 (${code ?? signal})，已恢复就绪。`));
+    }
+  }
+
   isAllowed(from, chat) {
     return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
   }
@@ -730,8 +768,40 @@ class Gateway {
   dispatchUpdate(update) {
     const priority = getUpdatePriority(update);
     if (priority === "p0" || priority === "p1") {
-      this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
-      return;
+      const p = this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
+      return p;
+    }
+    // 相册入站聚合：首条出现时立即在 updateChain 占位，保证后续普通消息排在相册之后 (ref: python-telegram-bot media_group)
+    if (update.message?.media_group_id && this.isAllowed(update.message.from, update.message.chat) && !this.pendingUi) {
+      const m = update.message;
+      this.chatReady = true;
+      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
+      const key = `${this.chatId}:${m.media_group_id}`;
+      let group = this.mediaGroups.get(key);
+      if (!group) {
+        let resolveReady;
+        const ready = new Promise((r) => { resolveReady = r; });
+        group = { messages: [], timer: null, ready, resolveReady, cancelled: false };
+        this.mediaGroups.set(key, group);
+        const groupTask = async () => {
+          await group.ready;
+          if (group.cancelled || !group.messages.length) return;
+          await this.handleMediaGroup(group.messages);
+        };
+        const next = this.updateChain.then(groupTask).catch((err) => {
+          console.error("Media group error:", err);
+          this.telegram.send(this.chatId, `❌ 处理图片组失败: ${err.message}`);
+        });
+        this.updateChain = next;
+        group.done = next;
+      }
+      group.messages.push(m);
+      if (group.timer) clearTimeout(group.timer);
+      group.timer = setTimeout(() => {
+        this.mediaGroups.delete(key);
+        group.resolveReady();
+      }, 1200);
+      return group.done;
     }
     const next = this.updateChain.then(() => this.handleUpdate(update));
     this.updateChain = next.catch((err) => console.error("Telegram update error:", err));
@@ -743,7 +813,7 @@ class Gateway {
     try {
       if (update.stopped_message_generation) {
         console.log(`${new Date().toISOString()} [p0] stopped_message_generation`);
-        await this.handleCommand({ name: "abort", argument: "" }, "/abort");
+        await this.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
         return;
       }
       const m = update.message;
@@ -751,9 +821,17 @@ class Gateway {
       this.chatReady = true;
       const cmd = parseCommand(m.text?.trim() || "");
       if (!cmd) return;
+      if (cmd.name === "restart") {
+        const receiptPath = join(this.config.stateDir, "last-restart-update");
+        const lastRestart = await readFile(receiptPath, "utf8").catch(() => "");
+        if (lastRestart && String(update.update_id) === lastRestart.trim()) {
+          console.log(`${new Date().toISOString()} [p0] ignoring duplicate restart update #${update.update_id}`);
+          return;
+        }
+      }
       this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
       console.log(`${new Date().toISOString()} [${priority}] handling /${cmd.name}`);
-      await this.handleCommand(cmd, m.text);
+      await this.handleCommand(cmd, m.text, update.update_id);
       await this.telegram.setReaction(this.chatId, m.message_id, this.config.doneEmoji);
     } catch (error) {
       console.error(`[${priority}] error:`, error);
@@ -780,10 +858,8 @@ class Gateway {
         this.chatReady = true;
         console.log(`${new Date().toISOString()} [update] callback #${callback.id}: ${callback.data}`);
         await this.handleCallback(callback);
-      } else if (update.stopped_message_generation) {
-        console.log(`${new Date().toISOString()} [update] stopped_message_generation`);
-        await this.handleCommand({ name: "abort", argument: "" }, "/abort");
       }
+      // stopped_message_generation 由 getUpdatePriority 判为 p0，永远走 handlePriorityUpdate，此处不可达
     } catch (error) {
       console.error("Telegram input:", error);
       this.settleActiveReactions();
@@ -816,23 +892,6 @@ class Gateway {
       this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await this.telegram.send(this.chatId, "已提交。");
       await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
-      return;
-    }
-
-    if (message.media_group_id) {
-      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
-      const key = `${this.chatId}:${message.media_group_id}`;
-      const group = this.mediaGroups.get(key) || { messages: [], timer: null };
-      group.messages.push(message);
-      if (group.timer) clearTimeout(group.timer);
-      group.timer = setTimeout(async () => {
-        this.mediaGroups.delete(key);
-        await this.handleMediaGroup(group.messages).catch((err) => {
-          console.error("Media group error:", err);
-          this.telegram.send(this.chatId, `❌ 处理图片组失败: ${err.message}`);
-        });
-      }, 1200);
-      this.mediaGroups.set(key, group);
       return;
     }
 
@@ -934,8 +993,13 @@ class Gateway {
     this.runFirstUiAt = null;
     for (const group of this.mediaGroups.values()) {
       if (group.timer) clearTimeout(group.timer);
+      group.cancelled = true;
+      if (group.resolveReady) group.resolveReady();
     }
     this.mediaGroups.clear();
+    for (const [key, action] of this.actions) {
+      if (action.type === "ui") this.actions.delete(key);
+    }
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     this.toolPanel = null;
     if (this.draft) {
@@ -976,7 +1040,7 @@ class Gateway {
     }
   }
 
-  async handleCommand({ name, argument }, original) {
+  async handleCommand({ name, argument }, original, updateId = null) {
     const t0 = performance.now();
     try {
       switch (name) {
@@ -988,6 +1052,7 @@ class Gateway {
       case "resume": return this.showSessions();
       case "reset":
       case "new": {
+        this.abortedRun = true;
         if (this.pi.proc) {
           await this.pi.request("clear_queue").catch(() => {});
           await this.pi.request("abort").catch(() => {});
@@ -1080,6 +1145,7 @@ class Gateway {
         return this.prompt(argument, undefined, "followUp");
       }
       case "abort": {
+        this.abortedRun = true;
         const clear = argument === "clear";
         if (this.pendingUi && this.pi.proc) {
           this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
@@ -1096,6 +1162,14 @@ class Gateway {
       }
       case "restart": {
         await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
+        // ref: Node.js process.exit & restart receipt (https://nodejs.org/api/process.html#processexitcode)
+        if (updateId) {
+          const receiptPath = join(this.config.stateDir, "last-restart-update");
+          await writeFile(receiptPath, String(updateId), { mode: 0o600 }).catch(() => {});
+          const tmp = `${this.telegram.offsetPath}.tmp`;
+          await writeFile(tmp, String(updateId + 1), { mode: 0o600 }).catch(() => {});
+          await rename(tmp, this.telegram.offsetPath).catch(() => {});
+        }
         this.stop();
         setTimeout(() => process.exit(0), 100);
         return;
@@ -1311,6 +1385,10 @@ class Gateway {
         await this.switchCwd(action.path, callback.id);
         return;
       } else if (action.type === "ui") {
+        // ref: Telegram Bot API callback single consumption (https://core.telegram.org/bots/api#callbackquery)
+        for (const [k, v] of this.actions) {
+          if (v.type === "ui" && v.requestId === action.requestId) this.actions.delete(k);
+        }
         this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
         if (callback.message) {
           const chosen = action.response?.value ?? (action.response?.confirmed ? "确认" : "取消");
@@ -1346,7 +1424,7 @@ class Gateway {
     this.config.sessionDir = join(this.config.stateDir, "sessions", target.replace(/^\//, "").replaceAll("/", "-"));
     await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
     this.resetSessionState();
-    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event));
+    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
     await this.pi.start();
     await this.registerBotCommands();
     const state = await this.pi.request("get_state");
@@ -1361,6 +1439,7 @@ class Gateway {
       this.isStreaming = true;
       this.pendingUi = null;
       this.repliedInRun = false;
+      this.abortedRun = false;
       this.startTyping();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       this.toolPanel = null;
@@ -1387,9 +1466,11 @@ class Gateway {
         draft.closed = true;
         this.queueTelegram(() => this.finishDraft(draft));
       }
-      if (!this.repliedInRun) {
-        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复（可能是上游请求超时）。可使用 /model 切换模型或重试。"));
+      // ref: Pi RPC settled lifecycle (https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+      if (!this.repliedInRun && !this.abortedRun) {
+        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复。可使用 /model 切换模型或重试。"));
       }
+      this.abortedRun = false;
       this.settleActiveReactions();
       this.runStartedAt = null;
       this.runFirstTokenAt = null;
@@ -1433,6 +1514,7 @@ class Gateway {
       }
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
+      if (event.message.stopReason === "aborted") this.abortedRun = true;
       const draft = this.draft || { text: "", messageId: null, timer: null };
       this.draft = null;
       if (draft.timer) clearTimeout(draft.timer);
@@ -1533,6 +1615,7 @@ class Gateway {
 
   async flushDraft(draft) {
     if (!draft.text || draft.flushing || draft.closed) return;
+    if (this.telegram.retryNotBefore > Date.now()) return; // 429 冷却中
     draft.flushing = true;
     const t0 = performance.now();
     try {
@@ -1553,7 +1636,7 @@ class Gateway {
             console.error("sendMessageDraft unavailable; falling back to send+edit:", error.message);
           } else {
             console.error("sendMessageDraft transient error:", error.message);
-            if (this.draftSupport === "supported") return;
+            if (this.draftSupport === "supported" || /429|too many requests/i.test(msg)) return;
           }
         }
       }
@@ -1564,7 +1647,8 @@ class Gateway {
       }
       draft.sentPreview = text;
       this.logFirstUi(t0, "edit");
-    } catch {
+    } catch (error) {
+      console.error(`${new Date().toISOString()} [ui] preview update failed:`, error.message);
     } finally {
       draft.flushing = false;
     }
@@ -1593,7 +1677,10 @@ class Gateway {
       console.log(`${new Date().toISOString()} [ui] final reply sent (${parts.length} parts, took ${apiMs}ms)${turnMs}`);
     } catch (error) {
       console.error(`${new Date().toISOString()} [ui] final reply delivery failed:`, error.message);
-      await this.telegram.send(this.chatId, `❌ 回复交付失败：${error.message}`).catch(() => {});
+      // draft 模式预览 30s 即过期，失败副本落盘防丢内容
+      const copy = join(this.config.stateDir, `failed-reply-${Date.now()}.txt`);
+      await writeFile(copy, draft.text).catch(() => {});
+      await this.telegram.send(this.chatId, `❌ 回复交付失败：${error.message}\n内容已存：${copy}`).catch(() => {});
     }
   }
 
@@ -1767,6 +1854,18 @@ async function selfTest() {
     await gw.flushDraft({ text: "stale", closed: true });
     assert.equal(draftCalls, 2);
 
+    // 回归：最终交付失败时文本落盘为可恢复副本
+    {
+      const tmpUi = join(tmpdir(), `test-remote-pi-ui-${Date.now()}`);
+      await mkdir(tmpUi, { recursive: true, mode: 0o700 });
+      const gwFail = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpUi });
+      gwFail.telegram.sendOne = async () => { throw new Error("network down"); };
+      await gwFail.finishDraft({ text: "recover me", messageId: null, draftId: null });
+      const copies = (await readdir(tmpUi)).filter((f) => f.startsWith("failed-reply-"));
+      assert.equal(copies.length, 1);
+      assert.equal(await readFile(join(tmpUi, copies[0]), "utf8"), "recover me");
+    }
+
     // Test telegram_attach auto delivery via tool_execution_end
     gw.chatReady = true;
     const docs = [];
@@ -1834,6 +1933,40 @@ async function selfTest() {
       sendOrder.push("outer-end");
     });
     assert.deepEqual(sendOrder, ["outer-start", "nested", "outer-end"]);
+
+    // 回归（审计修复 M1）：missedPings 随 Pi 重启复位，余数不误杀新进程
+    {
+      const rpc = new PiRpc({ piBin: "echo", sessionDir: tmpdir() }, () => {});
+      rpc.missedPings = 2;
+      await rpc.start();
+      assert.equal(rpc.missedPings, 0);
+    }
+
+    // 回归（审计修复 M2）：预览更新失败不再静默，必须留错误日志
+    {
+      const errs = [];
+      const origError = console.error;
+      console.error = (...a) => errs.push(a.map(String).join(" "));
+      const prevSupport = gw.draftSupport;
+      const prevSendOne = gw.telegram.sendOne;
+      gw.draftSupport = "unsupported";
+      gw.telegram.sendOne = async () => { throw new Error("preview boom"); };
+      await gw.flushDraft({ text: "boom draft", flushing: false, draftId: null, messageId: null });
+      console.error = origError;
+      gw.draftSupport = prevSupport;
+      gw.telegram.sendOne = prevSendOne;
+      assert.ok(errs.some((e) => e.includes("preview update failed")), "flushDraft 失败应留日志");
+    }
+
+    // 回归（审计修复 L4）：handleUpdate 不再含 stopped_message_generation 死分支（p0 必然先拦截）
+    {
+      const calls = [];
+      gw.pi.proc = {};
+      gw.pi.request = async (type) => { calls.push(type); return {}; };
+      await gw.handleUpdate({ stopped_message_generation: true, update_id: 424242 });
+      assert.deepEqual(calls, [], "handleUpdate 不应再处理 stopped_message_generation");
+      gw.pi.proc = undefined;
+    }
 
     // Test /new preserves last effective model
     let mockModel = { provider: "openai", id: "gpt-4o" };
@@ -1948,6 +2081,167 @@ async function selfTest() {
       handled.push(update.update_id);
       return gate;
     });
+    // 回归（架构审查 Issue 1）：/restart 重启收据与防死循环重放
+    {
+      const tmpState = join(tmpdir(), `test-remote-pi-restart-${Date.now()}`);
+      await mkdir(tmpState, { recursive: true, mode: 0o700 });
+      const gwRestart = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpState });
+      gwRestart.stop = () => {};
+      gwRestart.telegram.setReaction = async () => {};
+      let sentMsg = "";
+      gwRestart.telegram.send = async (_c, text) => { sentMsg = text; };
+      let origExit = process.exit;
+      process.exit = () => {};
+
+      // 首次 /restart：应落盘收据并发送提示
+      await gwRestart.handlePriorityUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 }, "p0");
+      assert.ok(sentMsg.includes("正在重启"));
+      assert.equal(await readFile(join(tmpState, "last-restart-update"), "utf8"), "888");
+
+      // 重复投递相同的 update_id：应静默忽略，不再重复执行
+      sentMsg = "";
+      await gwRestart.handlePriorityUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 }, "p0");
+      assert.equal(sentMsg, "");
+      await sleep(150); // 等待 restart 的 100ms exit 定时器被空函数消耗
+      process.exit = origExit;
+    }
+
+    // 回归（架构审查 Issue 2）：PiRpc 进程异常退出通知 Gateway 并重置就绪
+    {
+      let exitedInfo = null;
+      const rpc = new PiRpc({ piBin: "echo", sessionDir: tmpdir() }, () => {}, (info) => { exitedInfo = info; });
+      await rpc.start();
+      rpc.proc.kill("SIGTERM");
+      await sleep(100);
+      assert.ok(exitedInfo !== null, "Pi 退出应触发 onClose 回调");
+      assert.equal(exitedInfo.expected, false);
+
+      const gwExit = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+      gwExit.isStreaming = true;
+      let exitNotice = "";
+      gwExit.telegram.send = async (_c, text) => { exitNotice = text; };
+      gwExit.handlePiExit({ code: 1, signal: null, expected: false });
+      assert.equal(gwExit.isStreaming, false, "异常退出后 isStreaming 必须重置为 false");
+      await gwExit.telegramChain;
+      assert.ok(exitNotice.includes("异常退出"), "异常退出必须向用户告警");
+    }
+
+    // 回归（架构审查 Issue 3）：HTML 解析与长度超限时降级为分段纯文本
+    {
+      const tgLimit = new Telegram("1:x", "/tmp/fake-offset");
+      let calls = [];
+      tgLimit.call = async (method, body) => {
+        calls.push({ method, body });
+        if (body.parse_mode === "HTML") throw new Error("Telegram sendMessage: Bad Request: message is too long");
+        return { message_id: 99 };
+      };
+      const longText = "x".repeat(5000);
+      const res = await tgLimit.sendOne(1, longText);
+      assert.equal(res.message_id, 99);
+      // 超长纯文本被切片为 <=4000 的纯文本分段调用
+      assert.ok(calls.length >= 2);
+      assert.ok(calls.every((c) => !c.body.parse_mode || c.body.parse_mode === "HTML"));
+    }
+
+    // 回归（架构审查 Issue 4）：MediaGroup 延迟聚合占位并保证后续文本时序
+    {
+      const gwMedia = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+      gwMedia.chatReady = true;
+      gwMedia.telegram.setReaction = async () => {};
+      gwMedia.saveDownload = async (_id, name) => ({ path: `/tmp/${name}`, data: null });
+      const prompts = [];
+      gwMedia.prompt = async (text) => { prompts.push(text); };
+
+      // 发送 2 张图片组成 media_group
+      gwMedia.dispatchUpdate({
+        message: {
+          message_id: 101,
+          media_group_id: "mg-1",
+          photo: [{ file_id: "p1" }],
+          from: { id: 1 },
+          chat: { type: "private" },
+        },
+      });
+      gwMedia.dispatchUpdate({
+        message: {
+          message_id: 102,
+          media_group_id: "mg-1",
+          photo: [{ file_id: "p2" }],
+          from: { id: 1 },
+          chat: { type: "private" },
+        },
+      });
+      // 紧接着发送文本消息
+      gwMedia.dispatchUpdate({
+        message: {
+          message_id: 103,
+          text: "请分析以上两张图",
+          from: { id: 1 },
+          chat: { type: "private" },
+        },
+      });
+
+      // 等待 media_group timer 触发并完成排队处理
+      await sleep(1300);
+      await gwMedia.updateChain;
+
+      assert.equal(prompts.length, 2);
+      assert.ok(prompts[0].includes("photo-101.jpg"), "相册应首先被处理并 prompt 给 Pi");
+      assert.equal(prompts[1], "请分析以上两张图", "文本消息应严格排在相册之后");
+    }
+
+    // 回归（架构审查 Issue 5）：/abort 终止任务后 agent_settled 不得误报空回复
+    {
+      const gwAbort = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+      gwAbort.chatReady = true;
+      gwAbort.telegram.send = async () => {};
+      let sentWarning = false;
+      gwAbort.telegram.send = async (_c, text) => {
+        if (text.includes("未返回任何文本回复")) sentWarning = true;
+      };
+
+      // 模拟用户触发 abort
+      await gwAbort.handleCommand({ name: "abort", argument: "" }, "/abort");
+      // Pi RPC 随后响应 agent_settled
+      await gwAbort.handleEvent({ type: "agent_settled" });
+      await gwAbort.telegramChain;
+      assert.equal(sentWarning, false, "/abort 后 agent_settled 不应误报未返回文本回复");
+    }
+
+    // 回归（架构审查 Issue 6）：UI 选项点击时同一 requestId 的所有 token 立即作废
+    {
+      const gwUi = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+      gwUi.pi.write = () => {};
+      gwUi.telegram.answer = async () => {};
+      gwUi.telegram.edit = async () => {};
+
+      // 模拟注册两个选项按钮
+      const t1 = gwUi.action({ type: "ui", requestId: "req-99", response: { value: "A" } });
+      const t2 = gwUi.action({ type: "ui", requestId: "req-99", response: { value: "B" } });
+
+      assert.equal(gwUi.actions.size, 2);
+      // 点击选项 A
+      await gwUi.handleCallback({ id: "cb-1", data: t1, message: { chat: { id: 1 }, message_id: 1, text: "q" } });
+
+      // 选项 A 与 B 均应从 actions 中删除，防止重复点击 B
+      assert.equal(gwUi.actions.size, 0);
+      let answeredMsg = "";
+      gwUi.telegram.answer = async (_id, text) => { answeredMsg = text; };
+      // 再次点击选项 B
+      await gwUi.handleCallback({ id: "cb-2", data: t2 });
+      assert.equal(answeredMsg, "操作已过期");
+    }
+
+    // 回归（架构审查 Issue 7）：429 触发 retryNotBefore 冷却且 flushDraft 退避
+    {
+      const gwRate = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+      gwRate.telegram.retryNotBefore = Date.now() + 5000;
+      let draftCalled = false;
+      gwRate.telegram.sendDraft = async () => { draftCalled = true; };
+      await gwRate.flushDraft({ text: "test rate limit", flushing: false, closed: false, draftId: null, messageId: null });
+      assert.equal(draftCalled, false, "429 冷却期内 flushDraft 应跳过发送");
+    }
+
     await sleep(80);
     assert.equal(existsSync(join(tmpOffset, "offset")), false, "offset 不应在处理完前落盘");
     release();
