@@ -249,7 +249,16 @@ function formatContextTokens(count) {
   return String(count);
 }
 
-function formatSessionReset({ model, cwd }) {
+// ponytail: reads the extension's last quota refresh; may lag one refresh if the model was switched seconds ago
+function readQuota() {
+  try {
+    return readFileSync(join(homedir(), ".local/var/remote-pi/quota.txt"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function formatSessionReset({ model, cwd, quota }) {
   const modelId = model?.id || "unknown";
   const provider = model?.provider || "unknown";
   const contextTokens = formatContextTokens(model?.contextWindow);
@@ -263,6 +272,7 @@ function formatSessionReset({ model, cwd }) {
     `◆ Context: ${context}`,
     `◆ Endpoint: ${endpoint}`,
     `◆ CWD: ${cwd}`,
+    ...(quota ? [`◆ Quota: ${quota}`] : []),
   ].join("\n");
 }
 
@@ -1074,7 +1084,7 @@ class Gateway {
           this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
-        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
+        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd, quota: readQuota() });
         return this.telegram.send(this.chatId, text);
       }
       case "name": {
@@ -1255,7 +1265,9 @@ class Gateway {
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
         this.lastModel = { provider: exact.provider, modelId: exact.id };
-        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}`);
+        await sleep(1500); // let the quota extension refresh for the new provider
+        const quota = readQuota();
+        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}${quota ? `\n◆ Quota: ${quota}` : ""}`);
       }
     }
     const filtered = models.filter((model) => !query || `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query.toLowerCase()));
@@ -1361,7 +1373,9 @@ class Gateway {
       if (action.type === "model") {
         await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
         this.lastModel = { provider: action.provider, modelId: action.modelId };
-        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
+        await sleep(1500); // let the quota extension refresh for the new provider
+        const quota = readQuota();
+        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}${quota ? `\n◆ Quota: ${quota}` : ""}`);
       } else if (action.type === "thinking") {
         await this.pi.request("set_thinking_level", { level: action.level });
         await this.telegram.send(this.chatId, `✅ thinking: ${action.level}`);
@@ -1996,6 +2010,27 @@ async function selfTest() {
     assert.deepEqual(gw.lastModel, { provider: "openai", modelId: "gpt-4o" });
   }
 
+  assert.equal(
+    formatSessionReset({
+      model: {
+        id: "gemini-3.8-flash",
+        provider: "antigravity",
+        contextWindow: 1048576,
+        baseUrl: "http://127.0.0.1:51122/v1",
+      },
+      cwd: "/Users/user/dev/remote-pi",
+    }).includes("\n◆ Quota: "),
+    false,
+    "no quota line when quota missing",
+  );
+  assert.ok(
+    formatSessionReset({
+      model: { id: "gemini-3.8-flash", provider: "antigravity", contextWindow: 1048576, baseUrl: "http://x" },
+      cwd: "/tmp",
+      quota: "93%:3h55m | 82%:4d3h",
+    }).endsWith("\n◆ Quota: 93%:3h55m | 82%:4d3h"),
+    "quota line rendered below CWD",
+  );
   assert.equal(
     formatSessionReset({
       model: {
