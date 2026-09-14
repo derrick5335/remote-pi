@@ -107,7 +107,7 @@ rules.fence = (t, i) => {
 rules.code_block = (t, i) => `<pre>${esc(t[i].content)}</pre>\n\n`;
 
 rules.paragraph_open = () => "";
-rules.paragraph_close = () => "";
+rules.paragraph_close = () => (listStack.length ? "" : "\n");
 rules.heading_open = () => "<b>";
 rules.heading_close = () => "</b>\n\n";
 rules.blockquote_open = () => "<blockquote>";
@@ -145,6 +145,7 @@ md.renderer.render = (tokens, options, env) => {
   const out = rawRender(tokens, options, env)
     .replaceAll("<strong>", "<b>").replaceAll("</strong>", "</b>")
     .replaceAll("<em>", "<i>").replaceAll("</em>", "</i>")
+    .replaceAll("\n</blockquote>", "</blockquote>")
     // Telegram 无 <table>：拆成手机友好的标题行 + bullet 行（保留单元格内行内标记）
     .replace(/<table>[\s\S]*?<\/table>/g, (m) => {
       const rows = m.match(/<tr>[\s\S]*?<\/tr>/g) || [];
@@ -1651,6 +1652,7 @@ async function selfTest() {
     "<blockquote expandable>line 1\nline 2</blockquote>"
   );
   assert.equal(telegramHtml("> quote 1\n> quote 2"), "<blockquote>quote 1\nquote 2</blockquote>");
+  assert.equal(telegramHtml("✨ fresh.\n\n◆ Model: m"), "✨ fresh.\n◆ Model: m");
   assert.equal(telegramHtml("**`code`**"), "<b><code>code</code></b>");
   assert.equal(
     telegramHtml("- a\n  - nested\n\n1. first\n2. second"),
