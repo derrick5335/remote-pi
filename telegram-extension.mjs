@@ -2,25 +2,12 @@
 // Gives the model two Telegram-native tools:
 //   telegram_attach — deliver local files to the chat
 //   telegram_ask    — ask a multiple-choice question with inline buttons
-// Communication with the gateway runs through a spool directory (REMOTE_PI_SPOOL):
-//   events.jsonl        extension -> gateway (attach / ask events, JSONL, append-only)
-//   answers/<id>.json   gateway -> extension (ask answers, one file per ask)
-import { existsSync } from "node:fs";
-import { appendFile, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
+import { stat } from "node:fs/promises";
 import { Type } from "typebox";
 
-const SPOOL = process.env.REMOTE_PI_SPOOL;
 const ASK_TIMEOUT_MS = 5 * 60_000;
 
 export default function (pi) {
-  if (!SPOOL) return; // Only meaningful when spawned by the gateway.
-
-  async function emit(event) {
-    await appendFile(join(SPOOL, "events.jsonl"), `${JSON.stringify(event)}\n`);
-  }
-
   pi.registerTool({
     name: "telegram_attach",
     label: "Telegram Attach",
@@ -35,8 +22,10 @@ export default function (pi) {
         const info = await stat(path);
         if (!info.isFile()) throw new Error(`Not a file: ${path}`);
       }
-      await emit({ type: "attach", paths: params.paths });
-      return { content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s) for Telegram delivery.` }], details: { paths: params.paths } };
+      return {
+        content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s) for Telegram delivery.` }],
+        details: { paths: params.paths },
+      };
     },
   });
 
@@ -50,18 +39,12 @@ export default function (pi) {
       question: Type.String({ description: "Short question shown above the buttons" }),
       options: Type.Array(Type.String({ description: "Button label" }), { minItems: 2, maxItems: 8 }),
     }),
-    async execute(_toolCallId, params) {
-      const id = `ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      await emit({ type: "ask", id, question: params.question, options: params.options });
-      const answerPath = join(SPOOL, "answers", `${id}.json`);
-      for (let waited = 0; waited < ASK_TIMEOUT_MS; waited += 500) {
-        await sleep(500);
-        if (existsSync(answerPath)) {
-          const { answer } = JSON.parse(await readFile(answerPath, "utf8"));
-          return { content: [{ type: "text", text: `用户选择了：${answer}` }], details: { answer } };
-        }
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const answer = await ctx.ui.select(params.question, params.options, { timeout: ASK_TIMEOUT_MS });
+      if (answer) {
+        return { content: [{ type: "text", text: `用户选择了：${answer}` }], details: { answer } };
       }
-      return { content: [{ type: "text", text: "（用户 5 分钟内未回答）" }], details: { answer: null } };
+      return { content: [{ type: "text", text: "（用户 5 分钟内未回答或取消）" }], details: { answer: null } };
     },
   });
 }

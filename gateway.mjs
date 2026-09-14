@@ -3,15 +3,15 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { copyFile, appendFile, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { existsSync, openAsBlob, readFileSync } from "node:fs";
+import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import MarkdownIt from "markdown-it";
 
-const MAX_MESSAGE = 1800;
+const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 const HELP = `Remote Pi
 
@@ -28,8 +28,6 @@ const HELP = `Remote Pi
 /new                新会话
 /name <名称>         设置会话名
 /session            当前模型、Session、Token 和费用
-/history [条数]      历史消息，默认 20，最多 50
-/tree               查看 Session 树
 /fork               从历史用户消息创建分支
 /clone              克隆当前分支
 /compact [要求]      压缩上下文
@@ -45,8 +43,8 @@ const BOT_COMMANDS = [
   ["cwd", "查看或切换工作目录"], ["sh", "直接执行 Shell 命令"], ["get", "下载项目文件"],
   ["model", "查看或切换模型"], ["thinking", "查看或切换思考级别"],
   ["resume", "恢复历史会话"], ["new", "新会话"], ["name", "设置会话名"],
-  ["session", "Session 和费用"], ["history", "查看历史消息"],
-  ["tree", "查看 Session 树"], ["fork", "从历史分支"], ["clone", "克隆当前分支"],
+  ["session", "Session 和费用"],
+  ["fork", "从历史分支"], ["clone", "克隆当前分支"],
   ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务（保留队列）"],
   ["restart", "重启 Gateway"],
   ["queue", "查看或清空队列"],
@@ -66,105 +64,91 @@ function retryableTelegramStatus(status) {
   return status === 429 || status >= 500;
 }
 
-function telegramSkillName(piName) {
-  return `skill_${piName.slice("skill:".length).toLowerCase().replace(/[^a-z0-9_]/g, "_")}`.slice(0, 32);
-}
-
 function telegramCommandName(command) {
-  if (command.source === "skill") return telegramSkillName(command.name);
-  return command.name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
-}
-
-function escapeTelegramMarkdown(text) {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
-}
-
-function inlineTelegramMarkdown(text) {
-  const placeholders = [];
-  const hold = (rendered) => {
-    const key = `\x1a${placeholders.length}\x1a`;
-    placeholders.push(rendered);
-    return key;
-  };
-
-  let s = text.replace(/(?<!`)(`+)([\s\S]+?)(?<!`)\1(?!`)/g, (_, ticks, code) => {
-    let clean = code;
-    if (clean.startsWith(" ") && clean.endsWith(" ") && clean.trim().length > 0) clean = clean.slice(1, -1);
-    return hold(`\`${clean.replace(/[\\`]/g, "\\$&")}\``);
-  });
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_, label, url) => hold(`[${escapeTelegramMarkdown(label)}](${url.replace(/[\\)]/g, "\\$&")})`));
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, content) => hold(`*${escapeTelegramMarkdown(content)}*`));
-  s = s.replace(/~~([^~\n]+)~~/g, (_, content) => hold(`~${escapeTelegramMarkdown(content)}~`));
-  s = s.replace(/(?<!\*)\*([^*\n\s](?:[^*\n]*[^*\n\s])?)\*(?!\*)/g, (_, content) => hold(`_${escapeTelegramMarkdown(content)}_`));
-  s = s.replace(/(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)/g, (_, content) => hold(`_${escapeTelegramMarkdown(content)}_`));
-  s = escapeTelegramMarkdown(s);
-  while (/\x1a(\d+)\x1a/.test(s)) s = s.replace(/\x1a(\d+)\x1a/g, (_, index) => placeholders[Number(index)]);
-  return s;
-}
-
-function formatAssistantError(errorMessage) {
-  const message = String(errorMessage || "模型调用失败");
-  if (/usage limit|quota|balance|credit|insufficient|budget/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 提示：当前模型用量额度已用尽。你可以使用 /model 切换到其他可用模型（例如 Gemini 或 Claude）。`;
-  }
-  if (/rate limit|too many requests|429/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 提示：触发了服务商速率限制，请稍候重试，或使用 /model 切换模型。`;
-  }
-  return `❌ ${message}`;
+  const name = command.source === "skill" ? `skill_${command.name.slice("skill:".length)}` : command.name;
+  return name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
 }
 
 function expandableBlockquote(text) {
   const clean = String(text || "").trim();
-  if (!clean) return "";
-  const lines = clean.split("\n").map((line) => `>${line}`).join("\n");
-  return `**${lines}||`;
+  return clean ? `\`\`\`expandable\n${clean}\n\`\`\`` : "";
 }
 
-function telegramMarkdown(text) {
-  const blocks = [];
-  const holdBlock = (rendered) => {
-    const key = `\x1bBLOCK_${blocks.length}\x1b`;
-    blocks.push(rendered);
-    return key;
-  };
+// markdown-it + 自定义 renderer → Telegram HTML 子集（b/i/s/u/code/pre/a/blockquote）
+// html:false：模型输出里的原始 HTML 一律转义，防注入；linkify:true：裸 URL 自动成链接
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 
-  const fenceRegex = /^[ \t]{0,3}```([^\n]*)\n([\s\S]*?\n)?[ \t]{0,3}```[ \t]*$/gm;
-  let s = text.replace(fenceRegex, (_, info, body) => {
-    const lang = (info || "").trim().split(/\s+/)[0].replace(/[^a-zA-Z0-9_+-]/g, "");
-    const code = (body || "").replace(/[\\`]/g, "\\$&").replace(/\n$/, "");
-    return holdBlock(`\`\`\`${lang}\n${code}\n\`\`\``);
-  });
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+const { rules } = md.renderer;
 
-  s = s.replace(/(?:^[ \t]*\|.+?\|[ \t]*$\n?)+/gm, (table) => {
-    if (!/^[ \t]*\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|[ \t]*$/m.test(table)) return table;
-    const newline = table.endsWith("\n") ? "\n" : "";
-    return holdBlock(`\`\`\`\n${table.trim().replace(/[\\`]/g, "\\$&")}\n\`\`\``) + newline;
-  });
+rules.code_inline = (t, i) => `<code>${esc(t[i].content)}</code>`;
+rules.fence = (t, i) => {
+  const info = (t[i].info || "").trim().split(/\s+/)[0];
+  const body = esc(t[i].content.replace(/\n$/, ""));
+  if (info === "expandable") return `<blockquote expandable>${body}</blockquote>\n\n`;
+  return info
+    ? `<pre><code class="language-${info.replace(/[^a-zA-Z0-9_+-]/g, "")}">${body}</code></pre>\n\n`
+    : `<pre>${body}</pre>\n\n`;
+};
+rules.code_block = (t, i) => `<pre>${esc(t[i].content)}</pre>\n\n`;
 
-  s = s.replace(/^\*\*>\s?([\s\S]*?)\|\|$/gm, (_, content) => {
-    const lines = content.split("\n").map((line) => {
-      const clean = line.replace(/^>\s?/, "");
-      return `>${inlineTelegramMarkdown(clean)}`;
+rules.paragraph_open = () => "";
+rules.paragraph_close = () => "";
+rules.heading_open = () => "<b>";
+rules.heading_close = () => "</b>\n\n";
+rules.blockquote_open = () => "<blockquote>";
+rules.blockquote_close = () => "</blockquote>\n\n";
+
+// 列表：去掉 ul/ol 包装；有序序号自计数；嵌套按层级缩进（render 同步执行，模块级栈安全）
+let listStack = [];
+rules.bullet_list_open = () => { listStack.push(null); return listStack.length >= 2 ? "\n" : ""; };
+rules.ordered_list_open = () => { listStack.push(0); return listStack.length >= 2 ? "\n" : ""; };
+rules.bullet_list_close = () => { listStack.pop(); return listStack.length ? "" : "\n"; };
+rules.ordered_list_close = () => { listStack.pop(); return listStack.length ? "" : "\n"; };
+rules.list_item_open = () => {
+  const depth = listStack.length;
+  const top = listStack[depth - 1];
+  if (top === null) return `${"  ".repeat(depth - 1)}• `;
+  listStack[depth - 1] = top + 1;
+  return `${"  ".repeat(depth - 1)}${top + 1}. `;
+};
+rules.list_item_close = () => "\n";
+
+rules.link_open = (t, i) => `<a href="${escAttr(t[i].attrGet("href") || "")}">`;
+rules.link_close = () => "</a>";
+rules.image = (t, i) => {
+  const src = t[i].attrGet("src") || "";
+  const alt = (t[i].children || []).map((c) => c.content).join("") || src;
+  return `<a href="${escAttr(src)}">${esc(alt)}</a>`;
+};
+
+rules.hardbreak = () => "\n";
+rules.softbreak = () => "\n";
+rules.hr = () => "─ ─ ─\n\n";
+
+const rawRender = md.renderer.render.bind(md.renderer);
+md.renderer.render = (tokens, options, env) => {
+  const out = rawRender(tokens, options, env)
+    .replaceAll("<strong>", "<b>").replaceAll("</strong>", "</b>")
+    .replaceAll("<em>", "<i>").replaceAll("</em>", "</i>")
+    // Telegram 无 <table>：拆成手机友好的标题行 + bullet 行（保留单元格内行内标记）
+    .replace(/<table>[\s\S]*?<\/table>/g, (m) => {
+      const rows = m.match(/<tr>[\s\S]*?<\/tr>/g) || [];
+      const cells = rows
+        .map((r) => (r.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/g) || [])
+          .map((c) => c.replace(/<\/?t[hd][^>]*>/g, "").trim()));
+      const body = cells.filter((cs) => !cs.every((c) => !c || /^:?-+:?$/.test(c.replace(/<[^>]+>/g, ""))));
+      if (body.length < 2) return m;
+      const [head, ...data] = body;
+      return [`<b>${head.join(" · ")}</b>`, ...data.map((r) => `• ${r.join(" — ")}`)].join("\n") + "\n\n";
     });
-    return holdBlock(`**${lines.join("\n")}||`);
-  });
+  listStack = [];
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+};
 
-  const renderLine = (line) => {
-    if (line.includes("\x1bBLOCK_")) return line;
-    let match = line.match(/^#{1,6}\s+(.+)$/);
-    if (match) return `*${escapeTelegramMarkdown(match[1].trim())}*`;
-    match = line.match(/^(\s*)[-*+]\s+(.+)$/);
-    if (match) return `${match[1]}• ${inlineTelegramMarkdown(match[2])}`;
-    match = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
-    if (match) return `${match[1]}${match[2]}\\. ${inlineTelegramMarkdown(match[3])}`;
-    match = line.match(/^>\s?(.*)$/);
-    if (match) return `>${inlineTelegramMarkdown(match[1])}`;
-    return inlineTelegramMarkdown(line);
-  };
-
-  s = s.split("\n").map(renderLine).join("\n");
-  while (/\x1bBLOCK_(\d+)\x1b/.test(s)) s = s.replace(/\x1bBLOCK_(\d+)\x1b/g, (_, index) => blocks[Number(index)]);
-  return s;
+function telegramHtml(text) {
+  return md.render(String(text || ""));
 }
 
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -213,22 +197,9 @@ function chunks(text, limit = MAX_MESSAGE) {
   return parts;
 }
 
-function contentText(content, includeThinking = false) {
+function extractText(content) {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.map((part) => {
-    if (part.type === "text") return part.text;
-    if (includeThinking && part.type === "thinking") return `💭 ${part.thinking}`;
-    if (part.type === "toolCall") return `🔧 ${part.name} ${JSON.stringify(part.arguments)}`;
-    if (part.type === "image") return "[图片]";
-    return "";
-  }).filter(Boolean).join("\n");
-}
-
-function assistantText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.map((part) => (part.type === "text" ? part.text : "")).filter(Boolean).join("\n");
+  return Array.isArray(content) ? content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : "";
 }
 
 function toolSummary(name, args = {}) {
@@ -238,17 +209,15 @@ function toolSummary(name, args = {}) {
   return json && json !== "{}" ? `${name} ${json}` : name;
 }
 
-function renderToolPanel(tools, isSettled = false, now = Date.now()) {
+function renderToolPanel(tools, isSettled = false) {
   if (!tools.length) return "";
   const total = tools.length;
   const done = tools.filter((t) => t.status !== "running").length;
-  const header = isSettled ? `🛠 已完成 ${total} 项操作` : `⚙️ 正在执行操作 (${done}/${total})…`;
+  const header = isSettled ? `✅ 已完成 ${total} 项操作` : `⚙️ 正在执行操作 (${done}/${total})…`;
   const recent = tools.slice(-6).map((t) => {
     const icon = t.status === "running" ? "⏳" : t.status === "error" ? "❌" : "✅";
     const summary = t.summary.length > 80 ? `${t.summary.slice(0, 77)}…` : t.summary;
-    const seconds = t.startedAt ? Math.floor((now - t.startedAt) / 1000) : 0;
-    const elapsed = t.status === "running" && seconds >= 30 ? ` · ${Math.floor(seconds / 60)}m ${seconds % 60}s` : "";
-    return `• ${icon} ${summary}${elapsed}`;
+    return `• ${icon} ${summary}`;
   });
   const hidden = tools.length - recent.length;
   const prefix = hidden > 0 ? [`… 之前已完成 ${hidden} 项`] : [];
@@ -257,21 +226,6 @@ function renderToolPanel(tools, isSettled = false, now = Date.now()) {
     return `${header}\n${expandableBlockquote(body)}`;
   }
   return [header, ...prefix, ...recent].join("\n");
-}
-
-function entryText(entry) {
-  if (entry.type === "message") {
-    const message = entry.message;
-    const labels = { user: "👤", assistant: "🤖", toolResult: "🔧", bashExecution: "⌨️" };
-    const body = message.role === "bashExecution"
-      ? `${message.command}\n${message.output}`
-      : contentText(message.content);
-    return `${labels[message.role] ?? message.role}: ${body || "（无文本内容）"}`;
-  }
-  if (entry.type === "compaction") return `📦 压缩：${entry.summary}`;
-  if (entry.type === "branch_summary") return `🌿 分支摘要：${entry.summary}`;
-  if (entry.type === "custom_message") return `📎 ${contentText(entry.content)}`;
-  return "";
 }
 
 function formatContextTokens(count) {
@@ -308,8 +262,18 @@ function attachmentPrompt(caption, files) {
 }
 
 function previewText(text) {
-  const chars = [...text];
-  return chars.slice(0, MAX_MESSAGE).join("") + (chars.length > MAX_MESSAGE ? "\n\n*(内容较长，输出中…)*" : "");
+  return text.length > MAX_MESSAGE ? `${text.slice(0, MAX_MESSAGE)}\n\n*(内容较长，输出中…)*` : text;
+}
+
+function formatAssistantError(errorMessage) {
+  const message = String(errorMessage || "模型调用失败");
+  if (/usage limit|quota|balance|credit|insufficient|budget/i.test(message)) {
+    return `⚠️ ${message}\n\n💡 提示：当前模型用量额度已用尽。你可以使用 /model 切换到其他可用模型（例如 Gemini 或 Claude）。`;
+  }
+  if (/rate limit|too many requests|429/i.test(message)) {
+    return `⚠️ ${message}\n\n💡 提示：触发了服务商速率限制，请稍候重试，或使用 /model 切换模型。`;
+  }
+  return `❌ ${message}`;
 }
 
 function runStt(sttCommand, audioPath) {
@@ -344,32 +308,15 @@ function loadConfig() {
     approve: file.approve !== false,
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "👀",
-    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "👍",
+    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "🫡",
   };
   config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
   config.downloadsDir = join(config.stateDir, "downloads");
-  config.spoolDir = join(config.stateDir, "spool");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
   if (!existsSync(config.cwd)) throw new Error(`Pi working directory does not exist: ${config.cwd}`);
   if (!existsSync(config.devRoot)) throw new Error(`Project directory does not exist: ${config.devRoot}`);
   return config;
-}
-
-let rotatingLog = false;
-async function rotateLog(logFile, maxSize = MAX_LOG_SIZE) {
-  if (!logFile || rotatingLog) return;
-  rotatingLog = true;
-  try {
-    const s = await stat(logFile);
-    if (s.size >= maxSize) {
-      await copyFile(logFile, `${logFile}.1`);
-      await truncate(logFile, 0);
-    }
-  } catch {
-  } finally {
-    rotatingLog = false;
-  }
 }
 
 class Telegram {
@@ -409,10 +356,10 @@ class Telegram {
   async sendOne(chatId, text, extra = {}) {
     const plain = String(text || "（无内容）");
     try {
-      return await this.call("sendMessage", { chat_id: chatId, text: telegramMarkdown(plain), parse_mode: "MarkdownV2", ...extra });
+      return await this.call("sendMessage", { chat_id: chatId, text: telegramHtml(plain), parse_mode: "HTML", ...extra });
     } catch (error) {
       if (!error.message.includes("can't parse entities")) throw error;
-      console.error("Markdown parse fallback:", error.message);
+      console.error("HTML parse fallback:", error.message);
       return this.call("sendMessage", { chat_id: chatId, text: plain, ...extra });
     }
   }
@@ -429,10 +376,10 @@ class Telegram {
     const timeout = ephemeral ? 10_000 : 35_000;
     const maxAttempts = ephemeral ? 1 : 3;
     try {
-      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramMarkdown(plain), parse_mode: "MarkdownV2" }, timeout, maxAttempts);
+      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramHtml(plain), parse_mode: "HTML" }, timeout, maxAttempts);
     } catch (error) {
       if (error.message.includes("can't parse entities")) {
-        console.error("Markdown parse fallback:", error.message);
+        console.error("HTML parse fallback:", error.message);
         return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain }, timeout, maxAttempts);
       }
       if (!error.message.includes("message is not modified")) throw error;
@@ -459,14 +406,13 @@ class Telegram {
   async sendDocument(chatId, path) {
     const form = new FormData();
     form.set("chat_id", String(chatId));
-    form.set("document", new Blob([await readFile(path)]), basename(path));
+    form.set("document", await openAsBlob(path), basename(path));
     const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
   }
 
   async sendDraft(chatId, draftId, text) {
-    // Bot API 9.5+; ephemeral streaming preview, replaced when the final message is sent.
     await this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text, can_stop: true }, 10_000, 1);
   }
 
@@ -480,7 +426,7 @@ class Telegram {
     const reaction = list.map((e) => (typeof e === "string" ? { type: "emoji", emoji: e } : e));
     try {
       return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction }, 5000, 1);
-    } catch (error) {
+    } catch {
       if (reaction.length > 1) {
         try {
           return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: [reaction.at(-1)] }, 5000, 1);
@@ -500,7 +446,6 @@ class Telegram {
           offset, timeout: 50, allowed_updates: ["message", "callback_query", "stopped_message_generation"],
         }, 60_000);
         for (const update of updates) {
-          // At-most-once is safer than running a coding instruction twice after a crash.
           offset = update.update_id + 1;
           const tmp = `${this.offsetPath}.tmp`;
           await writeFile(tmp, String(offset), { mode: 0o600 });
@@ -519,67 +464,25 @@ class Telegram {
   }
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
 class PiRpc {
-  constructor(config, onEvent, isBusy) {
+  constructor(config, onEvent) {
     this.config = config;
     this.onEvent = onEvent;
-    this.isBusyCallback = isBusy || (() => false);
     this.pending = new Map();
     this.sequence = 0;
-    this.closing = false;
-    this.idleStopping = false;
-    this.startingPromise = null;
-    this.idleStoppingPromise = null;
-    this.idleTimeoutMs = Number(process.env.REMOTE_PI_IDLE_TIMEOUT_MS) || DEFAULT_IDLE_TIMEOUT_MS;
-    this.idleTimer = null;
-  }
-
-  isBusy() {
-    return this.pending.size > 0 || this.isBusyCallback();
-  }
-
-  touch() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
-    if (this.closing || this.idleStopping || !this.proc) return;
-    if (this.isBusy()) return;
-    this.idleTimer = setTimeout(() => {
-      this.idleTimer = null;
-      if (!this.isBusy()) this.stopIdle().catch((err) => console.error("Pi idle stop error:", err));
-    }, this.idleTimeoutMs);
-    this.idleTimer.unref();
+    this.proc = null;
   }
 
   async ensureStarted() {
-    if (this.proc && !this.idleStopping) return;
-    if (this.startingPromise) return this.startingPromise;
-    this.startingPromise = (async () => {
-      try {
-        if (this.idleStoppingPromise) await this.idleStoppingPromise;
-        await this.start();
-      } finally {
-        this.startingPromise = null;
-      }
-    })();
-    return this.startingPromise;
+    if (!this.proc) await this.start();
   }
 
   async start() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
-    this.closing = false;
-    this.idleStopping = false;
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
     const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
     if (existsSync(extensionPath)) args.push("-e", extensionPath);
-    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", REMOTE_PI_SPOOL: this.config.spoolDir, PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
+    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
     this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(process.stderr);
     await new Promise((resolveSpawn, reject) => {
@@ -587,8 +490,18 @@ class PiRpc {
       this.proc.once("error", reject);
     });
 
-    createInterface({ input: this.proc.stdout, crlfDelay: Infinity })
-      .on("line", (line) => line && this.handleLine(line));
+    let buffer = "";
+    this.proc.stdout.setEncoding("utf8");
+    this.proc.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line) this.handleLine(line);
+      }
+    });
     this.proc.on("close", (code, signal) => {
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
@@ -596,13 +509,7 @@ class PiRpc {
       }
       this.pending.clear();
       this.proc = null;
-      if (!this.closing && !this.idleStopping) {
-        console.error(`Pi exited (${code ?? signal}); exiting so launchd can restart both.`);
-        process.exitCode = 1;
-        setTimeout(() => process.exit(1), 100);
-      }
     });
-    this.touch();
   }
 
   handleLine(line) {
@@ -613,7 +520,6 @@ class PiRpc {
       const pending = this.pending.get(value.id);
       this.pending.delete(value.id);
       clearTimeout(pending.timer);
-      this.touch();
       value.success ? pending.resolve(value.data) : pending.reject(new Error(value.error || `${value.command} failed`));
     } else {
       this.onEvent(value);
@@ -622,60 +528,28 @@ class PiRpc {
 
   async request(type, fields = {}, timeout = 600_000) {
     await this.ensureStarted();
-    this.touch();
     const id = `tg-${++this.sequence}`;
     return new Promise((resolveRequest, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        this.touch();
         reject(new Error(`Pi RPC ${type} timed out`));
       }, timeout);
       this.pending.set(id, { resolve: resolveRequest, reject, timer });
       this.write({ id, type, ...fields });
-    }).finally(() => {
-      this.touch();
     });
   }
 
   write(value) {
     if (!this.proc?.stdin?.writable) throw new Error("Pi RPC is not running");
-    this.touch();
     this.proc.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
-  async stopProc() {
-    if (!this.proc) return;
-    const proc = this.proc;
-    this.proc = null;
-    proc.kill("SIGTERM");
-    await new Promise((resolveClose) => {
-      if (proc.killed || proc.exitCode !== null) return resolveClose();
-      proc.once("close", resolveClose);
-      setTimeout(resolveClose, 2000);
-    });
-  }
-
-  async stopIdle() {
-    if (!this.proc || this.closing || this.startingPromise) return;
-    if (this.isBusy()) return;
-    console.log(`${new Date().toISOString()} Pi RPC idle for ${Math.round(this.idleTimeoutMs / 60_000)}m; stopping subprocess to save memory.`);
-    this.idleStopping = true;
-    this.idleStoppingPromise = this.stopProc();
-    try {
-      await this.idleStoppingPromise;
-    } finally {
-      this.idleStopping = false;
-      this.idleStoppingPromise = null;
+  stop() {
+    if (this.proc) {
+      const proc = this.proc;
+      this.proc = null;
+      proc.kill("SIGTERM");
     }
-  }
-
-  async stop() {
-    this.closing = true;
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
-    await this.stopProc();
   }
 }
 
@@ -685,7 +559,7 @@ class Gateway {
     this.chatId = config.allowedUserId;
     this.chatReady = false;
     this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
-    this.pi = new PiRpc(config, (event) => this.queueEvent(event), () => this.isBusy());
+    this.pi = new PiRpc(config, (event) => this.queueEvent(event));
     this.actions = new Map();
     this.commandAliases = new Map();
     this.toolPanel = null;
@@ -697,27 +571,17 @@ class Gateway {
     this.telegramChain = Promise.resolve();
     this.draftSupport = "unknown";
     this.nextDraftId = 0;
-    this.spoolOffset = 0;
-    this.spoolInitialized = false;
     this.activeMessageIds = [];
   }
 
-  isBusy() {
-    return this.isStreaming || !!this.pendingUi || this.queue.steering.length > 0 || this.queue.followUp.length > 0;
-  }
-
   async start() {
-    await rotateLog(this.config.logFile);
-    this.logTimer = setInterval(() => { rotateLog(this.config.logFile).catch(() => {}); }, 60_000);
-    this.logTimer.unref();
+    // launchd 以 O_APPEND 持有日志 fd，启动时截断即可防无限增长（newsyslog 处理不了这种 fd）
+    await stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
     await Promise.all([
       mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
-      mkdir(join(this.config.spoolDir, "answers"), { recursive: true, mode: 0o700 }),
     ]);
-    await this.acquireLock();
-    // A stale webhook makes getUpdates return nothing forever.
     await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
     const me = await this.telegram.call("getMe");
     try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
@@ -726,70 +590,10 @@ class Gateway {
     const state = await this.pi.request("get_state");
     await this.registerBotCommands();
     console.log(`${new Date().toISOString()} @${me.username} ready; Pi session ${state.sessionId}`);
-    const eventsPath = join(this.config.spoolDir, "events.jsonl");
-    this.spoolTimer = setInterval(() => {
-      this.consumeSpool(eventsPath).catch((error) => console.error("Extension spool:", error.message));
-    }, 700);
-    this.spoolTimer.unref();
     await this.telegram.poll((update) => this.handleUpdate(update));
   }
 
-  // ponytail: check-then-write 有竞态窗口，防的是人手双开（相隔几秒），不是毫秒级并发
-  async acquireLock() {
-    const pidFile = join(this.config.stateDir, "gateway.pid");
-    const pid = Number(await readFile(pidFile, "utf8").catch(() => 0));
-    if (pid && pid !== process.pid) {
-      let alive = false;
-      try { process.kill(pid, 0); alive = true; } catch {}
-      if (alive) throw new Error(`另一个 gateway 正在运行 (pid ${pid})。先 ./install.sh stop`);
-    }
-    await writeFile(pidFile, String(process.pid), { mode: 0o600 });
-    this.pidFile = pidFile;
-  }
-
-  async consumeSpool(eventsPath) {
-    const buffer = await readFile(eventsPath).catch(() => null);
-    if (!buffer) return;
-    // First successful read: start from the current end so stale events from a previous run aren't replayed.
-    if (!this.spoolInitialized) {
-      this.spoolInitialized = true;
-      this.spoolOffset = buffer.length;
-      return;
-    }
-    if (buffer.length < this.spoolOffset) this.spoolOffset = 0;
-    const chunk = buffer.subarray(this.spoolOffset).toString("utf8");
-    this.spoolOffset = buffer.length;
-    for (const line of chunk.split("\n")) {
-      if (!line.trim()) continue;
-      let event;
-      try { event = JSON.parse(line); } catch { continue; }
-      await this.handleSpoolEvent(event);
-    }
-    // ponytail: truncate instead of rotating; offset 0 re-inits to "current end" on the next tick
-    if (buffer.length > 10 * 1024 * 1024) {
-      await truncate(eventsPath).catch(() => {});
-      this.spoolOffset = 0;
-    }
-  }
-
-  async handleSpoolEvent(event) {
-    if (event.type === "attach") {
-      for (const path of event.paths || []) {
-        await this.queueTelegram(async () => {
-          try { await this.telegram.sendDocument(this.chatId, path); }
-          catch (error) { await this.telegram.send(this.chatId, `❌ 附件发送失败 ${basename(path)}: ${error.message}`); }
-        });
-      }
-    } else if (event.type === "ask") {
-      const options = (event.options || []).slice(0, 8);
-      await this.queueTelegram(() => this.telegram.send(this.chatId, event.question, this.keyboard(options.map((option) => ({
-        label: option,
-        action: { type: "ask", askId: event.id, answer: option, question: event.question },
-      })))));
-    }
-  }
-
-  async saveDownload(fileId, name) {
+  async saveDownload(fileId, name, needsBase64 = false) {
     const file = await this.telegram.call("getFile", { file_id: fileId });
     const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
@@ -797,7 +601,7 @@ class Gateway {
     const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
     const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
     await writeFile(path, buffer);
-    return { path, data: buffer.toString("base64") };
+    return { path, data: needsBase64 ? buffer.toString("base64") : null };
   }
 
   queueEvent(event) {
@@ -814,6 +618,12 @@ class Gateway {
     return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
   }
 
+  settleActiveReactions() {
+    for (const id of this.activeMessageIds.splice(0)) {
+      this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
+    }
+  }
+
   async handleUpdate(update) {
     try {
       if (update.message) {
@@ -826,34 +636,28 @@ class Gateway {
         this.chatReady = true;
         await this.handleCallback(callback);
       } else if (update.stopped_message_generation) {
-        // User tapped the native stop button on a streaming draft.
         await this.handleCommand({ name: "abort", argument: "" }, "/abort");
       }
     } catch (error) {
       console.error("Telegram input:", error);
-      if (this.activeMessageIds.length) {
-        const ids = [...this.activeMessageIds];
-        this.activeMessageIds = [];
-        for (const id of ids) {
-          this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]).catch(() => {});
-        }
-      }
+      this.settleActiveReactions();
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
     }
   }
 
   async extractMedia(m) {
     if (m.photo?.length) {
-      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`);
+      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`, true);
       return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "图片" };
     }
     const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
     if (!file) return null;
+    const isImage = file.mime_type?.startsWith("image/");
     const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
-    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`);
-    const image = file.mime_type?.startsWith("image/") ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
+    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`, isImage);
+    const image = isImage ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
     const label = m.voice ? "语音消息" : file.file_name ? `文件 ${file.file_name}` : kind;
-    return { file, saved, image, label };
+    return { saved, image, label };
   }
 
   async handleMessage(message) {
@@ -862,7 +666,7 @@ class Gateway {
       this.pendingUi = null;
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
-      await this.telegram.send(this.chatId, "已提交。 ");
+      await this.telegram.send(this.chatId, "已提交。");
       await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
       return;
     }
@@ -904,25 +708,15 @@ class Gateway {
 
     const text = message.text?.trim();
     if (!text) return;
-    if (/^restart$/i.test(text)) {
-      await this.telegram.send(this.chatId, "⚠️ 如需重启 Gateway，请手动发送 /restart 命令。");
-      return;
-    }
 
     this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
 
     const command = parseCommand(text);
     if (command) {
-      if (command.name === "followup") {
-        this.activeMessageIds.push(message.message_id);
-      }
-      try {
-        await this.handleCommand(command, text);
-        if (command.name !== "followup") {
-          await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
-        }
-      } catch (error) {
-        throw error;
+      if (command.name === "followup") this.activeMessageIds.push(message.message_id);
+      await this.handleCommand(command, text);
+      if (command.name !== "followup") {
+        await this.telegram.setReaction(this.chatId, message.message_id, [this.config.ackEmoji, this.config.doneEmoji]);
       }
     } else {
       this.activeMessageIds.push(message.message_id);
@@ -931,12 +725,13 @@ class Gateway {
   }
 
   async handleMediaGroup(messages) {
-    const images = [];
+    const mediaList = await Promise.all(messages.map((m) => this.extractMedia(m)));
     const files = [];
+    const images = [];
     let caption = "";
-    for (const m of messages) {
-      if (m.caption) caption = m.caption;
-      const media = await this.extractMedia(m);
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].caption) caption = messages[i].caption;
+      const media = mediaList[i];
       if (!media) continue;
       files.push(media.saved);
       if (media.image) images.push(media.image);
@@ -974,7 +769,6 @@ class Gateway {
     }
     this.mediaGroups.clear();
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
-    if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
     this.toolPanel = null;
     if (this.draft) {
       if (this.draft.timer) clearTimeout(this.draft.timer);
@@ -985,14 +779,11 @@ class Gateway {
     }
     this.draft = null;
     this.queue = { steering: [], followUp: [] };
-    this.pi?.touch();
   }
 
   async prompt(message, images, streamingBehavior) {
     this.startTyping();
     try {
-      const state = await this.pi.request("get_state").catch(() => null);
-      if (state) this.isStreaming = state.isStreaming;
       const fields = { message };
       if (images) fields.images = images;
       const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
@@ -1042,8 +833,6 @@ class Gateway {
         return this.telegram.send(this.chatId, `✅ 会话名：${argument}`);
       }
       case "session": case "status": return this.showSession();
-      case "history": return this.showHistory(argument);
-      case "tree": return this.showTree();
       case "fork": return this.showForks();
       case "clone": {
         const result = await this.pi.request("clone");
@@ -1111,13 +900,7 @@ class Gateway {
         const kept = this.queue;
         this.resetSessionState();
         if (!clear) this.queue = kept;
-        if (this.activeMessageIds.length) {
-          const ids = [...this.activeMessageIds];
-          this.activeMessageIds = [];
-          for (const id of ids) {
-            this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
-          }
-        }
+        this.settleActiveReactions();
         return this.telegram.send(this.chatId, clear ? "⏹ 已停止，队列已清空" : "⏹ 已停止（排队消息保留，/abort clear 可清空）");
       }
       case "restart": {
@@ -1157,13 +940,11 @@ class Gateway {
         this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
       }
     }
-    if (data.commands.some((item) => item.name === "git-commit-push")) {
-      this.commandAliases.set("commit_push", "git-commit-push");
-      this.commandAliases.set("gcp", "git-commit-push");
-    }
     const finalCommands = commands.slice(0, 100);
-    await this.telegram.call("setMyCommands", { commands: finalCommands });
-    await this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } });
+    await Promise.all([
+      this.telegram.call("setMyCommands", { commands: finalCommands }),
+      this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
+    ]);
   }
 
   async showCommands() {
@@ -1237,30 +1018,40 @@ class Gateway {
       return info ? { path, name, mtime: info.mtimeMs } : null;
     }));
     const sorted = files.filter(Boolean).sort((a, b) => b.mtime - a.mtime).slice(0, 15);
-    const sessions = [];
-    for (const { path, name, mtime } of sorted) {
+    const parseHead = async ({ path, name, mtime }) => {
       try {
-        const raw = await readFile(path, "utf8");
+        const fh = await open(path, "r");
+        const buf = Buffer.alloc(16384);
+        const { bytesRead } = await fh.read(buf, 0, 16384, 0);
+        await fh.close();
+        const raw = buf.toString("utf8", 0, bytesRead);
         let header;
         let title = "";
-        for (const line of raw.split("\n")) {
+        for (const line of raw.split("\n", 20)) {
           if (!line) continue;
           let entry;
-          try { entry = JSON.parse(line); } catch { continue; }
+          try { entry = JSON.parse(line); } catch {
+            const m = line.match(/"role"\s*:\s*"user"[\s\S]*?"text"\s*:\s*"([^"\\]{1,60})/);
+            if (m) title = m[1];
+            continue;
+          }
           if (entry.type === "session") header = entry;
           if (entry.type === "session_info" && entry.name) title = entry.name;
-          if (!title && entry.type === "message" && entry.message?.role === "user") title = contentText(entry.message.content).slice(0, 60);
+          if (!title && entry.type === "message" && entry.message?.role === "user") title = extractText(entry.message.content).slice(0, 60);
           if (header && title) break;
         }
-        if (header?.cwd === this.config.cwd) sessions.push({ path, id: header.id, title: title || name, mtime });
-      } catch (error) { console.error(`Skipping session ${path}:`, error.message); }
-    }
-    return sessions;
+        if (header?.cwd === this.config.cwd) return { path, id: header.id, title: title || name, mtime };
+      } catch (error) {
+        console.error(`Skipping session ${path}:`, error.message);
+      }
+      return null;
+    };
+    return (await Promise.all(sorted.map(parseHead))).filter(Boolean);
   }
 
   async showSessions() {
     const sessions = (await this.sessionFiles()).slice(0, 12);
-    if (!sessions.length) return this.telegram.send(this.chatId, "当前目录还没有历史 Session。 ");
+    if (!sessions.length) return this.telegram.send(this.chatId, "当前目录还没有历史 Session。");
     return this.telegram.send(this.chatId, "选择 Session：", this.keyboard(sessions.map((session) => ({
       label: session.title,
       action: { type: "resume", path: session.path },
@@ -1278,32 +1069,10 @@ class Gateway {
     ].join("\n"));
   }
 
-  async showHistory(argument) {
-    const count = Math.min(Math.max(Number(argument) || 20, 1), 50);
-    const data = await this.pi.request("get_entries");
-    const formatted = data.entries.map(entryText).filter(Boolean).slice(-count);
-    await this.telegram.send(this.chatId, formatted.join("\n\n") || "暂无历史消息。 ");
-  }
-
-  async showTree() {
-    const data = await this.pi.request("get_tree");
-    const lines = [];
-    const visit = (node, depth) => {
-      if (lines.length >= 80) return;
-      const entry = node.entry;
-      const summary = entryText(entry).replaceAll("\n", " ").slice(0, 100) || entry.type;
-      lines.push(`${"  ".repeat(depth)}${entry.id === data.leafId ? "●" : "○"} ${entry.id} ${summary}`);
-      for (const child of node.children || []) visit(child, depth + 1);
-    };
-    for (const root of data.tree) visit(root, 0);
-    if (lines.length >= 80) lines.push("…仅显示前 80 个节点");
-    await this.telegram.send(this.chatId, lines.join("\n") || "Session 树为空。 ");
-  }
-
   async showForks() {
     const data = await this.pi.request("get_fork_messages");
     const messages = data.messages.slice(-12).reverse();
-    if (!messages.length) return this.telegram.send(this.chatId, "没有可分支的用户消息。 ");
+    if (!messages.length) return this.telegram.send(this.chatId, "没有可分支的用户消息。");
     return this.telegram.send(this.chatId, "从哪条消息创建分支？", this.keyboard(messages.map((message) => ({
       label: message.text.replaceAll("\n", " ").slice(0, 60),
       action: { type: "fork", entryId: message.entryId },
@@ -1337,9 +1106,10 @@ class Gateway {
         return;
       } else if (action.type === "ui") {
         this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
-      } else if (action.type === "ask") {
-        await writeFile(join(this.config.spoolDir, "answers", `${action.askId}.json`), JSON.stringify({ answer: action.answer }));
-        await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${action.question}\n\n✅ ${action.answer}`).catch(() => {});
+        if (callback.message) {
+          const chosen = action.response?.value ?? (action.response?.confirmed ? "确认" : "取消");
+          await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
+        }
       }
       await this.telegram.answer(callback.id, "完成");
     } catch (error) {
@@ -1363,12 +1133,12 @@ class Gateway {
     await rename(temporary, this.config.configPath);
     await this.telegram.answer(callbackId, "正在切换");
     await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
-    await this.pi.stop();
+    this.pi.stop();
     this.config.cwd = target;
     this.config.sessionDir = join(this.config.stateDir, "sessions", target.replace(/^\//, "").replaceAll("/", "-"));
     await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
     this.resetSessionState();
-    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event), () => this.isBusy());
+    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event));
     await this.pi.start();
     await this.registerBotCommands();
     const state = await this.pi.request("get_state");
@@ -1381,18 +1151,14 @@ class Gateway {
       this.pendingUi = null;
       this.repliedInRun = false;
       this.startTyping();
-      this.pi?.touch();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
-      if (this.toolPanel?.heartbeat) clearInterval(this.toolPanel.heartbeat);
       this.toolPanel = null;
     }
     if (event.type === "agent_settled") {
       this.isStreaming = false;
       this.pendingUi = null;
       this.stopTyping();
-      this.pi?.touch();
       if (this.toolPanel && this.toolPanel.tools.length) {
-        if (this.toolPanel.heartbeat) clearInterval(this.toolPanel.heartbeat);
         for (const tool of this.toolPanel.tools) {
           if (tool.status === "running") tool.status = "done";
         }
@@ -1408,13 +1174,7 @@ class Gateway {
       if (!this.repliedInRun) {
         this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复（可能是上游请求超时）。可使用 /model 切换模型或重试。"));
       }
-      if (this.activeMessageIds.length) {
-        const ids = [...this.activeMessageIds];
-        this.activeMessageIds = [];
-        for (const id of ids) {
-          this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, [this.config.ackEmoji, this.config.doneEmoji]));
-        }
-      }
+      this.settleActiveReactions();
     }
     if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
     if (!this.chatReady) return;
@@ -1446,7 +1206,7 @@ class Gateway {
       const draft = this.draft || { text: "", messageId: null, timer: null };
       this.draft = null;
       if (draft.timer) clearTimeout(draft.timer);
-      const content = assistantText(event.message.content);
+      const content = extractText(event.message.content);
       if (content) draft.text = content;
       if (event.message.stopReason === "error" || event.message.errorMessage) {
         const errText = formatAssistantError(event.message.errorMessage);
@@ -1459,31 +1219,29 @@ class Gateway {
     }
 
     if (event.type === "tool_execution_start") {
-      if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, heartbeat: null, sending: false };
+      if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, sending: false };
       this.toolPanel.tools.push({
         id: event.toolCallId,
         summary: toolSummary(event.toolName, event.args),
         status: "running",
         startedAt: Date.now(),
       });
-      if (!this.toolPanel.heartbeat) {
-        const panel = this.toolPanel;
-        panel.heartbeat = setInterval(() => {
-          if (this.toolPanel === panel) this.queueTelegram(() => this.flushToolPanel(false));
-        }, 30_000);
-        panel.heartbeat.unref();
-      }
       this.scheduleToolPanelUpdate(false, false);
     }
     if (event.type === "tool_execution_end") {
       if (this.toolPanel) {
         const tool = this.toolPanel.tools.find((item) => item.id === event.toolCallId);
         if (tool) tool.status = event.isError ? "error" : "done";
-        if (!this.toolPanel.tools.some((item) => item.status === "running") && this.toolPanel.heartbeat) {
-          clearInterval(this.toolPanel.heartbeat);
-          this.toolPanel.heartbeat = null;
-        }
         this.scheduleToolPanelUpdate(false, false);
+      }
+      if (event.toolName === "telegram_attach" && !event.isError) {
+        const paths = event.result?.details?.paths || event.args?.paths || [];
+        for (const path of paths) {
+          this.queueTelegram(async () => {
+            try { await this.telegram.sendDocument(this.chatId, path); }
+            catch (error) { await this.telegram.send(this.chatId, `❌ 附件发送失败 ${basename(path)}: ${error.message}`); }
+          });
+        }
       }
     }
     if (event.type === "extension_ui_request") await this.handleUiRequest(event);
@@ -1553,7 +1311,6 @@ class Gateway {
           }
         }
       }
-      // Fallback preview: silent real message edited in place; finishDraft deletes it and sends the final answer.
       if (draft.messageId) await this.telegram.edit(this.chatId, draft.messageId, text, true);
       else draft.messageId = (await this.telegram.sendOne(this.chatId, text, { disable_notification: true })).message_id;
     } catch {
@@ -1564,7 +1321,6 @@ class Gateway {
 
   async finishDraft(draft) {
     if (!draft.text) return;
-    // Dismiss the preview; the final answer is sent fresh so the phone rings once.
     if (this.draftSupport === "supported" && draft.draftId !== null) {
       await this.telegram.sendDraft(this.chatId, draft.draftId, "").catch(() => {});
     }
@@ -1590,9 +1346,6 @@ class Gateway {
 
   stop() {
     this.resetSessionState();
-    if (this.logTimer) clearInterval(this.logTimer);
-    if (this.spoolTimer) clearInterval(this.spoolTimer);
-    try { unlinkSync(this.pidFile); } catch {}
     this.pi.stop();
   }
 }
@@ -1607,30 +1360,39 @@ async function selfTest() {
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project"), true);
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project/nested"), false);
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/other"), false);
-  assert.equal(telegramSkillName("skill:grill-me"), "skill_grill_me");
-  assert.equal(telegramSkillName(`skill:${"a".repeat(40)}`).length, 32);
-  assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");
   assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
-  assert.equal(telegramMarkdown("### Status!\n- **ready** and `a_b`"), "*Status\\!*\n• *ready* and `a_b`");
-  assert.equal(telegramMarkdown("```js\na_b();\n```"), "```js\na_b();\n```");
-  assert.ok(telegramMarkdown("| A | B |\n|---|---|\n| 1 | 2 |").includes("```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"));
+  assert.equal(telegramCommandName({ name: `skill:${"a".repeat(40)}`, source: "skill" }).length, 32);
+  assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");
+
+  // HTML format checks (markdown-it renderer)
+  assert.equal(telegramHtml("### Status!\n- **ready** and `a_b`"), "<b>Status!</b>\n\n• <b>ready</b> and <code>a_b</code>");
+  assert.equal(telegramHtml("```js\na_b();\n```"), '<pre><code class="language-js">a_b();</code></pre>');
+  assert.equal(telegramHtml("| A | B |\n|---|---|\n| 1 | 2 |"), "<b>A · B</b>\n• 1 — 2");
   assert.equal(
-    telegramMarkdown("- code: `/```([^\\n]*)\\n?([\\s\\S]*?)```/` and ```` ```lang ````"),
-    "• code: `/\\`\\`\\`([^\\\\n]*)\\\\n?([\\\\s\\\\S]*?)\\`\\`\\`/` and `\\`\\`\\`lang`"
+    telegramHtml(expandableBlockquote("line 1\nline 2")),
+    "<blockquote expandable>line 1\nline 2</blockquote>"
   );
-  assert.equal(telegramMarkdown("**`code`**"), "*`code`*");
-  assert.equal(expandableBlockquote("line 1\nline 2"), "**>line 1\n>line 2||");
+  assert.equal(telegramHtml("> quote 1\n> quote 2"), "<blockquote>quote 1\nquote 2</blockquote>");
+  assert.equal(telegramHtml("**`code`**"), "<b><code>code</code></b>");
   assert.equal(
-    telegramMarkdown(expandableBlockquote("line 1\nline 2")),
-    "**>line 1\n>line 2||"
+    telegramHtml("- a\n  - nested\n\n1. first\n2. second"),
+    "• a\n  • nested\n\n1. first\n2. second"
   );
+  assert.equal(telegramHtml("nested **bold _inner_ end**"), "nested <b>bold <i>inner</i> end</b>");
+  assert.equal(telegramHtml("A & B < C > D"), "A &amp; B &lt; C &gt; D");
+  assert.equal(
+    telegramHtml("[link](https://example.com) and https://t.me"),
+    '<a href="https://example.com">link</a> and <a href="https://t.me">https://t.me</a>'
+  );
+
   assert.ok(formatAssistantError("Codex error: The usage limit has been reached").includes("额度已用尽"));
   assert.ok(formatAssistantError("Rate limit exceeded").includes("速率限制"));
   assert.equal(formatAssistantError("Network failure"), "❌ Network failure");
   assert.equal(retryableTelegramStatus(429), true);
   assert.equal(retryableTelegramStatus(500), true);
   assert.equal(retryableTelegramStatus(400), false);
-  const original = "a".repeat(4000) + "🐈";
+
+  const original = "a".repeat(8000) + "🎉";
   assert.equal(chunks(original).join(""), original);
   assert.ok(chunks(original).every((part) => [...part].length <= MAX_MESSAGE));
   const fenced = "```js\n" + "const a = 1;\n".repeat(10) + "```";
@@ -1638,22 +1400,13 @@ async function selfTest() {
   assert.ok(fencedChunks.length > 1);
   assert.ok(fencedChunks[0].endsWith("```"));
   assert.ok(fencedChunks[1].startsWith("```js\n"));
-  assert.equal(contentText([{ type: "text", text: "hi" }, { type: "toolCall", name: "read", arguments: { path: "x" } }]), 'hi\n🔧 read {"path":"x"}');
-  assert.equal(assistantText([{ type: "text", text: "hi" }, { type: "toolCall", name: "read", arguments: { path: "x" } }]), "hi");
+
+  assert.equal(extractText([{ type: "text", text: "hi" }, { type: "toolCall", name: "read", arguments: { path: "x" } }]), "hi");
   assert.equal(toolSummary("bash", { command: "git status" }), "bash: git status");
   assert.equal(toolSummary("read", { path: "foo.txt" }), "read: foo.txt");
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("⏳"));
-  assert.ok(renderToolPanel([{ summary: "web_search", status: "running", startedAt: 1_000 }], false, 66_000).includes("1m 5s"));
-  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("🛠 已完成 1 项操作"));
-  const mockPi = new PiRpc({ sessionDir: "/tmp" }, () => {}, () => false);
-  mockPi.proc = { kill: () => {} };
-  assert.equal(mockPi.isBusy(), false);
-  mockPi.touch();
-  assert.ok(mockPi.idleTimer !== null);
-  mockPi.isBusyCallback = () => true;
-  assert.equal(mockPi.isBusy(), true);
-  mockPi.touch();
-  assert.equal(mockPi.idleTimer, null);
+  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("✅ 已完成 1 项操作"));
+
   assert.equal(formatContextTokens(1048576), "1.0M");
   assert.equal(formatContextTokens(128000), "128K");
   assert.equal(formatContextTokens(8192), "8K");
@@ -1662,22 +1415,12 @@ async function selfTest() {
   assert.equal(extensionFromMime("weird/type"), "");
   assert.ok(attachmentPrompt("看看", [{ path: "/tmp/a b.txt" }]).includes("- /tmp/a b.txt"));
   assert.equal(previewText("ab"), "ab");
-  assert.ok(previewText("x".repeat(4000)).endsWith("*(内容较长，输出中…)*"));
-  assert.ok([...previewText("x".repeat(4000))].length <= MAX_MESSAGE + 20);
+  assert.ok(previewText("x".repeat(5000)).endsWith("*(内容较长，输出中…)*"));
+  assert.ok(previewText("x".repeat(5000)).length <= MAX_MESSAGE + 20);
   assert.equal(await runStt("printf %s $1", "/tmp/audio.ogg"), "/tmp/audio.ogg");
+
   {
     const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-    const sent = [];
-    gw.telegram = { send: async (_chat, text) => sent.push(text), sendDocument: async (_chat, path) => sent.push(`doc:${path}`) };
-    const eventsPath = join(tmpdir(), `remote-pi-spool-${Date.now()}.jsonl`);
-    await writeFile(eventsPath, "");
-    await gw.consumeSpool(eventsPath);
-    await appendFile(eventsPath, `${JSON.stringify({ type: "attach", paths: ["/tmp/a.txt"] })}\n${JSON.stringify({ type: "ask", id: "ask-1", question: "选一个", options: ["甲", "乙"] })}\n`);
-    await gw.consumeSpool(eventsPath);
-    await gw.consumeSpool(eventsPath);
-    assert.deepEqual(sent, ["doc:/tmp/a.txt", "选一个"]);
-    await unlink(eventsPath);
-
     gw.telegram.sendDraft = async () => { throw new Error("fetch failed"); };
     gw.telegram.sendOne = async () => ({ message_id: 123 });
     const draft = { text: "hello", flushing: false, draftId: null, messageId: null };
@@ -1687,7 +1430,22 @@ async function selfTest() {
     gw.telegram.sendDraft = async () => { throw new Error("Telegram sendMessageDraft: Not Found"); };
     await gw.flushDraft(draft);
     assert.equal(gw.draftSupport, "unsupported");
+
+    // Test telegram_attach auto delivery via tool_execution_end
+    gw.chatReady = true;
+    const docs = [];
+    gw.telegram.sendDocument = async (_chat, path) => docs.push(path);
+    await gw.handleEvent({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "telegram_attach",
+      isError: false,
+      result: { details: { paths: ["/tmp/file1.png", "/tmp/file2.pdf"] } },
+    });
+    await gw.telegramChain;
+    assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
   }
+
   assert.equal(
     formatSessionReset({
       model: {
@@ -1708,7 +1466,7 @@ async function selfTest() {
       "◆ CWD: /Users/user/dev/remote-pi",
     ].join("\n")
   );
-  console.log("self-test: ok");
+
   {
     const tg = new Telegram("123456:fake-token", "/tmp/fake-offset");
     const calls = [];
@@ -1726,25 +1484,20 @@ async function selfTest() {
       body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }] },
     });
 
-    await tg.setReaction(123, 456, ["👀", "👍"]);
+    await tg.setReaction(123, 456, ["👀", "🫡"]);
     assert.deepEqual(calls[1], {
       method: "setMessageReaction",
-      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }, { type: "emoji", emoji: "👍" }] },
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }, { type: "emoji", emoji: "🫡" }] },
     });
 
-    await tg.setReaction(123, 456, ["fail_multi", "👍"]);
+    await tg.setReaction(123, 456, ["fail_multi", "🫡"]);
     assert.deepEqual(calls[3], {
       method: "setMessageReaction",
-      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👍" }] },
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "🫡" }] },
     });
   }
-  const tmpLog = join(tmpdir(), `test-remote-pi-rot-${Date.now()}.log`);
-  await writeFile(tmpLog, "x".repeat(20));
-  await rotateLog(tmpLog, 10);
-  assert.equal((await stat(tmpLog)).size, 0);
-  assert.equal((await stat(`${tmpLog}.1`)).size, 20);
-  await unlink(tmpLog);
-  await unlink(`${tmpLog}.1`);
+
+  console.log("self-test: ok");
 }
 
 if (import.meta.main) {

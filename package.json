@@ -1,0 +1,8 @@
+{
+  "name": "remote-pi",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "markdown-it": "^15.0.2"
+  }
+}

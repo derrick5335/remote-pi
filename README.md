@@ -34,7 +34,7 @@ Send normal text to prompt Pi. Messages sent while Pi is working become steering
 - `/get <相对路径>`（下载项目文件或导出产物）
 - `/followup <消息>`（排队追加后续任务，不打断当前轮次）
 - `/model`, `/thinking`
-- `/resume`, `/new`, `/name`, `/session`, `/history`, `/tree`, `/fork`, `/clone`
+- `/resume`, `/new`, `/name`, `/session`, `/fork`, `/clone`
 - `/compact`, `/export`, `/abort`（停止当前任务，排队消息保留；`/abort clear` 连队列清空）, `/queue`
 - Extension commands and prompt templates
 - Skills appear in Telegram as `/skill_name`; manual `/skill-name` is also accepted and mapped to Pi's `/skill:name`
@@ -47,7 +47,7 @@ Telegram 发送的图片、文件、视频、语音均可作为上下文：文�
 }
 ```
 
-未配置 `sttCommand` 时语音仅落盘。模型还可主动使用两个 Telegram 工具（由同目录的 `telegram-extension.mjs` 提供，Gateway 自动以 `-e` 加载）：`telegram_attach` 把本地文件作为附件发到聊天（让 Pi 主动交付产物）；`telegram_ask` 用内联按钮向用户提问。Agent replies are rendered as safe Telegram MarkdownV2 (headings, lists, quotes, links, inline code, fenced code, bold, italic, and strikethrough), with plain-text fallback for malformed input. Only the configured user in a private chat is accepted.
+未配置 `sttCommand` 时语音仅落盘。模型还可主动使用两个 Telegram 工具（由同目录的 `telegram-extension.mjs` 提供，Gateway 自动以 `-e` 加载）：`telegram_attach` 把本地文件作为附件发到聊天（让 Pi 主动交付产物）；`telegram_ask` 用内联按钮向用户提问。Agent replies are rendered as safe Telegram HTML (headings, lists, quotes, links, inline code, fenced code, bold, italic, and strikethrough), with plain-text fallback for malformed input. Only the configured user in a private chat is accepted.
 
 ## Streaming & UI
 

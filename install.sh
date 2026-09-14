@@ -22,11 +22,7 @@ PI="$(command -v pi || echo /opt/homebrew/bin/pi)"
 
 install_command() {
     mkdir -p "$(dirname "$COMMAND")"
-    cat > "$COMMAND" <<EOF
-#!/bin/sh
-exec "$ROOT/install.sh" "\$@"
-EOF
-    chmod 755 "$COMMAND"
+    ln -sf "$ROOT/install.sh" "$COMMAND"
 }
 
 install() {
@@ -53,6 +49,7 @@ install() {
 EOF
     chmod 600 "$CONFIG"
     install_command
+    (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
 
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
