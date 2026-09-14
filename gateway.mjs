@@ -73,6 +73,25 @@ function isDirectChild(root, target) {
   return dirname(target) === root;
 }
 
+function buildDevPath(basePath = process.env.PATH) {
+  const home = homedir();
+  const extra = [
+    join(home, ".local", "bin"),
+    join(home, ".bun", "bin"),
+    join(home, ".cargo", "bin"),
+    join(home, ".opencode", "bin"),
+    join(home, ".antigravity", "antigravity", "bin"),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    dirname(process.execPath),
+  ];
+  const existing = (basePath || "/usr/bin:/bin:/usr/sbin:/sbin").split(":");
+  return [...new Set([...extra, ...existing].filter(Boolean))].join(":");
+}
+
+process.env.PATH = buildDevPath(process.env.PATH);
+
 function retryableTelegramStatus(status) {
   return status === 429 || status >= 500;
 }
@@ -551,7 +570,7 @@ class PiRpc {
     if (this.config.approve) args.push("--approve");
     const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
     if (existsSync(extensionPath)) args.push("-e", extensionPath);
-    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", PATH: `${dirname(process.execPath)}:${process.env.PATH || "/usr/bin:/bin"}` };
+    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", PATH: buildDevPath(process.env.PATH) };
     this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(process.stderr);
     await new Promise((resolveSpawn, reject) => {
@@ -1771,6 +1790,8 @@ async function selfTest() {
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project"), true);
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project/nested"), false);
   assert.equal(isDirectChild("/Users/me/dev", "/Users/me/other"), false);
+  assert.ok(buildDevPath("/usr/bin:/bin").includes("/opt/homebrew/bin"));
+  assert.ok(buildDevPath("/usr/bin:/bin").includes(join(homedir(), ".local", "bin")));
   assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
   assert.equal(telegramCommandName({ name: `skill:${"a".repeat(40)}`, source: "skill" }).length, 32);
   assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");
