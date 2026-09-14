@@ -466,6 +466,8 @@ class Telegram {
 
   async poll(handler) {
     let offset = Number(await readFile(this.offsetPath, "utf8").catch(() => "0")) || 0;
+    // at-least-once：普通消息处理完才落盘 offset，崩溃后由 Telegram 重投（重复优于丢失）；p0/p1 只推进内存 offset
+    let persistChain = Promise.resolve();
     for (;;) {
       try {
         const updates = await this.call("getUpdates", {
@@ -473,10 +475,18 @@ class Telegram {
         }, 60_000);
         for (const update of updates) {
           offset = update.update_id + 1;
-          const tmp = `${this.offsetPath}.tmp`;
-          await writeFile(tmp, String(offset), { mode: 0o600 });
-          await rename(tmp, this.offsetPath);
-          handler(update);
+          const done = handler(update);
+          if (done) {
+            const mark = update.update_id + 1;
+            persistChain = persistChain
+              .then(() => done)
+              .then(async () => {
+                const tmp = `${this.offsetPath}.tmp`;
+                await writeFile(tmp, String(mark), { mode: 0o600 });
+                await rename(tmp, this.offsetPath);
+              })
+              .catch((error) => console.error(`${new Date().toISOString()} [tg:poll] offset persist:`, error.message));
+          }
         }
       } catch (error) {
         console.error(`${new Date().toISOString()} [tg:poll] error:`, error.message);
@@ -497,6 +507,8 @@ class PiRpc {
     this.pending = new Map();
     this.sequence = 0;
     this.proc = null;
+    this.pingTimer = null;
+    this.missedPings = 0;
   }
 
   async ensureStarted() {
@@ -515,6 +527,7 @@ class PiRpc {
       this.proc.once("spawn", resolveSpawn);
       this.proc.once("error", reject);
     });
+    this.proc.stdin.on("error", () => {}); // EPIPE 竞态（kill 时在途写入）；pending 由 close 路径 reject
 
     let buffer = "";
     this.proc.stdout.setEncoding("utf8");
@@ -529,6 +542,8 @@ class PiRpc {
       }
     });
     this.proc.on("close", (code, signal) => {
+      if (this.pingTimer) clearInterval(this.pingTimer);
+      this.pingTimer = null;
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(new Error(`Pi exited (${code ?? signal})`));
@@ -536,6 +551,21 @@ class PiRpc {
       this.pending.clear();
       this.proc = null;
     });
+
+    // MCP 式 ping（spec: utilities/ping）：挂而不死的 Pi 连续 2 次失联后强杀，走 close→respawn 路径
+    const pingMs = this.config.pingIntervalMs ?? 30_000;
+    const pongMs = this.config.pingTimeoutMs ?? 10_000;
+    this.pingTimer = setInterval(() => {
+      this.request("get_state", {}, pongMs, true)
+        .then(() => { this.missedPings = 0; })
+        .catch(() => {
+          if (++this.missedPings >= 2) {
+            console.error(`${new Date().toISOString()} [pi:ping] 2 consecutive pings lost, killing Pi`);
+            this.proc?.kill("SIGKILL");
+          }
+        });
+    }, pingMs);
+    this.pingTimer.unref();
   }
 
   handleLine(line) {
@@ -552,7 +582,7 @@ class PiRpc {
     }
   }
 
-  async request(type, fields = {}, timeout = 600_000) {
+  async request(type, fields = {}, timeout = 600_000, quiet = false) {
     await this.ensureStarted();
     const id = `tg-${++this.sequence}`;
     const t0 = performance.now();
@@ -560,13 +590,13 @@ class PiRpc {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const ms = Math.round(performance.now() - t0);
-        console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} timed out after ${ms}ms`);
+        if (!quiet) console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} timed out after ${ms}ms`);
         reject(new Error(`Pi RPC ${type} timed out`));
       }, timeout);
       this.pending.set(id, {
         resolve: (data) => {
           const ms = Math.round(performance.now() - t0);
-          console.log(`${new Date().toISOString()} [pi:rpc] ${type} #${id} ok in ${ms}ms`);
+          if (!quiet) console.log(`${new Date().toISOString()} [pi:rpc] ${type} #${id} ok in ${ms}ms`);
           resolveRequest(data);
         },
         reject: (err) => {
@@ -586,6 +616,7 @@ class PiRpc {
   }
 
   stop() {
+    if (this.pingTimer) clearInterval(this.pingTimer);
     if (this.proc) {
       const proc = this.proc;
       this.proc = null;
@@ -1897,6 +1928,32 @@ async function selfTest() {
     await gw2.acquireLock();
     assert.equal(existsSync(gw2.sockPath), true);
     gw2.stop();
+  }
+
+  {
+    // offset at-least-once：handler 返回 promise（p2），处理完才落盘；p0/p1（返回 undefined）不落盘
+    const tmpOffset = join(tmpdir(), `test-remote-pi-offset-${Date.now()}`);
+    await mkdir(tmpOffset, { recursive: true, mode: 0o700 });
+    const tg = new Telegram("123456:fake-token", join(tmpOffset, "offset"));
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let pollCount = 0;
+    tg.call = async (method) => {
+      if (method !== "getUpdates") return true;
+      if (pollCount++ === 0) return [{ update_id: 7 }];
+      return new Promise(() => {}); // 挂起后续轮询，不占用事件循环
+    };
+    const handled = [];
+    tg.poll((update) => {
+      handled.push(update.update_id);
+      return gate;
+    });
+    await sleep(80);
+    assert.equal(existsSync(join(tmpOffset, "offset")), false, "offset 不应在处理完前落盘");
+    release();
+    await sleep(80);
+    assert.deepEqual(handled, [7]);
+    assert.equal(readFileSync(join(tmpOffset, "offset"), "utf8"), "8", "处理完后 offset 应为 update_id+1");
   }
 
   console.log("self-test: ok");
