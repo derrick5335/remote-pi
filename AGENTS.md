@@ -6,6 +6,7 @@ Telegram Bot gateway for Pi RPC。Pi 在本仓库工作，通过 Telegram 收发
 
 - **不要启动新的 gateway 实例**：launchd 已有常驻服务，重复运行会被锁拦截。代码变更通过 `pi-telegram-gateway restart` 生效。
 - **唯一安全的测试方式**：`node gateway.mjs --self-test`（离线自检，不连 Telegram；没有 `--test` 参数）。
+- **修改前先查最佳实践**：动手改代码前，先上网确认该做法是否为最佳实践；若某次修改应用了官方文档、社区等来源的最佳实践，需标明该修改方向的 reference。
 
 ## 运维速查
 
