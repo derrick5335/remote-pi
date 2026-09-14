@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync } from "node:fs";
@@ -54,6 +55,17 @@ const BOT_COMMANDS = [
 function parseCommand(text) {
   const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
   return match ? { name: match[1].toLowerCase(), argument: match[2]?.trim() ?? "" } : null;
+}
+
+function getUpdatePriority(update) {
+  if (update?.stopped_message_generation) return "p0";
+  const text = update?.message?.text?.trim();
+  if (!text) return "p2";
+  const cmd = parseCommand(text);
+  if (!cmd) return "p2";
+  if (["abort", "restart", "new", "reset"].includes(cmd.name)) return "p0";
+  if (["status", "session", "queue", "help", "start", "commands"].includes(cmd.name)) return "p1";
+  return "p2";
 }
 
 function isDirectChild(root, target) {
@@ -462,7 +474,7 @@ class Telegram {
           const tmp = `${this.offsetPath}.tmp`;
           await writeFile(tmp, String(offset), { mode: 0o600 });
           await rename(tmp, this.offsetPath);
-          await handler(update);
+          handler(update);
         }
       } catch (error) {
         console.error(`${new Date().toISOString()} [tg:poll] error:`, error.message);
@@ -594,14 +606,25 @@ class Gateway {
     this.queue = { steering: [], followUp: [] };
     this.isStreaming = false;
     this.typingTimer = null;
+    this.als = new AsyncLocalStorage();
+    this.updateChain = Promise.resolve();
     this.eventChain = Promise.resolve();
     this.telegramChain = Promise.resolve();
+    this.uploadChain = Promise.resolve();
     this.draftSupport = "unknown";
     this.nextDraftId = 0;
     this.activeMessageIds = [];
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
+
+    const origSend = this.telegram.send.bind(this.telegram);
+    this.telegram.send = (chatId, text, extra = {}) =>
+      this.queueTelegram(() => origSend(chatId, text, extra));
+
+    const origEdit = this.telegram.edit.bind(this.telegram);
+    this.telegram.edit = (chatId, messageId, text, ephemeral = false) =>
+      this.queueTelegram(() => origEdit(chatId, messageId, text, ephemeral));
   }
 
   async start() {
@@ -621,7 +644,7 @@ class Gateway {
     const state = await this.pi.request("get_state");
     await this.registerBotCommands();
     console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
-    await this.telegram.poll((update) => this.handleUpdate(update));
+    await this.telegram.poll((update) => this.dispatchUpdate(update));
   }
 
   async saveDownload(fileId, name, needsBase64 = false) {
@@ -642,8 +665,15 @@ class Gateway {
   }
 
   queueTelegram(work) {
-    const next = this.telegramChain.then(work);
+    if (this.als.getStore()) return work();
+    const next = this.telegramChain.then(() => this.als.run(true, work));
     this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
+    return next;
+  }
+
+  queueUpload(work) {
+    const next = this.uploadChain.then(work);
+    this.uploadChain = next.catch((error) => console.error("Upload output:", error));
     return next;
   }
 
@@ -654,6 +684,42 @@ class Gateway {
   settleActiveReactions() {
     for (const id of this.activeMessageIds.splice(0)) {
       this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, this.config.doneEmoji));
+    }
+  }
+
+  dispatchUpdate(update) {
+    const priority = getUpdatePriority(update);
+    if (priority === "p0" || priority === "p1") {
+      this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
+      return;
+    }
+    const next = this.updateChain.then(() => this.handleUpdate(update));
+    this.updateChain = next.catch((err) => console.error("Telegram update error:", err));
+    return next;
+  }
+
+  async handlePriorityUpdate(update, priority) {
+    const t0 = performance.now();
+    try {
+      if (update.stopped_message_generation) {
+        console.log(`${new Date().toISOString()} [p0] stopped_message_generation`);
+        await this.handleCommand({ name: "abort", argument: "" }, "/abort");
+        return;
+      }
+      const m = update.message;
+      if (!m || !this.isAllowed(m.from, m.chat)) return;
+      this.chatReady = true;
+      const cmd = parseCommand(m.text?.trim() || "");
+      if (!cmd) return;
+      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
+      console.log(`${new Date().toISOString()} [${priority}] handling /${cmd.name}`);
+      await this.handleCommand(cmd, m.text);
+      await this.telegram.setReaction(this.chatId, m.message_id, this.config.doneEmoji);
+    } catch (error) {
+      console.error(`[${priority}] error:`, error);
+      await this.telegram.send(this.chatId, `❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [${priority}] finished in ${Math.round(performance.now() - t0)}ms`);
     }
   }
 
@@ -819,6 +885,9 @@ class Gateway {
   resetSessionState() {
     this.isStreaming = false;
     this.stopTyping();
+    if (this.pendingUi && this.pi.proc) {
+      this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
+    }
     this.pendingUi = null;
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
@@ -879,16 +948,19 @@ class Gateway {
       case "resume": return this.showSessions();
       case "reset":
       case "new": {
+        if (this.pi.proc) {
+          await this.pi.request("clear_queue").catch(() => {});
+          await this.pi.request("abort").catch(() => {});
+        }
         this.resetSessionState();
+        this.settleActiveReactions();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
-          this.queueTelegram(() => this.telegram.send(this.chatId, "新会话已取消"));
-          return;
+          return this.telegram.send(this.chatId, "新会话已取消");
         }
         const state = await this.pi.request("get_state").catch(() => null);
         const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
-        this.queueTelegram(() => this.telegram.send(this.chatId, text));
-        return;
+        return this.telegram.send(this.chatId, text);
       }
       case "name": {
         if (!argument) return this.telegram.send(this.chatId, "用法：/name <名称>");
@@ -906,6 +978,10 @@ class Gateway {
         try {
           const result = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
           return this.telegram.send(this.chatId, `✅ 已压缩：${result.tokensBefore} → 约 ${result.estimatedTokensAfter} tokens`);
+        } catch (error) {
+          if (!/abort/i.test(error.message)) {
+            return this.telegram.send(this.chatId, `❌ ${error.message}`);
+          }
         } finally {
           this.stopTyping();
         }
@@ -929,7 +1005,9 @@ class Gateway {
           }
           return this.telegram.send(this.chatId, output);
         } catch (error) {
-          return this.telegram.send(this.chatId, `❌ ${error.message}`);
+          if (!/abort/i.test(error.message)) {
+            return this.telegram.send(this.chatId, `❌ ${error.message}`);
+          }
         } finally {
           this.stopTyping();
         }
@@ -1335,7 +1413,7 @@ class Gateway {
       if (event.toolName === "telegram_attach" && !event.isError) {
         const paths = event.result?.details?.paths || event.args?.paths || [];
         for (const path of paths) {
-          this.queueTelegram(async () => {
+          this.queueUpload(async () => {
             try { await this.telegram.sendDocument(this.chatId, path); }
             catch (error) { await this.telegram.send(this.chatId, `❌ 附件发送失败 ${basename(path)}: ${error.message}`); }
           });
@@ -1597,8 +1675,62 @@ async function selfTest() {
       isError: false,
       result: { details: { paths: ["/tmp/file1.png", "/tmp/file2.pdf"] } },
     });
-    await gw.telegramChain;
+    await Promise.all([gw.telegramChain, gw.uploadChain]);
     assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
+
+    // Test priority command classification and preemptive dispatch
+    assert.equal(getUpdatePriority({ stopped_message_generation: true }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/abort" } }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/abort clear" } }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/new" } }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/reset" } }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/restart" } }), "p0");
+    assert.equal(getUpdatePriority({ message: { text: "/status" } }), "p1");
+    assert.equal(getUpdatePriority({ message: { text: "/session" } }), "p1");
+    assert.equal(getUpdatePriority({ message: { text: "/queue" } }), "p1");
+    assert.equal(getUpdatePriority({ message: { text: "/help" } }), "p1");
+    assert.equal(getUpdatePriority({ message: { text: "/commands" } }), "p1");
+    assert.equal(getUpdatePriority({ message: { text: "/sh cargo build" } }), "p2");
+    assert.equal(getUpdatePriority({ message: { text: "hello" } }), "p2");
+
+    let p2Started = false;
+    let p2Finished = false;
+    let p0Executed = false;
+    gw.handleUpdate = async () => {
+      p2Started = true;
+      await sleep(100);
+      p2Finished = true;
+    };
+    gw.handlePriorityUpdate = async () => {
+      p0Executed = true;
+    };
+
+    // Dispatch slow P2 update, followed immediately by P0
+    gw.dispatchUpdate({ message: { text: "/sh sleep 10" } });
+    await sleep(5);
+    assert.equal(p2Started, true);
+    assert.equal(p2Finished, false);
+
+    // P0 should execute immediately without waiting for P2 to finish
+    gw.dispatchUpdate({ message: { text: "/abort" } });
+    assert.equal(p0Executed, true);
+    assert.equal(p2Finished, false);
+
+    await gw.updateChain;
+    assert.equal(p2Finished, true);
+
+    // Test outbound queue re-entrancy and serialization
+    const sendOrder = [];
+    gw.telegram.sendOne = async (_chat, text) => {
+      sendOrder.push(text);
+      return { message_id: 1 };
+    };
+    await gw.queueTelegram(async () => {
+      sendOrder.push("outer-start");
+      await gw.telegram.send("1", "nested");
+      sendOrder.push("outer-end");
+    });
+    assert.deepEqual(sendOrder, ["outer-start", "nested", "outer-end"]);
   }
 
   assert.equal(
