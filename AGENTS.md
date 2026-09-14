@@ -4,8 +4,8 @@ Telegram Bot gateway for Pi RPC。Pi 在本仓库工作，通过 Telegram 收发
 
 ## 关键规则
 
-- **永远不要启动新的 gateway 实例**（不要跑 `node gateway.mjs`、`npm start` 等任何会拉起完整 gateway 的命令）。launchd 服务已有一个实例在轮询 Telegram，第二个实例会导致 `getUpdates` 无限 409 Conflict（"terminated by other getUpdates request"），两边都收不到消息，且该命令永不退出，会卡死当前任务。
-- **唯一安全的测试方式**：`node gateway.mjs --self-test`（离线自检，不连 Telegram）。没有 `--test` 这个参数。
+- **不要启动新的 gateway 实例**：launchd 已有常驻服务，重复运行会被锁拦截。代码变更通过 `pi-telegram-gateway restart` 生效。
+- **唯一安全的测试方式**：`node gateway.mjs --self-test`（离线自检，不连 Telegram；没有 `--test` 参数）。
 
 ## 运维速查
 

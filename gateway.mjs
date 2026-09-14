@@ -4,8 +4,9 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, openAsBlob, readFileSync } from "node:fs";
+import { existsSync, openAsBlob, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
+import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -636,6 +637,7 @@ class Gateway {
       mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
     ]);
+    await this.acquireLock();
     await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
     const me = await this.telegram.call("getMe");
     try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
@@ -1046,7 +1048,7 @@ class Gateway {
       }
       case "restart": {
         await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
-        this.pi.stop();
+        this.stop();
         setTimeout(() => process.exit(0), 100);
         return;
       }
@@ -1552,8 +1554,49 @@ class Gateway {
     }
   }
 
+  async acquireLock() {
+    const sockPath = join(this.config.stateDir, "gateway.sock");
+    const pidFile = join(this.config.stateDir, "gateway.pid");
+    await new Promise((resolveLock, reject) => {
+      const client = net.connect({ path: sockPath }, () => {
+        client.end();
+        const pid = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+        reject(new Error(`另一个 gateway 正在运行${pid ? ` (pid ${pid})` : ""}。先 ./install.sh stop`));
+      });
+      client.on("error", (err) => {
+        if (["ECONNREFUSED", "ENOENT", "ENOTSOCK"].includes(err.code)) {
+          try { unlinkSync(sockPath); } catch {}
+          const server = net.createServer();
+          server.unref();
+          server.listen(sockPath, () => {
+            this.lockServer = server;
+            this.sockPath = sockPath;
+            writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+            this.pidFile = pidFile;
+            resolveLock();
+          });
+          server.on("error", reject);
+        } else {
+          reject(err);
+        }
+      });
+    });
+  }
+
   stop() {
     this.resetSessionState();
+    if (this.lockServer) {
+      try { this.lockServer.close(); } catch {}
+      this.lockServer = null;
+    }
+    try {
+      if (this.sockPath && existsSync(this.sockPath)) unlinkSync(this.sockPath);
+    } catch {}
+    try {
+      if (this.pidFile && existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) {
+        unlinkSync(this.pidFile);
+      }
+    } catch {}
     this.pi.stop();
   }
 }
@@ -1767,6 +1810,39 @@ async function selfTest() {
     assert.equal(calls.length, 1);
   }
 
+  {
+    const tmpState = join(tmpdir(), `test-remote-pi-lock-${Date.now()}`);
+    await mkdir(tmpState, { recursive: true, mode: 0o700 });
+
+    const gw1 = { config: { stateDir: tmpState }, pidFile: null, lockServer: null, sockPath: null };
+    gw1.acquireLock = Gateway.prototype.acquireLock.bind(gw1);
+    gw1.stop = Gateway.prototype.stop.bind(gw1);
+    gw1.resetSessionState = () => {};
+    gw1.pi = { stop: () => {} };
+
+    await gw1.acquireLock();
+    assert.equal(existsSync(gw1.sockPath), true);
+    assert.equal(readFileSync(gw1.pidFile, "utf8").trim(), String(process.pid));
+
+    const gw2 = { config: { stateDir: tmpState }, pidFile: null, lockServer: null, sockPath: null };
+    gw2.acquireLock = Gateway.prototype.acquireLock.bind(gw2);
+    gw2.stop = Gateway.prototype.stop.bind(gw2);
+    gw2.resetSessionState = () => {};
+    gw2.pi = { stop: () => {} };
+
+    await assert.rejects(() => gw2.acquireLock(), /另一个 gateway 正在运行/);
+
+    gw1.stop();
+    assert.equal(existsSync(gw1.sockPath), false);
+    assert.equal(existsSync(gw1.pidFile), false);
+
+    // Stale socket recovery (simulate crashed process leaving file behind)
+    writeFileSync(join(tmpState, "gateway.sock"), "stale");
+    await gw2.acquireLock();
+    assert.equal(existsSync(gw2.sockPath), true);
+    gw2.stop();
+  }
+
   console.log("self-test: ok");
 }
 
@@ -1774,6 +1850,10 @@ if (import.meta.main) {
   if (process.argv.includes("--self-test")) {
     await selfTest();
   } else {
+    if (process.env.REMOTE_PI_GATEWAY) {
+      console.error("❌ Refusing to start: already running inside a remote-pi session.");
+      process.exit(1);
+    }
     const gateway = new Gateway(loadConfig());
     for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { gateway.stop(); process.exit(0); });
     gateway.start().catch((error) => { console.error(error); gateway.stop(); process.exit(1); });
