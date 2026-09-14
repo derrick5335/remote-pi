@@ -618,6 +618,7 @@ class Gateway {
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
+    this.lastModel = null;
 
     const origSend = this.telegram.send.bind(this.telegram);
     this.telegram.send = (chatId, text, extra = {}) =>
@@ -630,8 +631,10 @@ class Gateway {
 
   async start() {
     const t0 = performance.now();
-    // launchd 以 O_APPEND 持有日志 fd，启动时截断即可防无限增长（newsyslog 处理不了这种 fd）
-    await stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
+    // launchd 以 O_APPEND 持有日志 fd，newsyslog 处理不了这种 fd；启动时截断 + 每小时巡检（服务极少重启，只靠启动截断等于没截）
+    const trimLog = () => stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
+    await trimLog();
+    setInterval(trimLog, 60 * 60_000).unref();
     await Promise.all([
       mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
@@ -644,6 +647,9 @@ class Gateway {
     catch (error) { if (!error.message.includes("chat not found")) throw error; }
     await this.pi.start();
     const state = await this.pi.request("get_state");
+    if (state?.model?.provider && state?.model?.id) {
+      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
     await this.registerBotCommands();
     console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
     await this.telegram.poll((update) => this.dispatchUpdate(update));
@@ -954,11 +960,21 @@ class Gateway {
           await this.pi.request("clear_queue").catch(() => {});
           await this.pi.request("abort").catch(() => {});
         }
+        const stateBefore = this.pi.proc ? await this.pi.request("get_state").catch(() => null) : null;
+        const targetModel = (stateBefore?.model?.provider && stateBefore?.model?.id)
+          ? { provider: stateBefore.model.provider, modelId: stateBefore.model.id }
+          : this.lastModel;
         this.resetSessionState();
         this.settleActiveReactions();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
           return this.telegram.send(this.chatId, "新会话已取消");
+        }
+        if (targetModel) {
+          await this.pi.request("set_model", targetModel).catch((err) => {
+            console.error("Failed to restore last model after new_session:", err.message);
+          });
+          this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
         const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
@@ -1132,6 +1148,7 @@ class Gateway {
       const exact = models.find((model) => `${model.provider}/${model.id}` === query || model.id === query);
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
+        this.lastModel = { provider: exact.provider, modelId: exact.id };
         return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}`);
       }
     }
@@ -1237,6 +1254,7 @@ class Gateway {
       console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
       if (action.type === "model") {
         await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
+        this.lastModel = { provider: action.provider, modelId: action.modelId };
         await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
       } else if (action.type === "thinking") {
         await this.pi.request("set_thinking_level", { level: action.level });
@@ -1245,6 +1263,12 @@ class Gateway {
         if (this.isStreaming) await this.pi.request("abort").catch(() => {});
         this.resetSessionState();
         const result = await this.pi.request("switch_session", { sessionPath: action.path });
+        if (!result.cancelled) {
+          const state = await this.pi.request("get_state").catch(() => null);
+          if (state?.model?.provider && state?.model?.id) {
+            this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+          }
+        }
         await this.telegram.send(this.chatId, result.cancelled ? "恢复已取消" : "✅ 已恢复 Session");
       } else if (action.type === "fork") {
         if (this.isStreaming) await this.pi.request("abort").catch(() => {});
@@ -1294,6 +1318,9 @@ class Gateway {
     await this.pi.start();
     await this.registerBotCommands();
     const state = await this.pi.request("get_state");
+    if (state?.model?.provider && state?.model?.id) {
+      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
     await this.telegram.send(this.chatId, `✅ Pi 已就绪；Session: ${state.sessionId}`);
   }
 
@@ -1774,6 +1801,33 @@ async function selfTest() {
       sendOrder.push("outer-end");
     });
     assert.deepEqual(sendOrder, ["outer-start", "nested", "outer-end"]);
+
+    // Test /new preserves last effective model
+    let mockModel = { provider: "openai", id: "gpt-4o" };
+    const mockRequests = [];
+    gw.pi.proc = {};
+    gw.pi.request = async (command, params) => {
+      mockRequests.push({ command, params });
+      if (command === "get_state") return { model: mockModel };
+      if (command === "new_session") {
+        mockModel = { provider: "anthropic", id: "claude-3-7-sonnet" };
+        return { cancelled: false };
+      }
+      if (command === "set_model") {
+        mockModel = { provider: params.provider, id: params.modelId };
+        return mockModel;
+      }
+      return {};
+    };
+    let newSessionSent = "";
+    gw.telegram.send = async (_chat, text) => { newSessionSent = text; };
+    await gw.handleCommand({ name: "new", argument: "" });
+    assert.deepEqual(mockRequests.find((r) => r.command === "set_model"), {
+      command: "set_model",
+      params: { provider: "openai", modelId: "gpt-4o" },
+    });
+    assert.ok(newSessionSent.includes("◆ Model: gpt-4o"));
+    assert.deepEqual(gw.lastModel, { provider: "openai", modelId: "gpt-4o" });
   }
 
   assert.equal(
