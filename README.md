@@ -1,32 +1,46 @@
 # remote-pi
 
-> 通过 Telegram 远程操作 [Pi](https://github.com/mariozechner/pi-coding-agent) coding agent 的轻量网关。
+<p align="center">
+  <b>通过 Telegram 远程操作 <a href="https://github.com/mariozechner/pi-coding-agent">Pi</a> coding agent 的轻量网关</b><br>
+  无需公网 IP、无须 SSH 端口映射、无需中继服务，在手机上随时随地驱动本地或远程机器上的 Pi。
+</p>
 
-随时随地在手机 Telegram 上向本机的 Pi 编程助手发送需求、排队任务、查看工具调用进度与流式输出，并接收生成产物。
+<p align="center">
+  <img src="https://img.shields.io/badge/node-%3E%3D22.18.0-brightgreen.svg" alt="Node.js">
+  <img src="https://img.shields.io/badge/platform-Telegram%20Only-blue.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/daemon-macOS%20Launchd-orange.svg" alt="macOS Launchd">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
+</p>
 
 ---
 
-## 平台与支持范围
+## 平台与定位说明
 
-- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（包括 `sendMessageDraft` 流式草稿实时预览、内联按钮交互、多模态附件解析与单用户消息队列）。
+- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessageDraft` 流式草稿实时预览、内联按钮、消息 Reaction 表情状态机、多模态附件解析与可折叠引用块）。
 - **运行环境**：
-  - **macOS**：提供开箱即用的 `./install.sh` 脚本，基于 launchd 常驻运行并使用 `caffeinate` 防睡眠。
-  - **Linux**：支持直接前台运行或通过 systemd 自行托管。
+  - **macOS**：提供开箱即用的 `./install.sh` 脚本，将网关注册为 launchd 用户守护进程，配合 `caffeinate` 保持接电状态下常驻防睡眠。
+  - **Linux**：支持直接前台运行或由用户编写 systemd 服务常驻。
 
 ---
 
 ## 核心特性
 
-- ⚡ **单文件极简核心**：除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部基于 Node.js 标准库实现，无重型框架包袱。
-- 🌊 **原生流式输出**：优先利用 Telegram 官方流式草稿（`sendMessageDraft`）实时展示思考过程与回复；遇 API 限制时自动回退为静音消息编辑。
-- 🛠️ **可折叠工具面板**：模型调用工具时以原生可折叠引用块（Expandable Blockquote）呈现执行状态，不刷屏。
-- 🎙️ **多模态上下文**：
-  - **语音转写**：可配置 `sttCommand`（如 whisper / mlx-whisper），在 Telegram 发送语音即可自动转写为 Prompt。
-  - **视觉与附件**：直接发送图片或文件（PDF、代码、音视频），网关自动下载到本地并作为当前轮次的上下文传给 Pi。
-- 🔌 **扩展（Extensions）与工具增强**：
-  - 自带 Companion Extension（`telegram-extension.mjs`），向模型注入 `telegram_attach`（向用户回传本地文件）和 `telegram_ask`（内联按钮问答）两个工具。
-  - 支持配置加载用户自定义的 Pi 扩展（`-e` 注入），并支持在 Telegram 中交互响应 Extension 的 UI 事件（`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`）。
-- 🔒 **单实例与安全控制**：基于 Unix Domain Socket 的互斥锁，杜绝多实例竞争导致会话混乱；严格的单用户白名单机制，忽略群聊与未授权访问。
+- ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
+- 🎯 **100% 基于 Pi 原生状态与能力**：会话状态、模型列表、上下文统计、参数配置等全部通过 JSON-RPC 严格依赖 Pi 原生提供的数据接口，无私有黑盒或非标准文件桥接。
+- 🌊 **原生流式输出**：优先利用 Telegram 官方流式草稿（`sendMessageDraft`）实时输出思考过程与回复（在聊天界面中自带暂停/停止按钮）；不支持时平滑降级为静音消息编辑。
+- 🛠️ **原生可折叠工具卡片**：Agent 连续调用工具（Bash、读写文件、Grep 等）时，自动生成原生可折叠引用块（`<blockquote expandable>`），保持手机端信息整洁不刷屏。
+- 🎮 **Telegram Companion 扩展**：
+  - 自带 `telegram-extension.mjs`，向模型补充 `telegram_attach`（主动将本地生成的文件/产物发回 Telegram）与 `telegram_ask`（内联按钮问答）两个工具。
+  - 支持配置加载用户自定义的 Pi 扩展（`-e` 注入），并在 Telegram 中无缝代理扩展的 UI 交互（`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`）。
+- 🎙️ **多模态与语音转写（STT）**：
+  - **语音输入**：支持在配置中指定 `sttCommand`（如 Groq Whisper API 或本地 mlx-whisper），发送语音消息即自动转写为 Prompt 执行。
+  - **视觉与附件**：直接向 Bot 发送图片（模型原生视觉上下文）或代码/文档/音视频文件（自动下载至本地供 Pi 处理分析）。
+- 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
+  - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
+  - 收到消息时 Bot 立即在原消息标记“接收”表情（默认 `👀`），执行完成自动替换为“完成”表情（默认 `🫡`），彻底消除移动端等待焦虑。
+- 🔒 **单实例互斥与严格白名单**：
+  - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
+  - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
 
 ---
 
@@ -34,56 +48,63 @@
 
 | 命令 | 说明 |
 | :--- | :--- |
-| 直接发文字 | 与 Pi 对话；任务执行中发送文字会作为 steer（实时干预） |
-| `/cwd` | 查看当前工作目录，或在配置的 `devRoot` 下切换项目 |
-| `/model [关键词]` | 查看可用模型列表或直接搜索切换 |
-| `/thinking [level]` | 查看或设置模型的思考级别（如 `off`, `low`, `high`） |
-| `/new` | 开启全新会话，重置上下文并汇报环境状态 |
+| 直接发送文字 | 与 Pi 对话；任务执行中发送的文字会作为实时干预（Steer） |
+| `/cwd` | 查看当前工作目录，或在配置的 `devRoot` 项目根目录下选择切换 |
+| `/model [关键词]` | 弹出内联键盘选择模型，或直接按关键词/完整 ID 快速切换 |
+| `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
+| `/new` | 开启新会话，重置上下文并以卡片汇报当前模型、环境与工作目录 |
 | `/resume` | 弹出最近历史会话列表供选择恢复 |
-| `/sh <shell 命令>` | 在当前工作目录下直接执行系统 Shell 命令并返回结果 |
-| `/get <文件路径>` | 将当前项目中的文件作为附件下载到 Telegram |
-| `/followup <指令>` | 排队追加后续任务指令 |
-| `/session` 或 `/status` | 查看当前会话 ID、模型、上下文消耗比例及费用 |
-| `/compact [要求]` | 主动触发上下文压缩与总结 |
+| `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应 |
+| `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
+| `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
+| `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
+| `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/fork` | 从历史用户消息创建分支会话 |
-| `/abort` | 立即中断当前正在运行的 Agent 任务 |
-| `/help` | 显示完整的指令帮助 |
+| `/abort` | 立即中断当前正在运行的任务 |
+| `/help` | 显示完整的操作帮助 |
+
+> **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。
 
 ---
 
 ## 环境准备
 
 1. **Node.js**：需要 **>= 22.18.0**（推荐 Node 24 LTS，依赖 ES 模块原生 `import.meta.main`）。
-2. **Pi CLI**：确保已安装并登录 Pi 编码助手（如 `@mariozechner/pi-coding-agent`），在终端中可直接执行 `pi` 命令。
-3. **Telegram Bot**：
-   - 在 Telegram 中联系 [@BotFather](https://t.me/BotFather) 创建 Bot 并获取 **Bot Token**（格式类似 `123456789:ABCdefGh...`）。
-   - 联系 [@userinfobot](https://t.me/userinfobot) 获取你自己的 **纯数字 User ID**。
+2. **Pi CLI**：在终端中已全局安装并完成模型登录的 Pi 命令行工具（如 `@mariozechner/pi-coding-agent`）。
+3. **Telegram Bot Token 与 User ID**：
+   - 在 Telegram 联系 [@BotFather](https://t.me/BotFather) 输入 `/newbot`，创建 Bot 并保存获得的 Token。
+   - 获取自己的纯数字 Telegram User ID（向刚创建的 Bot 发送任意消息，运行下述命令即可获取）：
+     ```bash
+     read -s TOKEN   # 粘贴你的 Bot Token
+     curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | \
+       node -e 'fs=require("fs");d=JSON.parse(fs.readFileSync(0,"utf-8"));console.log(d.result?.slice(-1)[0]?.message?.from?.id)'
+     unset TOKEN
+     ```
 
 ---
 
 ## 快速上手
 
-### 1. 克隆与安装依赖
+### 1. 克隆项目与安装依赖
 
 ```bash
-git clone https://github.com/your-username/remote-pi.git
+git clone https://github.com/derrick5335/remote-pi.git
 cd remote-pi
 npm install --omit=dev
 ```
 
 ### 2. 离线自检
 
-运行离线单元自检，验证环境与解析逻辑：
+在不连接 Telegram 的情况下运行离线单元测试：
 
 ```bash
 npm test
-# 或者: node gateway.mjs --self-test
+# 输出 "self-test: ok" 即表示全部核心逻辑正常
 ```
-输出 `self-test: ok` 即表示测试通过。
 
-### 3. 配置
+### 3. 创建配置文件
 
-复制配置模板：
+复制示例配置并保护权限：
 
 ```bash
 mkdir -p ~/.config/remote-pi
@@ -91,7 +112,7 @@ cp config.example.json ~/.config/remote-pi/config.json
 chmod 600 ~/.config/remote-pi/config.json
 ```
 
-编辑 `~/.config/remote-pi/config.json`，填入你的 `botToken` 与 `allowedUserId`：
+编辑 `~/.config/remote-pi/config.json`，填入 Bot Token、用户 ID 以及工作目录：
 
 ```json
 {
@@ -102,9 +123,9 @@ chmod 600 ~/.config/remote-pi/config.json
 }
 ```
 
-### 4. 运行服务
+### 4. 启动网关
 
-#### 方式 A：前台直接运行（开发 / Linux / 调试）
+#### 方式 A：前台运行（开发调试 / Linux）
 
 ```bash
 npm start
@@ -113,73 +134,94 @@ npm start
 
 #### 方式 B：macOS launchd 常驻后台（推荐）
 
-本项目自带安装脚本，将 gateway 注册为 launchd 用户守护进程，并在崩溃时自动拉起：
+本项目提供自动化安装脚本，可将网关注册为开机启动并在崩溃时自动拉起的 launchd 服务：
 
 ```bash
 ./install.sh install
 ```
 
-安装后可通过快捷命令管理守护进程：
+安装后可通过全局管理命令进行运维：
 
 ```bash
 pi-telegram-gateway status   # 查看运行状态与近期日志
-pi-telegram-gateway restart  # 代码或配置修改后重启
-pi-telegram-gateway logs     # 持续跟踪运行日志
-pi-telegram-gateway stop     # 停止守护进程
+pi-telegram-gateway restart  # 代码更新后重启服务生效
+pi-telegram-gateway logs     # 持续跟踪日志输出 (tail -f)
+pi-telegram-gateway stop     # 停止后台服务
 ```
 
 ---
 
-## 配置项详解
+## 配置项参考
 
-配置文件路径默认为 `~/.config/remote-pi/config.json`（可通过环境变量 `REMOTE_PI_CONFIG` 覆盖）。
+配置文件默认路径为 `~/.config/remote-pi/config.json`，也可以通过环境变量 `REMOTE_PI_CONFIG` 自定义。
 
-| 配置键 | 环境变量 | 默认值 | 说明 |
+| 配置键 | 对应环境变量 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
-| `botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | Telegram BotFather 提供的 Bot Token |
+| `botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | BotFather 生成的 Telegram Bot Token |
 | `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *必填* | 允许访问的 Telegram 纯数字用户 ID |
-| `cwd` | `PI_CWD` | 当前执行目录 | Pi 子进程启动时的工作目录（支持 `~/` 展开） |
-| `devRoot` | `DEV_ROOT` | `~/dev`（若存在） | 项目根目录，用于 `/cwd` 命令列出一级子项目进行切换。若不需要可设为 `null` |
+| `cwd` | `PI_CWD` | 当前执行目录 | Pi 启动时的初始工作目录（支持 `~/` 展开） |
+| `devRoot` | `DEV_ROOT` | `~/dev`（若存在） | 项目根目录；用于 `/cwd` 列出一级子项目进行热切换。设为 `null` 可禁用项目选择 |
 | `piBin` | `PI_BIN` | `"pi"` | Pi CLI 可执行文件路径 |
 | `approve` | - | `true` | 是否向 Pi 传递 `--approve`（自动批准工具调用） |
-| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | 是否自动挂载自带的 `telegram-extension.mjs` 扩展（提供 `telegram_attach` 与 `telegram_ask` 工具） |
-| `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | 额外注入 Pi 的自定义扩展文件路径数组（支持 `~/` 及相对配置文件的路径） |
-| `sttCommand` | - | `""` | 语音转写命令，例如 `"mlx_whisper --model mlx-community/whisper-large-v3-turbo $1"` |
+| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | 是否加载自带的伴侣扩展（提供 `telegram_attach` 与 `telegram_ask` 工具） |
+| `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | 额外注入 Pi 的自定义扩展文件路径数组（支持 `~/` 及相对于配置文件的路径） |
+| `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
 | `stateDir` | - | `~/.local/var/remote-pi` | 会话状态、下载附件与套接字锁的存放目录 |
-| `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出文件 |
-| `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时的反馈表情 |
-| `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 消息处理完成时的反馈表情 |
+| `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
+| `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
+| `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
 
-> **提示**：环境变量会优先覆盖配置文件中的对应设置。对于 `REMOTE_PI_EXTENSIONS`，支持传入 JSON 数组字符串（如 `'["/path/ext1.ts"]'`）或逗号分隔的路径列表。
+> **环境变量覆盖说明**：环境变量优先级高于配置文件。例如 `REMOTE_PI_EXTENSIONS` 可以传入 JSON 数组字符串（如 `'["~/ext.ts"]'`）或逗号分隔的路径列表。
 
 ---
 
-## 架构与原理
+## 进阶玩法
 
-```
-[ Telegram App ]
-       ↕ (HTTPS Long Polling / SendMessageDraft / Media / Callbacks)
-[ gateway.mjs ] (Single Node.js Process, stdlib + markdown-it)
-       ↕ (JSON-RPC over stdio / Unix Domain Socket Lock)
-[ pi --mode rpc ]
-       ↕ (-e companion & custom extensions)
-[ Host Filesystem & Tools ]
+### 语音转写（STT）配置
+
+在 `config.json` 中配置 `"sttCommand"`。网关调用此命令时，会通过 `$1` 传入下载到本地的音频文件绝对路径，命令的标准输出（stdout）即作为转写文字。
+
+**示例 1：使用 Groq Whisper API（毫秒级极速响应）**
+```json
+{
+  "sttCommand": "curl -s https://api.groq.com/openai/v1/audio/transcriptions -H \"Authorization: Bearer $GROQ_API_KEY\" -F file=@$1 -F model=whisper-large-v3-turbo -F response_format=text"
+}
 ```
 
-1. **Telegram 通信**：`gateway.mjs` 采用长轮询接收 Telegram Update，单用户白名单过滤；向用户发送消息时结合 Markdown 格式化、超长分页截断与草稿流式预览。
-2. **RPC 驱动**：通过 `child_process.spawn` 启动 `pi --mode rpc --continue` 独立子进程，通过标准输入输出传输 JSON-RPC 消息。
-3. **伴侣扩展**：自动加载的 `telegram-extension.mjs` 为模型补充移动端聊天所需的工具（回传文件、按钮选择）；用户如果需要加载自己的扩展，只需在 `extensions` 数组中添加路径即可。
+**示例 2：使用本地 Apple Silicon 硬件加速（mlx-whisper）**
+```json
+{
+  "sttCommand": "mlx_whisper --model mlx-community/whisper-large-v3-turbo $1"
+}
+```
+
+---
+
+## 架构简述
+
+```text
+[ Telegram 客户端 ]
+       ↕ (HTTPS Long Polling / SendMessageDraft / Reactions / Callbacks)
+[ gateway.mjs ] (单进程常驻, Node stdlib + markdown-it, Unix Socket 互斥锁)
+       ↕ (JSON-RPC over stdio)
+[ pi --mode rpc --continue ]
+       ↕ (-e telegram-extension.mjs & custom extensions)
+[ 本地工作区与系统工具 ]
+```
+
+- **常驻与电源管理**：macOS 下 launchd 启动命令包装了 `/usr/bin/caffeinate -s -i -- node gateway.mjs`，确保在接通电源时处于暗唤醒状态随时接收指令，而不阻止合盖睡眠。
+- **会话持久化隔离**：网关启动的 Pi 进程会将 Telegram 会话单独持久化在 `~/.local/var/remote-pi/sessions` 下，与桌面终端使用的 Pi 会话目录隔离，避免两端同时读写同一个会话文件导致冲突。
 
 ---
 
 ## 安全须知
 
-1. **权限等同本机用户**：控制了 Telegram Bot 即获得了在你电脑上运行代码与 Shell 命令的权限。
-2. **严禁加入群组**：本项目仅针对私聊（Private Chat）设计。切勿将你的 Bot 加入任何 Telegram 群组，以免他人利用 Bot 窃取或篡改本机数据。
-3. **妥善保管 Token**：配置文件 `~/.config/remote-pi/config.json` 包含 Bot Token，应确保文件权限设置为 `600`（`chmod 600 config.json`），切勿提交到公开代码仓库。
+1. **权限等同本机用户**：控制了该 Telegram Bot 即等同于获得了该电脑上的完整 Shell 运行与文件读写权限。
+2. **严禁将 Bot 拉入任何群聊**：本项目针对 1 对 1 私聊设计，即便有白名单过滤，将具有命令执行能力的 Bot 置于公开群聊环境仍存在极大的误触与安全攻击面。
+3. **保护配置文件权限**：`~/.config/remote-pi/config.json` 包含 Bot Token，应严格维持 `600` 文件权限（仅当前系统用户可读写）。
 
 ---
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 Yunpeng Pan
