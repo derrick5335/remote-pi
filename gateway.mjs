@@ -21,7 +21,7 @@ const HELP = `Remote Pi
 
 /help               显示帮助
 /commands           扩展、Prompt 和 Skill 命令
-/cwd                查看或切换项目工作目录
+/cwd [路径]          切换工作目录；无参数显示历史项目
 /sh <命令>           直接执行 Shell 命令
 /get <文件路径>      从当前项目下载文件
 /model [关键词|provider/model]
@@ -42,7 +42,7 @@ const HELP = `Remote Pi
 
 const BOT_COMMANDS = [
   ["help", "帮助"], ["commands", "扩展、Prompt 和 Skill 命令"],
-  ["cwd", "查看或切换工作目录"], ["sh", "直接执行 Shell 命令"], ["get", "下载项目文件"],
+  ["cwd", "切换目录或显示历史"], ["sh", "直接执行 Shell 命令"], ["get", "下载项目文件"],
   ["model", "查看或切换模型"], ["thinking", "查看或切换思考级别"],
   ["resume", "恢复历史会话"], ["new", "新会话"], ["name", "设置会话名"],
   ["session", "Session 和费用"],
@@ -67,10 +67,6 @@ function getUpdatePriority(update) {
   if (["abort", "restart", "new", "reset"].includes(cmd.name)) return "p0";
   if (["status", "session", "queue", "help", "start", "commands"].includes(cmd.name)) return "p1";
   return "p2";
-}
-
-function isDirectChild(root, target) {
-  return dirname(target) === root;
 }
 
 function buildDevPath(basePath = process.env.PATH) {
@@ -384,28 +380,6 @@ function loadConfig() {
     }
   }
 
-  let devRoot = null;
-  const rawDevRoot = process.env.DEV_ROOT ?? file.devRoot;
-  if (rawDevRoot !== undefined && rawDevRoot !== null && rawDevRoot !== "") {
-    const resolvedDevRoot = resolvePath(rawDevRoot, configDir);
-    try {
-      if (statSync(resolvedDevRoot).isDirectory()) {
-        devRoot = resolvedDevRoot;
-      } else {
-        console.warn(`[config] devRoot is not a directory: ${resolvedDevRoot}`);
-      }
-    } catch {
-      console.warn(`[config] devRoot does not exist or is inaccessible: ${resolvedDevRoot}`);
-    }
-  } else {
-    const defaultDev = join(homedir(), "dev");
-    try {
-      if (statSync(defaultDev).isDirectory()) {
-        devRoot = defaultDev;
-      }
-    } catch {}
-  }
-
   let rawExtensions = [];
   if (process.env.REMOTE_PI_EXTENSIONS !== undefined) {
     const envExt = process.env.REMOTE_PI_EXTENSIONS.trim();
@@ -446,27 +420,16 @@ function loadConfig() {
   const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
   const savedState = loadState(stateDir);
 
-  let targetCwd = process.cwd();
-  if (process.env.PI_CWD) {
-    targetCwd = resolvePath(process.env.PI_CWD, configDir);
-  } else if (savedState.cwd && existsSync(savedState.cwd)) {
-    try {
-      if (statSync(savedState.cwd).isDirectory()) {
-        targetCwd = savedState.cwd;
-      }
-    } catch {
-      if (file.cwd) targetCwd = resolvePath(file.cwd, configDir);
-    }
-  } else if (file.cwd) {
-    targetCwd = resolvePath(file.cwd, configDir);
-  }
+  let targetCwd = process.env.PI_CWD
+    ? resolvePath(process.env.PI_CWD, configDir)
+    : savedState.cwd || (file.cwd ? resolvePath(file.cwd, configDir) : null);
+  if (!targetCwd) throw new Error(`"cwd" is required: set "cwd" in ${path} or export PI_CWD`);
 
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
     cwd: targetCwd,
     configPath: path,
-    devRoot,
     piBin: resolvePiBin(process.env.PI_BIN || file.piBin),
     stateDir,
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
@@ -481,7 +444,9 @@ function loadConfig() {
   config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
-  if (!existsSync(config.cwd)) throw new Error(`Pi working directory does not exist: ${config.cwd}`);
+  let cwdIsDir = false;
+  try { cwdIsDir = statSync(config.cwd).isDirectory(); } catch {}
+  if (!cwdIsDir) throw new Error(`Pi working directory does not exist or is not a directory: ${config.cwd}`);
   return config;
 }
 
@@ -1221,7 +1186,7 @@ class Gateway {
       switch (name) {
       case "start": case "help": return this.telegram.send(this.chatId, HELP);
       case "commands": return this.showCommands();
-      case "cwd": return this.showCwds();
+      case "cwd": return argument ? this.switchCwd(resolvePath(argument.trim(), this.config.cwd), null) : this.showCwds();
       case "model": return this.showModels(argument);
       case "thinking": return this.showThinking(argument);
       case "resume": return this.showSessions();
@@ -1415,20 +1380,6 @@ class Gateway {
   async showCwds() {
     const items = new Map();
 
-    if (this.config.devRoot) {
-      try {
-        const entries = (await readdir(this.config.devRoot, { withFileTypes: true }))
-          .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-          .sort((a, b) => a.name.localeCompare(b.name));
-        for (const entry of entries) {
-          const full = join(this.config.devRoot, entry.name);
-          items.set(full, entry.name);
-        }
-      } catch (err) {
-        console.warn(`[cwd] failed to read devRoot: ${err.message}`);
-      }
-    }
-
     if (Array.isArray(this.state.recentProjects)) {
       for (const p of this.state.recentProjects) {
         if (!items.has(p) && existsSync(p)) {
@@ -1441,10 +1392,10 @@ class Gateway {
       items.set(this.config.cwd, basename(this.config.cwd));
     }
 
-    if (!this.config.devRoot && items.size <= 1) {
+    if (items.size <= 1) {
       await this.telegram.send(
         this.chatId,
-        `当前目录：${this.config.cwd}\n\n⚠️ 未配置项目根目录 (devRoot)。\n若需在 Telegram 中使用 /cwd 选择并切换项目，请在配置文件中设置 "devRoot"（例如 {"devRoot": "~/dev"}）。`,
+        `当前目录：${this.config.cwd}\n\n暂无历史项目。使用 /cwd <绝对路径> 切换到其他项目。`,
       );
       return;
     }
@@ -1627,38 +1578,32 @@ class Gateway {
   }
 
   async switchCwd(path, callbackId) {
-    let root, target, targetStat;
+    const reply = callbackId
+      ? (text) => this.telegram.answer(callbackId, text)
+      : (text) => this.telegram.send(this.chatId, text);
+    let target, targetStat;
     try {
-      [root, target] = await Promise.all([
-        this.config.devRoot ? realpath(this.config.devRoot) : null,
-        realpath(path),
-      ]);
+      target = await realpath(path);
       targetStat = await stat(target);
     } catch {
-      await this.telegram.answer(callbackId, "目标目录已失效或不存在", { show_alert: true });
+      await reply(`目录不存在或无法访问：${path}`);
       return;
     }
     if (!targetStat.isDirectory()) {
-      await this.telegram.answer(callbackId, "目标不是有效目录", { show_alert: true });
-      return;
-    }
-    const isUnderDevRoot = Boolean(root && isDirectChild(root, target));
-    const isKnownRecent = Array.isArray(this.state.recentProjects) && this.state.recentProjects.includes(target);
-    if (!isUnderDevRoot && !isKnownRecent && target !== this.config.cwd) {
-      await this.telegram.answer(callbackId, "只能切换到 devRoot 子目录或已记录的项目", { show_alert: true });
+      await reply(`目标不是有效目录：${path}`);
       return;
     }
     if (target === this.config.cwd) {
-      await this.telegram.answer(callbackId, "已经在此目录");
+      await reply("已经在此目录");
       return;
     }
 
     await this.saveState({
       cwd: target,
-      recentProjects: [target, ...(this.state.recentProjects || []).filter((p) => p !== target)].slice(0, 10),
+      recentProjects: [target, ...(this.state.recentProjects || []).filter((p) => p !== target)].slice(0, 20),
     });
 
-    await this.telegram.answer(callbackId, "正在切换");
+    await reply("正在切换");
     await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
     this.pi.stop();
     this.config.cwd = target;
@@ -1995,9 +1940,6 @@ async function selfTest() {
   assert.deepEqual(parseCommand("/get README.md"), { name: "get", argument: "README.md" });
   assert.deepEqual(parseCommand("/followup check tests"), { name: "followup", argument: "check tests" });
   assert.equal(parseCommand("hello"), null);
-  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project"), true);
-  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/dev/project/nested"), false);
-  assert.equal(isDirectChild("/Users/me/dev", "/Users/me/other"), false);
   assert.ok(buildDevPath("/usr/bin:/bin").includes("/opt/homebrew/bin"));
   assert.ok(buildDevPath("/usr/bin:/bin").includes(join(homedir(), ".local", "bin")));
   assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
@@ -2288,7 +2230,6 @@ async function selfTest() {
         allowedUserId: "999",
         cwd: tmpCfgDir,
         stateDir: tmpCfgDir,
-        devRoot: tmpCfgDir,
         extensions: ["./my-ext.js"],
         enableCompanionExtension: false,
       })
@@ -2301,7 +2242,6 @@ async function selfTest() {
       assert.equal(cfg.botToken, "123456:abcdef");
       assert.equal(cfg.allowedUserId, "999");
       assert.equal(cfg.cwd, tmpCfgDir);
-      assert.equal(cfg.devRoot, tmpCfgDir);
       assert.deepEqual(cfg.extensions, [dummyExt]);
       assert.equal(cfg.enableCompanionExtension, false);
     } finally {
@@ -2328,12 +2268,40 @@ async function selfTest() {
       else delete process.env.REMOTE_PI_CONFIG;
     }
 
-    // verify showCwds handles devRoot: null gracefully
-    const gwNoDev = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir, devRoot: null });
+    // verify loadConfig throws when cwd is missing (required, no fallback)
+    const emptyStateDir = join(tmpCfgDir, `empty-state-${Date.now()}`);
+    await mkdir(emptyStateDir, { recursive: true });
+    const noCwdCfgPath = join(tmpCfgDir, "no-cwd.json");
+    writeFileSync(
+      noCwdCfgPath,
+      JSON.stringify({
+        botToken: "123456:abcdef",
+        allowedUserId: "999",
+        stateDir: emptyStateDir,
+      })
+    );
+    process.env.REMOTE_PI_CONFIG = noCwdCfgPath;
+    try {
+      assert.throws(() => loadConfig(), /"cwd" is required/);
+    } finally {
+      if (prevEnvCfg) process.env.REMOTE_PI_CONFIG = prevEnvCfg;
+      else delete process.env.REMOTE_PI_CONFIG;
+    }
+
+    // verify showCwds guides usage when history is empty
+    const gwNoHistory = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
     let sentMsg = "";
-    gwNoDev.telegram.send = async (_chat, text) => { sentMsg = text; };
-    await gwNoDev.showCwds();
-    assert.ok(sentMsg.includes("未配置项目根目录 (devRoot)"), "showCwds should guide user when devRoot is null");
+    gwNoHistory.telegram.send = async (_chat, text) => { sentMsg = text; };
+    await gwNoHistory.showCwds();
+    assert.ok(sentMsg.includes("暂无历史项目"), "showCwds should guide usage when history is empty");
+
+    // verify switchCwd reports error for nonexistent dir and keeps cwd
+    const gwSwitch = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
+    let switchMsg = "";
+    gwSwitch.telegram.send = async (_chat, text) => { switchMsg = text; };
+    await gwSwitch.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
+    assert.ok(switchMsg.includes("目录不存在"), "switchCwd should report error for missing dir");
+    assert.equal(gwSwitch.config.cwd, tmpCfgDir);
 
     // verify resolveSessionDir collision resistance and legacy fallback
     const dirA = resolveSessionDir(tmpCfgDir, "/a/b-c");
