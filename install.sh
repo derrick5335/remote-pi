@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LABEL="local.remote-pi"
 
-if [[ "${1:-}" =~ ^(restart|stop|uninstall)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
+if [[ "${1:-}" =~ ^(restart|stop|uninstall|upgrade)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
     echo "❌ 不能在 Remote Pi Gateway 会话内重启或停止自身服务（会导致自杀与失联）。" >&2
-    echo "💡 如需重启 Gateway，请在 Telegram 中手动发送 /restart 命令。" >&2
+    echo "💡 如需重启 Gateway，请在 Telegram 中手动发送 /restart；如需升级请发送 /upgrade。" >&2
     exit 1
 fi
 
