@@ -17,42 +17,42 @@ const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 const HELP = `Remote Pi
 
-直接发送文字即可和 Pi 对话；运行中发送的文字会作为 steer。
+Just send text to chat with Pi; messages sent while it is working act as steering.
 
-/help               显示帮助
-/commands           扩展、Prompt 和 Skill 命令
-/cwd [路径]          切换工作目录；无参数显示历史项目
-/sh <命令>           直接执行 Shell 命令
-/get <文件路径>      从当前项目下载文件
-/model [关键词|provider/model]
+/help               Show this help
+/commands           Extension, prompt & skill commands
+/cwd [path]         Switch workspace; no argument shows recent projects
+/sh <command>       Run a shell command directly
+/get <path>         Download a file from the workspace
+/model [query|provider/model]
 /thinking [level]
-/resume             选择历史会话
-/new                新会话
-/name <名称>         设置会话名
-/session            当前模型、Session、Token 和费用
-/fork               从历史用户消息创建分支
-/clone              克隆当前分支
-/compact [要求]      压缩上下文
-/export             导出 HTML
-/abort              停止当前任务（排队消息保留）
-/abort clear        停止并清空队列
-/restart            重启 Gateway
-/upgrade            升级 Gateway 到最新版本（git pull + 自检 + 重启）
-/queue [clear]       查看或清空消息队列
-/followup <消息>     追加为排队后续任务`;
+/resume             Pick a past session
+/new                New session
+/name <name>        Name the session
+/session            Current model, session, tokens & cost
+/fork               Branch from a past user message
+/clone              Clone the current branch
+/compact [focus]    Compact the context
+/export             Export as HTML
+/abort              Stop current task (queue kept)
+/abort clear        Stop and clear the queue
+/restart            Restart the gateway
+/upgrade            Upgrade gateway to latest (git pull + self-test + restart)
+/queue [clear]      View or clear the message queue
+/followup <text>    Queue a follow-up prompt`;
 
 const BOT_COMMANDS = [
-  ["help", "帮助"], ["commands", "扩展、Prompt 和 Skill 命令"],
-  ["cwd", "切换目录或显示历史"], ["sh", "直接执行 Shell 命令"], ["get", "下载项目文件"],
-  ["model", "查看或切换模型"], ["thinking", "查看或切换思考级别"],
-  ["resume", "恢复历史会话"], ["new", "新会话"], ["name", "设置会话名"],
-  ["session", "Session 和费用"],
-  ["fork", "从历史分支"], ["clone", "克隆当前分支"],
-  ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务（保留队列）"],
-  ["restart", "重启 Gateway"],
-  ["upgrade", "升级 Gateway 到最新版本"],
-  ["queue", "查看或清空队列"],
-  ["followup", "排队追加后续任务"],
+  ["help", "Help"], ["commands", "Extension, prompt & skill commands"],
+  ["cwd", "Switch workspace or show history"], ["sh", "Run a shell command"], ["get", "Download a file"],
+  ["model", "View or switch model"], ["thinking", "View or set thinking level"],
+  ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
+  ["session", "Session & cost"],
+  ["fork", "Branch from history"], ["clone", "Clone current branch"],
+  ["compact", "Compact context"], ["export", "Export session"], ["abort", "Stop task (queue kept)"],
+  ["restart", "Restart gateway"],
+  ["upgrade", "Upgrade gateway to latest"],
+  ["queue", "View or clear queue"],
+  ["followup", "Queue a follow-up"],
 ].map(([command, description]) => ({ command, description }));
 
 function parseCommand(text) {
@@ -209,7 +209,7 @@ function renderChunk(text, from, to) {
 }
 
 function chunks(text, limit = MAX_MESSAGE) {
-  const str = String(text || "（无内容）");
+  const str = String(text || "(empty)");
   if (str.length <= limit) return [str];
   const parts = [];
   let from = 0;
@@ -244,14 +244,14 @@ function renderToolPanel(tools, isSettled = false) {
   if (!tools.length) return "";
   const total = tools.length;
   const done = tools.filter((t) => t.status !== "running").length;
-  const header = isSettled ? `✅ 已完成 ${total} 项操作` : `⚙️ 正在执行操作 (${done}/${total})…`;
+  const header = isSettled ? `✅ ${total} tool call(s) done` : `⚙️ Running tools (${done}/${total})…`;
   const recent = tools.slice(-6).map((t) => {
     const icon = t.status === "running" ? "⏳" : t.status === "error" ? "❌" : "✅";
     const summary = t.summary.length > 80 ? `${t.summary.slice(0, 77)}…` : t.summary;
     return `• ${icon} ${summary}`;
   });
   const hidden = tools.length - recent.length;
-  const prefix = hidden > 0 ? [`… 之前已完成 ${hidden} 项`] : [];
+  const prefix = hidden > 0 ? [`… ${hidden} earlier call(s) done`] : [];
   const body = [...prefix, ...recent].join("\n");
   // ponytail: 面板是同一条消息反复 edit，实体结构必须首帧即定（官方 entities 不跨 edit 保留），避免中途跳变
   return `${header}\n${expandableBlockquote(body)}`;
@@ -287,20 +287,20 @@ function extensionFromMime(mime = "") {
 }
 
 function attachmentPrompt(caption, files) {
-  return `${caption}\n\n附件已保存到本地：\n${files.map((file) => `- ${file.path}`).join("\n")}`;
+  return `${caption}\n\nAttachments saved locally:\n${files.map((file) => `- ${file.path}`).join("\n")}`;
 }
 
 function previewText(text) {
-  return text.length > MAX_MESSAGE ? `${text.slice(0, MAX_MESSAGE)}\n\n*(内容较长，输出中…)*` : text;
+  return text.length > MAX_MESSAGE ? `${text.slice(0, MAX_MESSAGE)}\n\n*(output truncated, still streaming…)*` : text;
 }
 
 function formatAssistantError(errorMessage) {
-  const message = String(errorMessage || "模型调用失败");
+  const message = String(errorMessage || "Model call failed");
   if (/usage limit|quota|balance|credit|insufficient|budget/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 提示：当前模型用量额度已用尽。你可以使用 /model 切换到其他可用模型（例如 Gemini 或 Claude）。`;
+    return `⚠️ ${message}\n\n💡 Tip: the current model's usage quota is exhausted. Use /model to switch to another available model (e.g. Gemini or Claude).`;
   }
   if (/rate limit|too many requests|429/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 提示：触发了服务商速率限制，请稍候重试，或使用 /model 切换模型。`;
+    return `⚠️ ${message}\n\n💡 Tip: provider rate limit hit. Retry shortly, or use /model to switch models.`;
   }
   return `❌ ${message}`;
 }
@@ -316,7 +316,7 @@ function runStt(sttCommand, audioPath) {
     child.on("close", (code) => {
       const text = out.trim();
       if (code === 0 && text) return resolveStt(text);
-      rejectStt(new Error(`语音转写失败 (exit ${code ?? "signal"})：${(err.trim() || text || "无输出").slice(-300)}`));
+      rejectStt(new Error(`Speech-to-text failed (exit ${code ?? "signal"}): ${(err.trim() || text || "no output").slice(-300)}`));
     });
   });
 }
@@ -503,7 +503,7 @@ class Telegram {
   }
 
   async sendOne(chatId, text, extra = {}) {
-    const plain = String(text || "（无内容）");
+    const plain = String(text || "(empty)");
     try {
       return await this.call("sendMessage", { chat_id: chatId, text: telegramHtml(plain), parse_mode: "HTML", ...extra });
     } catch (error) {
@@ -532,7 +532,7 @@ class Telegram {
   }
 
   async edit(chatId, messageId, text, ephemeral = false) {
-    const plain = String(text || "（无内容）");
+    const plain = String(text || "(empty)");
     const timeout = ephemeral ? 10_000 : 35_000;
     const maxAttempts = ephemeral ? 1 : 3;
     try {
@@ -894,7 +894,7 @@ class Gateway {
     this.settleActiveReactions();
     if (wasStreaming || pendingUi) {
       console.error(`${new Date().toISOString()} [pi] process exited unexpectedly (${code ?? signal})`);
-      this.queueTelegram(() => this.telegram.send(this.chatId, `⚠️ Pi 进程异常退出 (${code ?? signal})，已恢复就绪。`));
+      this.queueTelegram(() => this.telegram.send(this.chatId, `⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`));
     }
   }
 
@@ -933,7 +933,7 @@ class Gateway {
         };
         const next = this.updateChain.then(groupTask).catch((err) => {
           console.error("Media group error:", err);
-          this.telegram.send(this.chatId, `❌ 处理图片组失败: ${err.message}`);
+          this.telegram.send(this.chatId, `❌ Failed to process media group: ${err.message}`);
         });
         this.updateChain = next;
         group.done = next;
@@ -1015,7 +1015,7 @@ class Gateway {
   async extractMedia(m) {
     if (m.photo?.length) {
       const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`, true);
-      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "图片" };
+      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "photo" };
     }
     const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
     if (!file) return null;
@@ -1023,7 +1023,7 @@ class Gateway {
     const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
     const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`, isImage);
     const image = isImage ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
-    const label = m.voice ? "语音消息" : file.file_name ? `文件 ${file.file_name}` : kind;
+    const label = m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind;
     return { saved, image, label };
   }
 
@@ -1033,7 +1033,7 @@ class Gateway {
       this.pendingUi = null;
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
-      await this.telegram.send(this.chatId, "已提交。");
+      await this.telegram.send(this.chatId, "Submitted.");
       await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       return;
     }
@@ -1060,7 +1060,7 @@ class Gateway {
       this.runStartedAt = performance.now();
       this.runFirstTokenAt = null;
       this.runFirstUiAt = null;
-      await this.prompt(attachmentPrompt(message.caption || `用户发送了${media.label}。`, [media.saved]), media.image ? [media.image] : undefined);
+      await this.prompt(attachmentPrompt(message.caption || `User sent a ${media.label}.`, [media.saved]), media.image ? [media.image] : undefined);
       return;
     }
 
@@ -1102,7 +1102,7 @@ class Gateway {
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
     if (files.length) {
-      await this.prompt(attachmentPrompt(caption || "请查看这组文件。", files), images.length ? images : undefined);
+      await this.prompt(attachmentPrompt(caption || "Please review these files.", files), images.length ? images : undefined);
     } else if (caption) {
       await this.prompt(caption);
     }
@@ -1176,7 +1176,7 @@ class Gateway {
         }
       }
       console.log(`${new Date().toISOString()} [prompt] accepted by Pi in ${Math.round(performance.now() - t0)}ms`);
-      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ 已加入 follow-up 队列", { disable_notification: true });
+      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ Queued as follow-up", { disable_notification: true });
     } catch (error) {
       this.stopTyping();
       throw error;
@@ -1208,7 +1208,7 @@ class Gateway {
         this.settleActiveReactions();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
-          return this.telegram.send(this.chatId, "新会话已取消");
+          return this.telegram.send(this.chatId, "New session cancelled");
         }
         if (targetModel) {
           await this.pi.request("set_model", targetModel).catch((err) => {
@@ -1221,21 +1221,21 @@ class Gateway {
         return this.telegram.send(this.chatId, text);
       }
       case "name": {
-        if (!argument) return this.telegram.send(this.chatId, "用法：/name <名称>");
+        if (!argument) return this.telegram.send(this.chatId, "Usage: /name <name>");
         await this.pi.request("set_session_name", { name: argument });
-        return this.telegram.send(this.chatId, `✅ 会话名：${argument}`);
+        return this.telegram.send(this.chatId, `✅ Session name: ${argument}`);
       }
       case "session": case "status": return this.showSession();
       case "fork": return this.showForks();
       case "clone": {
         const result = await this.pi.request("clone");
-        return this.telegram.send(this.chatId, result.cancelled ? "克隆已取消" : "✅ 已克隆当前分支");
+        return this.telegram.send(this.chatId, result.cancelled ? "Clone cancelled" : "✅ Current branch cloned");
       }
       case "compact": {
         this.startTyping();
         try {
           const result = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
-          return this.telegram.send(this.chatId, `✅ 已压缩：${result.tokensBefore} → 约 ${result.estimatedTokensAfter} tokens`);
+          return this.telegram.send(this.chatId, `✅ Compacted: ${result.tokensBefore} → ~${result.estimatedTokensAfter} tokens`);
         } catch (error) {
           if (!/abort/i.test(error.message)) {
             return this.telegram.send(this.chatId, `❌ ${error.message}`);
@@ -1250,14 +1250,14 @@ class Gateway {
         return;
       }
       case "sh": case "bash": {
-        if (!argument) return this.telegram.send(this.chatId, "用法：/sh <命令>");
+        if (!argument) return this.telegram.send(this.chatId, "Usage: /sh <command>");
         if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
-          return this.telegram.send(this.chatId, "❌ 禁止在此执行服务重启/停止命令。如需重启 Gateway 请手动发送 /restart。");
+          return this.telegram.send(this.chatId, "❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
         }
         this.startTyping();
         try {
           const res = await this.pi.request("bash", { command: argument });
-          const output = res.output ? res.output.trim() : "（命令无输出）";
+          const output = res.output ? res.output.trim() : "(no output)";
           if (output.split("\n").length > 3) {
             return this.telegram.send(this.chatId, expandableBlockquote(output));
           }
@@ -1271,20 +1271,20 @@ class Gateway {
         }
       }
       case "get": {
-        if (!argument) return this.telegram.send(this.chatId, "用法：/get <相对路径>");
+        if (!argument) return this.telegram.send(this.chatId, "Usage: /get <path>");
         const filePath = resolve(this.config.cwd, argument);
         try {
           const s = await stat(filePath);
-          if (!s.isFile()) return this.telegram.send(this.chatId, "❌ 指定路径不是普通文件");
-          if (s.size > 20 * 1024 * 1024) return this.telegram.send(this.chatId, "❌ 文件超过 20MB 限制");
+          if (!s.isFile()) return this.telegram.send(this.chatId, "❌ Not a regular file");
+          if (s.size > 20 * 1024 * 1024) return this.telegram.send(this.chatId, "❌ File exceeds the 20MB limit");
           await this.telegram.sendDocument(this.chatId, filePath);
         } catch (error) {
-          return this.telegram.send(this.chatId, `❌ 文件不存在或无法访问: ${error.message}`);
+          return this.telegram.send(this.chatId, `❌ File missing or inaccessible: ${error.message}`);
         }
         return;
       }
       case "followup": {
-        if (!argument) return this.telegram.send(this.chatId, "用法：/followup <消息>");
+        if (!argument) return this.telegram.send(this.chatId, "Usage: /followup <message>");
         return this.prompt(argument, undefined, "followUp");
       }
       case "abort": {
@@ -1301,7 +1301,7 @@ class Gateway {
         this.resetSessionState();
         if (!clear) this.queue = kept;
         this.settleActiveReactions();
-        return this.telegram.send(this.chatId, clear ? "⏹ 已停止，队列已清空" : "⏹ 已停止（排队消息保留，/abort clear 可清空）");
+        return this.telegram.send(this.chatId, clear ? "⏹ Stopped; queue cleared" : "⏹ Stopped (queued messages kept; /abort clear to clear)");
       }
       case "upgrade": {
         // 复用 install.sh upgrade（dirty check / ff-only pull / npm install / self-test / 自动回滚），
@@ -1319,14 +1319,14 @@ class Gateway {
           child.on("error", (err) => done({ code: 1, buf: String(err) }));
         });
         this.stopTyping();
-        const text = res.buf.trim() || "（无输出）";
-        if (res.code !== 0) return this.telegram.send(this.chatId, `❌ 升级失败\n${text}`);
-        if (text.includes("已是最新")) return this.telegram.send(this.chatId, text);
+        const text = res.buf.trim() || "(no output)";
+        if (res.code !== 0) return this.telegram.send(this.chatId, `❌ Upgrade failed\n${text}`);
+        if (text.includes("Already up to date")) return this.telegram.send(this.chatId, text);
         await this.telegram.send(this.chatId, text);
         return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId); // graceful restart: 回执落盘 → exit → launchd 拉起新版
       }
       case "restart": {
-        await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
+        await this.telegram.send(this.chatId, "🔄 Restarting gateway…");
         // ref: Node.js process.exit & restart receipt (https://nodejs.org/api/process.html#processexitcode)
         if (updateId) {
           const receiptPath = join(this.config.stateDir, "last-restart-update");
@@ -1343,16 +1343,16 @@ class Gateway {
         if (argument === "clear") {
           const removed = this.pi.proc ? await this.pi.request("clear_queue").catch(() => ({ steering: [], followUp: [] })) : { steering: [], followUp: [] };
           this.queue = { steering: [], followUp: [] };
-          return this.telegram.send(this.chatId, `已清空\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
+          return this.telegram.send(this.chatId, `Cleared\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
         }
-        return this.telegram.send(this.chatId, `steering:\n${this.queue.steering.join("\n") || "（空）"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "（空）"}`);
+        return this.telegram.send(this.chatId, `steering:\n${this.queue.steering.join("\n") || "(empty)"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "(empty)"}`);
       }
       default: {
         const alias = this.commandAliases.get(name);
         if (alias) return this.prompt(`/${alias}${argument ? ` ${argument}` : ""}`);
         const commands = await this.pi.request("get_commands");
         if (commands.commands.some((item) => item.name.toLowerCase() === name)) return this.prompt(original);
-        return this.telegram.send(this.chatId, `未知命令：/${name}\n使用 /help 或 /commands`);
+        return this.telegram.send(this.chatId, `Unknown command: /${name}\nUse /help or /commands`);
       }
     }
     } finally {
@@ -1386,7 +1386,7 @@ class Gateway {
     const data = await this.pi.request("get_commands");
     const text = data.commands.length
       ? data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n")
-      : "没有加载扩展命令、Prompt Template 或 Skill。";
+      : "No extension commands, prompt templates, or skills loaded.";
     await this.telegram.send(this.chatId, text);
   }
 
@@ -1420,7 +1420,7 @@ class Gateway {
     if (items.size <= 1) {
       await this.telegram.send(
         this.chatId,
-        `当前目录：${this.config.cwd}\n\n暂无历史项目。使用 /cwd <绝对路径> 切换到其他项目。`,
+        `Current directory: ${this.config.cwd}\n\nNo recent projects yet. Use /cwd <absolute-path> to switch to another project.`,
       );
       return;
     }
@@ -1430,7 +1430,7 @@ class Gateway {
       action: { type: "cwd", path },
     }));
 
-    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择工作区项目：`, this.keyboard(keyboardItems));
+    await this.telegram.send(this.chatId, `Current directory: ${this.config.cwd}\n\nPick a workspace project:`, this.keyboard(keyboardItems));
   }
 
   action(payload) {
@@ -1457,10 +1457,10 @@ class Gateway {
       }
     }
     const filtered = models.filter((model) => !query || `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query.toLowerCase()));
-    if (!filtered.length) return this.telegram.send(this.chatId, `没有匹配模型：${query}`);
+    if (!filtered.length) return this.telegram.send(this.chatId, `No matching model: ${query}`);
     const display = filtered.slice(0, 18);
-    const suffix = filtered.length > 18 ? `\n\n（共 ${filtered.length} 个模型，仅显示前 18 个，可用 /model 关键词 过滤）` : "";
-    return this.telegram.send(this.chatId, `选择模型：${suffix}`, this.keyboard(display.map((model) => ({
+    const suffix = filtered.length > 18 ? `\n\n(${filtered.length} models; showing first 18 — use /model <query> to filter)` : "";
+    return this.telegram.send(this.chatId, `Pick a model:${suffix}`, this.keyboard(display.map((model) => ({
       label: `${model.provider}/${model.id}`,
       action: { type: "model", provider: model.provider, modelId: model.id },
     }))));
@@ -1469,11 +1469,11 @@ class Gateway {
   async showThinking(argument) {
     const data = await this.pi.request("get_available_thinking_levels");
     if (argument) {
-      if (!data.levels.includes(argument)) return this.telegram.send(this.chatId, `可用级别：${data.levels.join(", ")}`);
+      if (!data.levels.includes(argument)) return this.telegram.send(this.chatId, `Available levels: ${data.levels.join(", ")}`);
       await this.pi.request("set_thinking_level", { level: argument });
       return this.telegram.send(this.chatId, `✅ thinking: ${argument}`);
     }
-    return this.telegram.send(this.chatId, "选择 thinking level：", this.keyboard(data.levels.map((level) => ({
+    return this.telegram.send(this.chatId, "Pick a thinking level:", this.keyboard(data.levels.map((level) => ({
       label: level, action: { type: "thinking", level },
     }))));
   }
@@ -1520,8 +1520,8 @@ class Gateway {
 
   async showSessions() {
     const sessions = (await this.sessionFiles()).slice(0, 12);
-    if (!sessions.length) return this.telegram.send(this.chatId, "当前目录还没有历史 Session。");
-    return this.telegram.send(this.chatId, "选择 Session：", this.keyboard(sessions.map((session) => ({
+    if (!sessions.length) return this.telegram.send(this.chatId, "No past sessions for this directory yet.");
+    return this.telegram.send(this.chatId, "Pick a session:", this.keyboard(sessions.map((session) => ({
       label: session.title,
       action: { type: "resume", path: session.path },
     }))));
@@ -1529,20 +1529,20 @@ class Gateway {
 
   async showSession() {
     const [state, stats] = await Promise.all([this.pi.request("get_state"), this.pi.request("get_session_stats")]);
-    const model = state.model ? `${state.model.provider}/${state.model.id}` : "未选择";
-    const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "暂无";
+    const model = state.model ? `${state.model.provider}/${state.model.id}` : "none";
+    const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "n/a";
     await this.telegram.send(this.chatId, [
-      `名称：${state.sessionName || "（未命名）"}`, `模型：${model}`, `Thinking：${state.thinkingLevel}`,
-      `状态：${state.isStreaming ? "working" : "idle"}`, `消息：${stats.totalMessages}`, `上下文：${context}`,
-      `费用：$${Number(stats.cost || 0).toFixed(4)}`, `Session：${state.sessionId}`, `文件：${state.sessionFile || "未持久化"}`,
+      `Name: ${state.sessionName || "(unnamed)"}`, `Model: ${model}`, `Thinking: ${state.thinkingLevel}`,
+      `State: ${state.isStreaming ? "working" : "idle"}`, `Messages: ${stats.totalMessages}`, `Context: ${context}`,
+      `Cost: $${Number(stats.cost || 0).toFixed(4)}`, `Session: ${state.sessionId}`, `File: ${state.sessionFile || "not persisted"}`,
     ].join("\n"));
   }
 
   async showForks() {
     const data = await this.pi.request("get_fork_messages");
     const messages = data.messages.slice(-12).reverse();
-    if (!messages.length) return this.telegram.send(this.chatId, "没有可分支的用户消息。");
-    return this.telegram.send(this.chatId, "从哪条消息创建分支？", this.keyboard(messages.map((message) => ({
+    if (!messages.length) return this.telegram.send(this.chatId, "No user messages to fork from.");
+    return this.telegram.send(this.chatId, "Fork from which message?", this.keyboard(messages.map((message) => ({
       label: message.text.replaceAll("\n", " ").slice(0, 60),
       action: { type: "fork", entryId: message.entryId },
     }))));
@@ -1553,7 +1553,7 @@ class Gateway {
     const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
     const action = this.actions.get(token);
     this.actions.delete(token);
-    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "操作已过期");
+    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
     try {
       console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
       if (action.type === "model") {
@@ -1573,12 +1573,12 @@ class Gateway {
             this.lastModel = { provider: state.model.provider, modelId: state.model.id };
           }
         }
-        await this.telegram.send(this.chatId, result.cancelled ? "恢复已取消" : "✅ 已恢复 Session");
+        await this.telegram.send(this.chatId, result.cancelled ? "Resume cancelled" : "✅ Session resumed");
       } else if (action.type === "fork") {
         if (this.isStreaming) await this.pi.request("abort").catch(() => {});
         this.resetSessionState();
         const result = await this.pi.request("fork", { entryId: action.entryId });
-        await this.telegram.send(this.chatId, result.cancelled ? "分支已取消" : `✅ 已从「${result.text.slice(0, 80)}」创建分支`);
+        await this.telegram.send(this.chatId, result.cancelled ? "Fork cancelled" : `✅ Forked from "${result.text.slice(0, 80)}"`);
       } else if (action.type === "cwd") {
         await this.switchCwd(action.path, callback.id);
         return;
@@ -1589,13 +1589,13 @@ class Gateway {
         }
         this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
         if (callback.message) {
-          const chosen = action.response?.value ?? (action.response?.confirmed ? "确认" : "取消");
+          const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
           await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
         }
       }
-      await this.telegram.answer(callback.id, "完成");
+      await this.telegram.answer(callback.id, "Done");
     } catch (error) {
-      await this.telegram.answer(callback.id, "失败");
+      await this.telegram.answer(callback.id, "Failed");
       await this.telegram.send(this.chatId, `❌ ${error.message}`);
     } finally {
       console.log(`${new Date().toISOString()} [callback] ${action.type} finished in ${Math.round(performance.now() - t0)}ms`);
@@ -1611,15 +1611,15 @@ class Gateway {
       target = await realpath(path);
       targetStat = await stat(target);
     } catch {
-      await reply(`目录不存在或无法访问：${path}`);
+      await reply(`Directory missing or inaccessible: ${path}`);
       return;
     }
     if (!targetStat.isDirectory()) {
-      await reply(`目标不是有效目录：${path}`);
+      await reply(`Not a valid directory: ${path}`);
       return;
     }
     if (target === this.config.cwd) {
-      await reply("已经在此目录");
+      await reply("Already in this directory");
       return;
     }
 
@@ -1628,8 +1628,8 @@ class Gateway {
       recentProjects: [target, ...(this.state.recentProjects || []).filter((p) => p !== target)].slice(0, 20),
     });
 
-    await reply("正在切换");
-    await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
+    await reply("Switching");
+    await this.telegram.send(this.chatId, `✅ Working directory switched to:\n${target}\n\nHot-restarting Pi…`);
     this.pi.stop();
     this.config.cwd = target;
     this.config.sessionDir = resolveSessionDir(this.config.stateDir, target);
@@ -1642,7 +1642,7 @@ class Gateway {
     if (state?.model?.provider && state?.model?.id) {
       this.lastModel = { provider: state.model.provider, modelId: state.model.id };
     }
-    await this.telegram.send(this.chatId, `✅ Pi 已就绪；Session: ${state.sessionId}`);
+    await this.telegram.send(this.chatId, `✅ Pi ready; Session: ${state.sessionId}`);
   }
 
   async handleEvent(event) {
@@ -1679,7 +1679,7 @@ class Gateway {
       }
       // ref: Pi RPC settled lifecycle (https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
       if (!this.repliedInRun && !this.abortedRun) {
-        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ 模型未返回任何文本回复。可使用 /model 切换模型或重试。"));
+        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ The model returned no text reply. Use /model to switch models or retry."));
       }
       this.abortedRun = false;
       this.settleActiveReactions();
@@ -1691,10 +1691,10 @@ class Gateway {
     if (!this.chatReady) return;
 
     if (event.type === "auto_retry_start") {
-      await this.telegram.send(this.chatId, `⏳ 模型响应异常，正在自动重试 (${event.attempt}/${event.maxAttempts})…`);
+      await this.telegram.send(this.chatId, `⏳ Model error; auto-retrying (${event.attempt}/${event.maxAttempts})…`);
     }
     if (event.type === "compaction_end" && event.errorMessage) {
-      await this.telegram.send(this.chatId, `⚠️ 上下文压缩失败: ${event.errorMessage}`);
+      await this.telegram.send(this.chatId, `⚠️ Context compaction failed: ${event.errorMessage}`);
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -1769,7 +1769,7 @@ class Gateway {
         for (const path of paths) {
           this.queueUpload(async () => {
             try { await this.telegram.sendDocument(this.chatId, path); }
-            catch (error) { await this.telegram.send(this.chatId, `❌ 附件发送失败 ${basename(path)}: ${error.message}`); }
+            catch (error) { await this.telegram.send(this.chatId, `❌ Failed to send attachment ${basename(path)}: ${error.message}`); }
           });
         }
       }
@@ -1891,14 +1891,14 @@ class Gateway {
       // draft 模式预览 30s 即过期，失败副本落盘防丢内容
       const copy = join(this.config.stateDir, `failed-reply-${Date.now()}.txt`);
       await writeFile(copy, draft.text).catch(() => {});
-      await this.telegram.send(this.chatId, `❌ 回复交付失败：${error.message}\n内容已存：${copy}`).catch(() => {});
+      await this.telegram.send(this.chatId, `❌ Reply delivery failed: ${error.message}\nContent saved to: ${copy}`).catch(() => {});
     }
   }
 
   async handleUiRequest(request) {
     if (["select", "confirm"].includes(request.method)) {
       const options = request.method === "confirm" ? [
-        { label: "确认", response: { confirmed: true } }, { label: "取消", response: { confirmed: false } },
+        { label: "Confirm", response: { confirmed: true } }, { label: "Cancel", response: { confirmed: false } },
       ] : request.options.map((value) => ({ label: value, response: { value } }));
       await this.telegram.send(this.chatId, [request.title, request.message].filter(Boolean).join("\n"), this.keyboard(options.map((option) => ({
         label: option.label, action: { type: "ui", requestId: request.id, response: option.response },
@@ -1918,7 +1918,7 @@ class Gateway {
       const client = net.connect({ path: sockPath }, () => {
         client.end();
         const pid = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
-        reject(new Error(`另一个 gateway 正在运行${pid ? ` (pid ${pid})` : ""}。先 ./install.sh stop`));
+        reject(new Error(`Another gateway is already running${pid ? ` (pid ${pid})` : ""}. Run ./install.sh stop first`));
       });
       client.on("error", (err) => {
         if (["ECONNREFUSED", "ENOENT", "ENOTSOCK"].includes(err.code)) {
@@ -1993,8 +1993,8 @@ async function selfTest() {
     '<a href="https://example.com">link</a> and <a href="https://t.me">https://t.me</a>'
   );
 
-  assert.ok(formatAssistantError("Codex error: The usage limit has been reached").includes("额度已用尽"));
-  assert.ok(formatAssistantError("Rate limit exceeded").includes("速率限制"));
+  assert.ok(formatAssistantError("Codex error: The usage limit has been reached").includes("quota is exhausted"));
+  assert.ok(formatAssistantError("Rate limit exceeded").includes("rate limit"));
   assert.equal(formatAssistantError("Network failure"), "❌ Network failure");
   assert.equal(retryableTelegramStatus(429), true);
   assert.equal(retryableTelegramStatus(500), true);
@@ -2014,7 +2014,7 @@ async function selfTest() {
   assert.equal(toolSummary("read", { path: "foo.txt" }), "read: foo.txt");
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("⏳"));
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("```expandable"), "单工具也应使用折叠块，避免中途跳变");
-  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("✅ 已完成 1 项操作"));
+  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("✅ 1 tool call(s) done"));
 
   assert.equal(formatContextTokens(1048576), "1.0M");
   assert.equal(formatContextTokens(128000), "128K");
@@ -2022,10 +2022,10 @@ async function selfTest() {
   assert.equal(formatContextTokens(500), "500");
   assert.equal(extensionFromMime("audio/ogg"), ".ogg");
   assert.equal(extensionFromMime("weird/type"), "");
-  assert.ok(attachmentPrompt("看看", [{ path: "/tmp/a b.txt" }]).includes("- /tmp/a b.txt"));
+  assert.ok(attachmentPrompt("check this", [{ path: "/tmp/a b.txt" }]).includes("- /tmp/a b.txt"));
   assert.equal(previewText("ab"), "ab");
-  assert.ok(previewText("x".repeat(5000)).endsWith("*(内容较长，输出中…)*"));
-  assert.ok(previewText("x".repeat(5000)).length <= MAX_MESSAGE + 20);
+  assert.ok(previewText("x".repeat(5000)).endsWith("*(output truncated, still streaming…)*"));
+  assert.ok(previewText("x".repeat(5000)).length <= MAX_MESSAGE + 60);
   assert.equal(await runStt("printf %s $1", "/tmp/audio.ogg"), "/tmp/audio.ogg");
 
   {
@@ -2315,14 +2315,14 @@ async function selfTest() {
     let sentMsg = "";
     gwNoHistory.telegram.send = async (_chat, text) => { sentMsg = text; };
     await gwNoHistory.showCwds();
-    assert.ok(sentMsg.includes("暂无历史项目"), "showCwds should guide usage when history is empty");
+    assert.ok(sentMsg.includes("No recent projects yet"), "showCwds should guide usage when history is empty");
 
     // verify switchCwd reports error for nonexistent dir and keeps cwd
     const gwSwitch = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
     let switchMsg = "";
     gwSwitch.telegram.send = async (_chat, text) => { switchMsg = text; };
     await gwSwitch.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
-    assert.ok(switchMsg.includes("目录不存在"), "switchCwd should report error for missing dir");
+    assert.ok(switchMsg.includes("Directory missing"), "switchCwd should report error for missing dir");
     assert.equal(gwSwitch.config.cwd, tmpCfgDir);
 
     // verify resolveSessionDir collision resistance and legacy fallback
@@ -2383,7 +2383,7 @@ async function selfTest() {
     gw2.resetSessionState = () => {};
     gw2.pi = { stop: () => {} };
 
-    await assert.rejects(() => gw2.acquireLock(), /另一个 gateway 正在运行/);
+    await assert.rejects(() => gw2.acquireLock(), /Another gateway is already running/);
 
     gw1.stop();
     assert.equal(existsSync(gw1.sockPath), false);
@@ -2428,7 +2428,7 @@ async function selfTest() {
 
       // 首次 /restart：应落盘收据并发送提示
       await gwRestart.handlePriorityUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 }, "p0");
-      assert.ok(sentMsg.includes("正在重启"));
+      assert.ok(sentMsg.includes("Restarting gateway"));
       assert.equal(await readFile(join(tmpState, "last-restart-update"), "utf8"), "888");
 
       // 重复投递相同的 update_id：应静默忽略，不再重复执行
@@ -2456,7 +2456,7 @@ async function selfTest() {
       gwExit.handlePiExit({ code: 1, signal: null, expected: false });
       assert.equal(gwExit.isStreaming, false, "异常退出后 isStreaming 必须重置为 false");
       await gwExit.telegramChain;
-      assert.ok(exitNotice.includes("异常退出"), "异常退出必须向用户告警");
+      assert.ok(exitNotice.includes("exited unexpectedly"), "异常退出必须向用户告警");
     }
 
     // 回归（架构审查 Issue 3）：HTML 解析与长度超限时降级为分段纯文本
@@ -2530,7 +2530,7 @@ async function selfTest() {
       gwAbort.telegram.send = async () => {};
       let sentWarning = false;
       gwAbort.telegram.send = async (_c, text) => {
-        if (text.includes("未返回任何文本回复")) sentWarning = true;
+        if (text.includes("no text reply")) sentWarning = true;
       };
 
       // 模拟用户触发 abort
@@ -2562,7 +2562,7 @@ async function selfTest() {
       gwUi.telegram.answer = async (_id, text) => { answeredMsg = text; };
       // 再次点击选项 B
       await gwUi.handleCallback({ id: "cb-2", data: t2 });
-      assert.equal(answeredMsg, "操作已过期");
+      assert.equal(answeredMsg, "Expired");
     }
 
     // 回归（架构审查 Issue 7）：429 触发 retryNotBefore 冷却且 flushDraft 退避

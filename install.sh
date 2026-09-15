@@ -8,8 +8,8 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 LABEL="local.remote-pi"
 
 if [[ "${1:-}" =~ ^(restart|stop|uninstall|upgrade)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
-    echo "❌ 不能在 Remote Pi Gateway 会话内重启或停止自身服务（会导致自杀与失联）。" >&2
-    echo "💡 如需重启 Gateway，请在 Telegram 中手动发送 /restart；如需升级请发送 /upgrade。" >&2
+    echo "❌ Cannot restart/stop/uninstall/upgrade from inside a Remote Pi Gateway session (it would kill itself and lose the connection)." >&2
+    echo "💡 Send /restart (or /upgrade) in Telegram instead." >&2
     exit 1
 fi
 
@@ -21,9 +21,9 @@ LOG_DIR="$HOME/.local/var/log"
 LOG_FILE="$LOG_DIR/remote-pi.log"
 COMMAND="$HOME/.local/bin/pi-remote-gateway"
 NODE="$(command -v node || true)"
-[[ -n "$NODE" ]] || { echo "❌ 未找到 node 可执行文件，请先安装 Node.js (>=22.18.0)" >&2; exit 1; }
+[[ -n "$NODE" ]] || { echo "❌ node not found; install Node.js (>=22.18.0) first" >&2; exit 1; }
 PI="$(command -v pi || true)"
-[[ -n "$PI" ]] || { echo "❌ 未找到 pi 可执行文件，请先安装并登录 pi 命令行工具" >&2; exit 1; }
+[[ -n "$PI" ]] || { echo "❌ pi not found; install and log in to the pi CLI first" >&2; exit 1; }
 
 xml_escape() {
     local s="$1"
@@ -72,11 +72,11 @@ EOF
 
 install() {
     if [[ -f "$CONFIG" ]]; then
-        echo "发现已有配置文件：$CONFIG"
-        printf '是否保留现有配置并直接安装/更新服务？(Y/n): '
+        echo "Found existing config: $CONFIG"
+        printf 'Keep it and (re)install/update the service? (Y/n): '
         read -r keep_config
         if [[ ! "$keep_config" =~ ^[Nn]$ ]]; then
-            echo "保留现有配置。"
+            echo "Keeping existing config."
             install_command
             (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
             setup_plist
@@ -154,34 +154,34 @@ status() {
 upgrade() {
     local flag="${1:-}"
     cd "$ROOT"
-    command -v git >/dev/null 2>&1 || { echo "❌ 未找到 git" >&2; exit 1; }
+    command -v git >/dev/null 2>&1 || { echo "❌ git not found" >&2; exit 1; }
     local old branch remote_name
-    old="$(git rev-parse HEAD 2>/dev/null)" || { echo "❌ $ROOT 不是 git 仓库" >&2; exit 1; }
-    [[ -z "$(git status --porcelain)" ]] || { echo "❌ working tree 存在未提交修改，拒绝升级（先提交或清理）" >&2; exit 1; }
-    branch="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || { echo "❌ 当前分支未设置 upstream（git push -u origin <branch>）" >&2; exit 1; }
+    old="$(git rev-parse HEAD 2>/dev/null)" || { echo "❌ $ROOT is not a git repository" >&2; exit 1; }
+    [[ -z "$(git status --porcelain)" ]] || { echo "❌ Working tree has uncommitted changes; refusing to upgrade (commit or clean first)" >&2; exit 1; }
+    branch="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || { echo "❌ Current branch has no upstream (git push -u origin <branch>)" >&2; exit 1; }
     remote_name="${branch%%/*}"
-    git fetch --quiet "$remote_name" || { echo "❌ git fetch 失败" >&2; exit 1; }
+    git fetch --quiet "$remote_name" || { echo "❌ git fetch failed" >&2; exit 1; }
     if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$branch")" ]]; then
-        echo "✅ 已是最新：$(git log -1 --format='(%h) %s')"
+        echo "✅ Already up to date: $(git log -1 --format='(%h) %s')"
         return 0
     fi
-    git merge --ff-only --quiet "$branch" || { echo "❌ 无法 fast-forward（本地与远端分叉）" >&2; exit 1; }
-    echo "⬆️ 已更新到：$(git log -1 --format='(%h) %s')"
+    git merge --ff-only --quiet "$branch" || { echo "❌ Cannot fast-forward (local and remote have diverged)" >&2; exit 1; }
+    echo "⬆️ Updated to: $(git log -1 --format='(%h) %s')"
     if ! npm install --omit=dev --no-audit --no-fund --silent; then
         git reset --hard --quiet "$old"
-        echo "❌ npm install 失败，已回滚到 $old" >&2; exit 1
+        echo "❌ npm install failed; rolled back to $old" >&2; exit 1
     fi
     if ! "$NODE" "$ROOT/gateway.mjs" --self-test >/dev/null 2>&1; then
         git reset --hard --quiet "$old"
         npm install --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1
-        echo "❌ self-test 失败，已回滚到 $old" >&2; exit 1
+        echo "❌ Self-test failed; rolled back to $old" >&2; exit 1
     fi
-    echo "✅ 升级完成"
+    echo "✅ Upgrade complete"
     [[ "$flag" == "--no-restart" ]] && return 0
     if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
         restart
     else
-        echo "（服务未运行，跳过重启；可执行 pi-remote-gateway start 启动）"
+        echo "(Service not running; skipping restart. Run pi-remote-gateway start to start it.)"
     fi
 }
 

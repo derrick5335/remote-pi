@@ -44,9 +44,9 @@ function registerAsk(pi, name, label, desc, promptSnippet, promptGuidelines) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const answer = await ctx.ui.select(params.question, params.options, { timeout: ASK_TIMEOUT_MS });
       if (answer) {
-        return { content: [{ type: "text", text: `用户选择了：${answer}` }], details: { answer } };
+        return { content: [{ type: "text", text: `User selected: ${answer}` }], details: { answer } };
       }
-      return { content: [{ type: "text", text: "（用户 5 分钟内未回答或取消）" }], details: { answer: null } };
+      return { content: [{ type: "text", text: "(User did not answer within 5 minutes, or cancelled)" }], details: { answer: null } };
     },
   });
 }
