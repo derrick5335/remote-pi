@@ -30,11 +30,12 @@
 ## 核心特性
 
 - ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
+- 🔒 **配置与状态严格解耦（12-Factor 原则）**：`config.json` 保持只读；运行期工作区切换（`/cwd`）与最近项目持久化于 `state.json`；Session 目录采用稳定摘要防碰撞。
 - 🎯 **100% 基于 Pi 原生状态与能力**：会话状态、模型列表、上下文统计、参数配置等全部通过 JSON-RPC 严格依赖 Pi 原生提供的数据接口，无私有黑盒或非标准文件桥接。
 - 🌊 **原生流式输出**：优先利用 Telegram 官方流式草稿（`sendMessageDraft`）实时输出思考过程与回复（在聊天界面中自带暂停/停止按钮）；不支持时平滑降级为静音消息编辑。
 - 🛠️ **原生可折叠工具卡片**：Agent 连续调用工具（Bash、读写文件、Grep 等）时，自动生成原生可折叠引用块（`<blockquote expandable>`），保持手机端信息整洁不刷屏。
 - 🎮 **Telegram Companion 扩展**：
-  - 自带 `telegram-extension.mjs`，向模型补充 `telegram_attach`（主动将本地生成的文件/产物发回 Telegram）与 `telegram_ask`（内联按钮问答）两个工具。
+  - 自带 `remote-extension.mjs`，向模型提供 `remote_attach`（主动将本地生成的文件/产物发回聊天窗口）与 `remote_ask`（交互按钮问答）两个工具（保持对 `telegram_attach`/`telegram_ask` 的兼容）。
   - 支持配置加载用户自定义的 Pi 扩展（`-e` 注入），并在 Telegram 中无缝代理扩展的 UI 交互（`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`）。
 - 🎙️ **多模态与语音转写（STT）**：
   - **语音输入**：支持在配置中指定 `sttCommand`（如 Groq Whisper API 或本地 mlx-whisper），发送语音消息即自动转写为 Prompt 执行。
@@ -53,7 +54,7 @@
 | 命令 | 说明 |
 | :--- | :--- |
 | 直接发送文字 | 与 Pi 对话；任务执行中发送的文字会作为实时干预（Steer） |
-| `/cwd` | 查看当前工作目录，或在配置的 `devRoot` 项目根目录下选择切换 |
+| `/cwd` | 查看当前工作目录，或在最近项目/`devRoot` 目录下选择切换 |
 | `/model [关键词]` | 弹出内联键盘选择模型，或直接按关键词/完整 ID 快速切换 |
 | `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
 | `/new` | 开启新会话，重置上下文并以卡片汇报当前模型、环境与工作目录 |
@@ -122,8 +123,7 @@ chmod 600 ~/.config/remote-pi/config.json
 {
   "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
   "allowedUserId": "123456789",
-  "cwd": "/path/to/your/workspace",
-  "devRoot": "~/dev"
+  "cwd": "~/dev/my-project"
 }
 ```
 
@@ -147,10 +147,10 @@ npm start
 安装后可通过全局管理命令进行运维：
 
 ```bash
-pi-telegram-gateway status   # 查看运行状态与近期日志
-pi-telegram-gateway restart  # 代码更新后重启服务生效
-pi-telegram-gateway logs     # 持续跟踪日志输出 (tail -f)
-pi-telegram-gateway stop     # 停止后台服务
+pi-remote-gateway status   # 查看运行状态与近期日志
+pi-remote-gateway restart  # 代码更新后重启服务生效
+pi-remote-gateway logs     # 持续跟踪日志输出 (tail -f)
+pi-remote-gateway stop     # 停止后台服务
 ```
 
 ---
@@ -159,18 +159,27 @@ pi-telegram-gateway stop     # 停止后台服务
 
 配置文件默认路径为 `~/.config/remote-pi/config.json`，也可以通过环境变量 `REMOTE_PI_CONFIG` 自定义。
 
+### 核心配置
+
+日常使用仅 `botToken` 和 `allowedUserId` 为严格必填项。运行时通过 `/cwd` 切换的工作目录及最近项目均保存在 `state.json`（`~/.local/var/remote-pi/state.json`）中，保持 `config.json` 纯净只读。
+
 | 配置键 | 对应环境变量 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
 | `botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | BotFather 生成的 Telegram Bot Token |
 | `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *必填* | 允许访问的 Telegram 纯数字用户 ID |
-| `cwd` | `PI_CWD` | 当前执行目录 | Pi 启动时的初始工作目录（支持 `~/` 展开） |
-| `devRoot` | `DEV_ROOT` | `~/dev`（若存在） | 项目根目录；用于 `/cwd` 列出一级子项目进行热切换。设为 `null` 可禁用项目选择 |
-| `piBin` | `PI_BIN` | `"pi"` | Pi CLI 可执行文件路径 |
-| `approve` | - | `true` | 是否向 Pi 传递 `--approve`（自动批准工具调用） |
-| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | 是否加载自带的伴侣扩展（提供 `telegram_attach` 与 `telegram_ask` 工具） |
+| `cwd` | `PI_CWD` | 当前执行目录 | Pi 启动时的初始工作目录（支持 `~/` 展开；运行期切换由 `state.json` 记录） |
+| `devRoot` | `DEV_ROOT` | `~/dev`（若存在） | 项目根目录；用于 `/cwd` 列出一级子项目进行热切换。设为 `null` 可禁用项目扫描 |
+
+### 进阶选项（开箱即用默认值）
+
+| 配置键 | 对应环境变量 | 默认值 | 详细说明 |
+| :--- | :--- | :--- | :--- |
+| `piBin` | `PI_BIN` | 自动探测 | Pi CLI 可执行文件路径（自动探测 Homebrew / 全局 npm 路径） |
+| `approve` | - | `true` | 是否向 Pi 传递 `--approve`（信任当前项目本地配置与扩展；详见 Pi 官方信任机制） |
+| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | 是否加载自带的伴侣扩展（提供 `remote_attach` 与 `remote_ask` 工具） |
 | `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | 额外注入 Pi 的自定义扩展文件路径数组（支持 `~/` 及相对于配置文件的路径） |
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
-| `stateDir` | - | `~/.local/var/remote-pi` | 会话状态、下载附件与套接字锁的存放目录 |
+| `stateDir` | - | `~/.local/var/remote-pi` | 运行时状态、会话文件、下载附件与套接字锁的存放目录 |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
 | `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
 | `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
@@ -209,7 +218,7 @@ pi-telegram-gateway stop     # 停止后台服务
 [ gateway.mjs ] (单进程常驻, Node stdlib + markdown-it, Unix Socket 互斥锁)
        ↕ (JSON-RPC over stdio)
 [ pi --mode rpc --continue ]
-       ↕ (-e telegram-extension.mjs & custom extensions)
+       ↕ (-e remote-extension.mjs & custom extensions)
 [ 本地工作区与系统工具 ]
 ```
 

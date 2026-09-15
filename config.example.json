@@ -1,13 +1,7 @@
 {
   "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
   "allowedUserId": "123456789",
-  "cwd": "/path/to/your/workspace",
-  "devRoot": "~/dev",
-  "piBin": "pi",
-  "approve": true,
-  "enableCompanionExtension": true,
-  "extensions": [],
-  "sttCommand": "",
-  "stateDir": "~/.local/var/remote-pi",
-  "logFile": "~/.local/var/log/remote-pi.log"
+  "cwd": "~/dev/my-project",
+  "devRoot": "~/dev"
 }
+

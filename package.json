@@ -1,7 +1,7 @@
 {
   "name": "remote-pi",
   "version": "0.1.0",
-  "description": "Telegram Bot gateway for Pi coding agent RPC",
+  "description": "Remote gateway for Pi coding agent RPC (currently supports Telegram)",
   "license": "MIT",
   "private": true,
   "type": "module",

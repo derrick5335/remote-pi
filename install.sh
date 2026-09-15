@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 LABEL="local.remote-pi"
 
 if [[ "${1:-}" =~ ^(restart|stop|uninstall)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
-    echo "❌ 不能在 Telegram Gateway 会话内重启或停止自身服务（会导致自杀与失联）。" >&2
+    echo "❌ 不能在 Remote Pi Gateway 会话内重启或停止自身服务（会导致自杀与失联）。" >&2
     echo "💡 如需重启 Gateway，请在 Telegram 中手动发送 /restart 命令。" >&2
     exit 1
 fi
@@ -16,7 +16,7 @@ CONFIG_DIR="$HOME/.config/remote-pi"
 CONFIG="$CONFIG_DIR/config.json"
 LOG_DIR="$HOME/.local/var/log"
 LOG_FILE="$LOG_DIR/remote-pi.log"
-COMMAND="$HOME/.local/bin/pi-telegram-gateway"
+COMMAND="$HOME/.local/bin/pi-remote-gateway"
 NODE="$(command -v node || true)"
 [[ -n "$NODE" ]] || { echo "❌ 未找到 node 可执行文件，请先安装 Node.js (>=22.18.0)" >&2; exit 1; }
 PI="$(command -v pi || true)"
@@ -96,10 +96,7 @@ install() {
 {
   "botToken": "$token",
   "allowedUserId": "$user_id",
-  "cwd": "$ROOT",
-  "piBin": "$PI",
-  "approve": true,
-  "logFile": "$LOG_FILE"
+  "cwd": "$ROOT"
 }
 EOF
     )

@@ -30,11 +30,12 @@
 ## Key Features
 
 - ⚡ **Lightweight & Minimalist**: Built around a clean, single-file core (`gateway.mjs`) using only the Node.js standard library plus `markdown-it` for Telegram HTML rendering. No heavy frameworks.
+- 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspace switches and recent projects are tracked cleanly in `state.json`, and session paths use stable digests to prevent collision.
 - 🎯 **100% Pi-Native**: Driven strictly via Pi's JSON-RPC protocol (`get_state`, `get_session_stats`, `new_session`, etc.). No private hacks, out-of-band files, or intrusive patches.
 - 🌊 **Native Draft Streaming**: Streams thoughts and responses in real time using Telegram's official `sendMessageDraft` API (including an in-app Stop button); automatically falls back to silent message editing when drafts are unsupported.
 - 🛠️ **Expandable Tool Cards**: Ongoing tool executions (Bash commands, file read/write, grep) are grouped into native collapsible blockquotes (`<blockquote expandable>`) to keep mobile chat clean and readable.
 - 🎮 **Telegram Companion Extension**:
-  - Automatically loads `telegram-extension.mjs`, giving the model two Telegram-native tools: `telegram_attach` (send local files and generated artifacts back to chat) and `telegram_ask` (interactive multiple-choice questions via inline buttons).
+  - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons; aliases `telegram_attach` / `telegram_ask` retained for compatibility).
   - Supports loading custom Pi extensions via config (`-e`), and proxies Pi extension UI requests (`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`) directly to Telegram.
 - 🎙️ **Multimodal Context & Voice Transcription (STT)**:
   - **Voice Input**: Configure `sttCommand` (e.g. Groq Whisper API or local Apple Silicon `mlx-whisper`) to convert Telegram voice notes into prompts automatically.
@@ -53,7 +54,7 @@
 | Command | Description |
 | :--- | :--- |
 | *Plain Text* | Chat with Pi. Messages sent while Pi is working act as live steering instructions |
-| `/cwd` | View current workspace directory, or switch to a project under configured `devRoot` |
+| `/cwd` | View current workspace directory, or switch across recent projects and folders under `devRoot` |
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
@@ -122,8 +123,7 @@ Edit `~/.config/remote-pi/config.json` with your credentials and workspace path:
 {
   "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
   "allowedUserId": "123456789",
-  "cwd": "/path/to/your/workspace",
-  "devRoot": "~/dev"
+  "cwd": "~/dev/my-project"
 }
 ```
 
@@ -147,10 +147,10 @@ Run the included installation script to register a persistent background daemon 
 Manage the service anytime via the installed helper CLI:
 
 ```bash
-pi-telegram-gateway status   # Check service state and recent logs
-pi-telegram-gateway restart  # Restart service after code/config edits
-pi-telegram-gateway logs     # Tail output log in real time (tail -f)
-pi-telegram-gateway stop     # Stop background daemon
+pi-remote-gateway status   # Check service state and recent logs
+pi-remote-gateway restart  # Restart service after code/config edits
+pi-remote-gateway logs     # Tail output log in real time (tail -f)
+pi-remote-gateway stop     # Stop background daemon
 ```
 
 ---
@@ -159,18 +159,27 @@ pi-telegram-gateway stop     # Stop background daemon
 
 Configuration is loaded from `~/.config/remote-pi/config.json` by default (can be overridden with `REMOTE_PI_CONFIG`).
 
+### Core Configuration
+
+Only `botToken` and `allowedUserId` are strictly required. Runtime workspace switches via `/cwd` and recent projects are tracked cleanly in `state.json` (`~/.local/var/remote-pi/state.json`), keeping `config.json` immutable.
+
 | Key | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `botToken` | `TELEGRAM_BOT_TOKEN` | *Required* | Telegram Bot Token provided by @BotFather |
 | `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *Required* | Numeric Telegram User ID permitted to access the bot |
-| `cwd` | `PI_CWD` | `process.cwd()` | Workspace working directory for the Pi child process (supports `~/`) |
-| `devRoot` | `DEV_ROOT` | `~/dev` (if exists) | Root directory used by `/cwd` to switch projects. Set to `null` to disable project picker |
-| `piBin` | `PI_BIN` | `"pi"` | Path to the `pi` executable |
-| `approve` | - | `true` | Pass `--approve` to Pi (auto-approves tool executions) |
-| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | Load companion extension (`telegram_attach` and `telegram_ask` tools) |
-| `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | Array of additional Pi extension file paths to pass via `-e` |
+| `cwd` | `PI_CWD` | `process.cwd()` | Initial workspace working directory (supports `~/`; runtime `/cwd` switches persist in `state.json`) |
+| `devRoot` | `DEV_ROOT` | `~/dev` (if exists) | Root directory scanned by `/cwd` to switch projects. Set to `null` to disable project scanning |
+
+### Advanced Options (Sensible Defaults)
+
+| Key | Environment Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `piBin` | `PI_BIN` | Auto-detected | Path to the `pi` executable (auto-detects Homebrew / global npm paths) |
+| `approve` | - | `true` | Pass `--approve` to Pi (trusts project-local settings and extensions for this run) |
+| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | Load companion extension (`remote_attach` and `remote_ask` tools) |
+| `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | Additional Pi extension file paths to pass via `-e` |
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |
-| `stateDir` | - | `~/.local/var/remote-pi` | Directory for session files, downloaded media, and lock socket |
+| `stateDir` | - | `~/.local/var/remote-pi` | Directory for runtime state, session files, downloads, and lock socket |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | Gateway output log file |
 | `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
 | `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
@@ -209,7 +218,7 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 [ gateway.mjs ] (Single daemon process, Node stdlib + markdown-it, Unix Socket Lock)
        ↕ (JSON-RPC over stdio)
 [ pi --mode rpc --continue ]
-       ↕ (-e telegram-extension.mjs & custom extensions)
+       ↕ (-e remote-extension.mjs & custom extensions)
 [ Local Workspace & System Tools ]
 ```
 

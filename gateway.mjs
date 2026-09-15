@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -329,6 +329,49 @@ function resolvePath(pathStr, baseDir = process.cwd()) {
   return resolve(baseDir, expanded);
 }
 
+function loadState(stateDir) {
+  const statePath = join(stateDir, "state.json");
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [] };
+  try {
+    const raw = JSON.parse(readFileSync(statePath, "utf8"));
+    return {
+      cwd: typeof raw.cwd === "string" ? raw.cwd : null,
+      recentProjects: Array.isArray(raw.recentProjects)
+        ? raw.recentProjects.filter((p) => typeof p === "string" && existsSync(p))
+        : [],
+    };
+  } catch {
+    return { cwd: null, recentProjects: [] };
+  }
+}
+
+function resolveSessionDir(stateDir, cwd) {
+  const legacy = join(stateDir, "sessions", cwd.replace(/^\//, "").replaceAll("/", "-"));
+  if (existsSync(legacy)) {
+    return legacy;
+  }
+  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+  const safeSlug = cwd.replace(/^[/\\]+/, "").replace(/[^a-zA-Z0-9_-]/g, "-");
+  return join(stateDir, "sessions", `${safeSlug}_${hash}`);
+}
+
+function resolvePiBin(configured) {
+  if (configured) return configured;
+  if (process.env.PI_BIN) return process.env.PI_BIN;
+  const candidates = [
+    "/opt/homebrew/bin/pi",
+    "/usr/local/bin/pi",
+    join(homedir(), ".npm-global", "bin", "pi"),
+    join(homedir(), ".local", "bin", "pi"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return "pi";
+}
+
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
   const configDir = dirname(path);
@@ -401,14 +444,30 @@ function loadConfig() {
     : file.enableCompanionExtension !== false;
 
   const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
+  const savedState = loadState(stateDir);
+
+  let targetCwd = process.cwd();
+  if (process.env.PI_CWD) {
+    targetCwd = resolvePath(process.env.PI_CWD, configDir);
+  } else if (savedState.cwd && existsSync(savedState.cwd)) {
+    try {
+      if (statSync(savedState.cwd).isDirectory()) {
+        targetCwd = savedState.cwd;
+      }
+    } catch {
+      if (file.cwd) targetCwd = resolvePath(file.cwd, configDir);
+    }
+  } else if (file.cwd) {
+    targetCwd = resolvePath(file.cwd, configDir);
+  }
 
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
-    cwd: resolvePath(process.env.PI_CWD || file.cwd || process.cwd(), configDir),
+    cwd: targetCwd,
     configPath: path,
     devRoot,
-    piBin: process.env.PI_BIN || file.piBin || "pi",
+    piBin: resolvePiBin(process.env.PI_BIN || file.piBin),
     stateDir,
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     approve: file.approve !== false,
@@ -418,7 +477,7 @@ function loadConfig() {
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "\u{1F440}",
     doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "\u{1FAE1}",
   };
-  config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
+  config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
@@ -632,7 +691,9 @@ class PiRpc {
     this.missedPings = 0; // 新进程从零计失联，避免上个进程被杀后的余数误杀新进程
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
-    const companionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
+    const companionPath = existsSync(join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs"))
+      ? join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs")
+      : join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
     const extensionsToLoad = [];
     if (this.config.enableCompanionExtension && existsSync(companionPath)) {
       extensionsToLoad.push(companionPath);
@@ -718,7 +779,7 @@ class PiRpc {
 
   async request(type, fields = {}, timeout = 600_000, quiet = false) {
     await this.ensureStarted();
-    const id = `tg-${++this.sequence}`;
+    const id = `rpc-${++this.sequence}`;
     const t0 = performance.now();
     return new Promise((resolveRequest, reject) => {
       const timer = setTimeout(() => {
@@ -765,6 +826,10 @@ class Gateway {
     this.config = config;
     this.chatId = config.allowedUserId;
     this.chatReady = false;
+    this.state = loadState(config.stateDir);
+    if (config.cwd && !this.state.recentProjects.includes(config.cwd)) {
+      this.state.recentProjects.unshift(config.cwd);
+    }
     this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
     this.pi = new PiRpc(config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
     this.actions = new Map();
@@ -1335,31 +1400,61 @@ class Gateway {
     await this.telegram.send(this.chatId, text);
   }
 
+  async saveState(patch) {
+    this.state = { ...this.state, ...patch };
+    const statePath = join(this.config.stateDir, "state.json");
+    const tempPath = `${statePath}.tmp.${Date.now()}`;
+    try {
+      await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+      await rename(tempPath, statePath);
+    } catch (err) {
+      console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
+    }
+  }
+
   async showCwds() {
-    if (!this.config.devRoot) {
+    const items = new Map();
+
+    if (this.config.devRoot) {
+      try {
+        const entries = (await readdir(this.config.devRoot, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        for (const entry of entries) {
+          const full = join(this.config.devRoot, entry.name);
+          items.set(full, entry.name);
+        }
+      } catch (err) {
+        console.warn(`[cwd] failed to read devRoot: ${err.message}`);
+      }
+    }
+
+    if (Array.isArray(this.state.recentProjects)) {
+      for (const p of this.state.recentProjects) {
+        if (!items.has(p) && existsSync(p)) {
+          items.set(p, basename(p));
+        }
+      }
+    }
+
+    if (!items.has(this.config.cwd)) {
+      items.set(this.config.cwd, basename(this.config.cwd));
+    }
+
+    if (!this.config.devRoot && items.size <= 1) {
       await this.telegram.send(
         this.chatId,
         `当前目录：${this.config.cwd}\n\n⚠️ 未配置项目根目录 (devRoot)。\n若需在 Telegram 中使用 /cwd 选择并切换项目，请在配置文件中设置 "devRoot"（例如 {"devRoot": "~/dev"}）。`,
       );
       return;
     }
-    let projects = [];
-    try {
-      projects = (await readdir(this.config.devRoot, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-        .sort((a, b) => a.name.localeCompare(b.name));
-    } catch (err) {
-      await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n❌ 读取 devRoot 目录失败：${err.message}`);
-      return;
-    }
-    if (projects.length === 0) {
-      await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n（目录 ${this.config.devRoot} 下无可选子项目）`);
-      return;
-    }
-    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择 ${this.config.devRoot} 下的项目：`, this.keyboard(projects.map((entry) => ({
-      label: `${join(this.config.devRoot, entry.name) === this.config.cwd ? "●" : "○"} ${entry.name}`,
-      action: { type: "cwd", path: join(this.config.devRoot, entry.name) },
-    }))));
+
+    const keyboardItems = Array.from(items.entries()).map(([path, name]) => ({
+      label: `${path === this.config.cwd ? "●" : "○"} ${name}`,
+      action: { type: "cwd", path },
+    }));
+
+    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择工作区项目：`, this.keyboard(keyboardItems));
   }
 
   action(payload) {
@@ -1532,20 +1627,25 @@ class Gateway {
   }
 
   async switchCwd(path, callbackId) {
-    if (!this.config.devRoot) {
-      await this.telegram.answer(callbackId, "devRoot 未配置", { show_alert: true });
-      return;
-    }
     let root, target, targetStat;
     try {
-      [root, target] = await Promise.all([realpath(this.config.devRoot), realpath(path)]);
+      [root, target] = await Promise.all([
+        this.config.devRoot ? realpath(this.config.devRoot) : null,
+        realpath(path),
+      ]);
       targetStat = await stat(target);
     } catch {
       await this.telegram.answer(callbackId, "目标目录已失效或不存在", { show_alert: true });
       return;
     }
-    if (!isDirectChild(root, target) || !targetStat.isDirectory()) {
-      await this.telegram.answer(callbackId, "只能切换到 devRoot 的一级子目录", { show_alert: true });
+    if (!targetStat.isDirectory()) {
+      await this.telegram.answer(callbackId, "目标不是有效目录", { show_alert: true });
+      return;
+    }
+    const isUnderDevRoot = Boolean(root && isDirectChild(root, target));
+    const isKnownRecent = Array.isArray(this.state.recentProjects) && this.state.recentProjects.includes(target);
+    if (!isUnderDevRoot && !isKnownRecent && target !== this.config.cwd) {
+      await this.telegram.answer(callbackId, "只能切换到 devRoot 子目录或已记录的项目", { show_alert: true });
       return;
     }
     if (target === this.config.cwd) {
@@ -1553,22 +1653,16 @@ class Gateway {
       return;
     }
 
-    if (existsSync(this.config.configPath)) {
-      try {
-        const config = JSON.parse(await readFile(this.config.configPath, "utf8"));
-        config.cwd = target;
-        const temporary = `${this.config.configPath}.tmp`;
-        await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-        await rename(temporary, this.config.configPath);
-      } catch (err) {
-        console.warn(`[config] failed to persist new cwd to ${this.config.configPath}: ${err.message}`);
-      }
-    }
+    await this.saveState({
+      cwd: target,
+      recentProjects: [target, ...(this.state.recentProjects || []).filter((p) => p !== target)].slice(0, 10),
+    });
+
     await this.telegram.answer(callbackId, "正在切换");
     await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
     this.pi.stop();
     this.config.cwd = target;
-    this.config.sessionDir = join(this.config.stateDir, "sessions", target.replace(/^\//, "").replaceAll("/", "-"));
+    this.config.sessionDir = resolveSessionDir(this.config.stateDir, target);
     await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
     this.resetSessionState();
     this.pi = new PiRpc(this.config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
@@ -1700,7 +1794,7 @@ class Gateway {
         console.log(`${new Date().toISOString()} [tool] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
         this.scheduleToolPanelUpdate(false, false);
       }
-      if (event.toolName === "telegram_attach" && !event.isError) {
+      if ((event.toolName === "remote_attach" || event.toolName === "telegram_attach") && !event.isError) {
         const paths = event.result?.details?.paths || event.args?.paths || [];
         for (const path of paths) {
           this.queueUpload(async () => {
@@ -2016,19 +2110,26 @@ async function selfTest() {
       assert.equal(await readFile(join(tmpUi, copies[0]), "utf8"), "recover me");
     }
 
-    // Test telegram_attach auto delivery via tool_execution_end
+    // Test remote_attach / telegram_attach auto delivery via tool_execution_end
     gw.chatReady = true;
     const docs = [];
     gw.telegram.sendDocument = async (_chat, path) => docs.push(path);
     await gw.handleEvent({
       type: "tool_execution_end",
       toolCallId: "call-1",
-      toolName: "telegram_attach",
+      toolName: "remote_attach",
       isError: false,
       result: { details: { paths: ["/tmp/file1.png", "/tmp/file2.pdf"] } },
     });
+    await gw.handleEvent({
+      type: "tool_execution_end",
+      toolCallId: "call-2",
+      toolName: "telegram_attach",
+      isError: false,
+      result: { details: { paths: ["/tmp/file3.txt"] } },
+    });
     await Promise.all([gw.telegramChain, gw.uploadChain]);
-    assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
+    assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf", "/tmp/file3.txt"]);
 
     // Test priority command classification and preemptive dispatch
     assert.equal(getUpdatePriority({ stopped_message_generation: true }), "p0");
@@ -2186,6 +2287,7 @@ async function selfTest() {
         botToken: "123456:abcdef",
         allowedUserId: "999",
         cwd: tmpCfgDir,
+        stateDir: tmpCfgDir,
         devRoot: tmpCfgDir,
         extensions: ["./my-ext.js"],
         enableCompanionExtension: false,
@@ -2232,6 +2334,30 @@ async function selfTest() {
     gwNoDev.telegram.send = async (_chat, text) => { sentMsg = text; };
     await gwNoDev.showCwds();
     assert.ok(sentMsg.includes("未配置项目根目录 (devRoot)"), "showCwds should guide user when devRoot is null");
+
+    // verify resolveSessionDir collision resistance and legacy fallback
+    const dirA = resolveSessionDir(tmpCfgDir, "/a/b-c");
+    const dirB = resolveSessionDir(tmpCfgDir, "/a-b/c");
+    assert.notEqual(dirA, dirB, "resolveSessionDir must not collide on /a/b-c and /a-b/c");
+
+    const legacyDir = join(tmpCfgDir, "sessions", "legacy-project");
+    await mkdir(legacyDir, { recursive: true });
+    assert.equal(resolveSessionDir(tmpCfgDir, "/legacy/project"), legacyDir, "resolveSessionDir should preserve legacy dir if it exists");
+
+    // verify state persistence without modifying config.json
+    const originalCfgContent = readFileSync(validCfgPath, "utf8");
+    const gwState = new Gateway({
+      allowedUserId: "999",
+      botToken: "123456:abcdef",
+      configPath: validCfgPath,
+      stateDir: tmpCfgDir,
+      cwd: tmpCfgDir,
+    });
+    await gwState.saveState({ cwd: "/target/path", recentProjects: ["/target/path", tmpCfgDir] });
+    assert.equal(readFileSync(validCfgPath, "utf8"), originalCfgContent, "config.json must remain immutable");
+    const loaded = loadState(tmpCfgDir);
+    assert.equal(loaded.cwd, "/target/path");
+    assert.deepEqual(loaded.recentProjects, [tmpCfgDir]); // only existing dirs filtered
   }
 
   {
