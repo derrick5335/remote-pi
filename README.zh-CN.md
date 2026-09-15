@@ -54,7 +54,7 @@
 | 命令 | 说明 |
 | :--- | :--- |
 | 直接发送文字 | 与 Pi 对话；任务执行中发送的文字会作为实时干预（Steer） |
-| `/cwd` | 查看当前工作目录，或在最近项目/`devRoot` 目录下选择切换 |
+| `/cwd [路径]` | 切换工作目录（支持 `~/` 与相对路径，目录无效会报错）；不带参数则弹出最近 20 个历史项目的选择键盘 |
 | `/model [关键词]` | 弹出内联键盘选择模型，或直接按关键词/完整 ID 快速切换 |
 | `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
 | `/new` | 开启新会话，重置上下文并以卡片汇报当前模型、环境与工作目录 |
@@ -161,14 +161,13 @@ pi-remote-gateway stop     # 停止后台服务
 
 ### 核心配置
 
-日常使用仅 `botToken` 和 `allowedUserId` 为严格必填项。运行时通过 `/cwd` 切换的工作目录及最近项目均保存在 `state.json`（`~/.local/var/remote-pi/state.json`）中，保持 `config.json` 纯净只读。
+首启时 `botToken`、`allowedUserId` 和 `cwd` 为必填项（cwd 缺失或目录无效会在启动时快速报错）。运行时通过 `/cwd` 切换的工作目录及最近项目均保存在 `state.json`（`~/.local/var/remote-pi/state.json`）中，保持 `config.json` 纯净只读。
 
 | 配置键 | 对应环境变量 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
 | `botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | BotFather 生成的 Telegram Bot Token |
 | `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *必填* | 允许访问的 Telegram 纯数字用户 ID |
-| `cwd` | `PI_CWD` | 当前执行目录 | Pi 启动时的初始工作目录（支持 `~/` 展开；运行期切换由 `state.json` 记录） |
-| `devRoot` | `DEV_ROOT` | `~/dev`（若存在） | 项目根目录；用于 `/cwd` 列出一级子项目进行热切换。设为 `null` 可禁用项目扫描 |
+| `cwd` | `PI_CWD` | *首次启动必填* | Pi 启动时的初始工作目录；除非 `state.json` 中已记录，否则必填（支持 `~/` 展开；运行期切换由 `state.json` 记录） |
 
 ### 进阶选项（开箱即用默认值）
 

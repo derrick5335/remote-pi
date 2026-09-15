@@ -54,7 +54,7 @@
 | Command | Description |
 | :--- | :--- |
 | *Plain Text* | Chat with Pi. Messages sent while Pi is working act as live steering instructions |
-| `/cwd` | View current workspace directory, or switch across recent projects and folders under `devRoot` |
+| `/cwd [path]` | Switch workspace directory (absolute path or `~`-relative; errors if invalid). Without argument, show inline keyboard of up to 20 recently used projects |
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
@@ -161,14 +161,13 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 
 ### Core Configuration
 
-Only `botToken` and `allowedUserId` are strictly required. Runtime workspace switches via `/cwd` and recent projects are tracked cleanly in `state.json` (`~/.local/var/remote-pi/state.json`), keeping `config.json` immutable.
+`botToken`, `allowedUserId`, and `cwd` (on first run) are strictly required. Runtime workspace switches via `/cwd` and recent projects are tracked cleanly in `state.json` (`~/.local/var/remote-pi/state.json`), keeping `config.json` immutable.
 
 | Key | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `botToken` | `TELEGRAM_BOT_TOKEN` | *Required* | Telegram Bot Token provided by @BotFather |
 | `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *Required* | Numeric Telegram User ID permitted to access the bot |
-| `cwd` | `PI_CWD` | `process.cwd()` | Initial workspace working directory (supports `~/`; runtime `/cwd` switches persist in `state.json`) |
-| `devRoot` | `DEV_ROOT` | `~/dev` (if exists) | Root directory scanned by `/cwd` to switch projects. Set to `null` to disable project scanning |
+| `cwd` | `PI_CWD` | *Required on first run* | Initial workspace directory; required unless restored from `state.json`. Supports `~/`. Runtime `/cwd` switches persist in `state.json` |
 
 ### Advanced Options (Sensible Defaults)
 

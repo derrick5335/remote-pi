@@ -8,6 +8,7 @@ Telegram Bot gateway for Pi RPC。Pi 在本仓库工作，通过 Telegram 收发
 - **唯一安全的测试方式**：`node gateway.mjs --self-test`（离线自检，不连 Telegram；没有 `--test` 参数）。
 - **修改前先查最佳实践**：动手改代码前，先上网确认该做法是否为最佳实践；若某次修改应用了官方文档、社区等来源的最佳实践，需标明该修改方向的 reference。
 - **100% 基于 Pi 原生状态与能力**：整个项目严格只依赖 Pi RPC 原生暴露的状态与能力（如 `get_state`、`get_session_stats` 等），不引入任何私有 addon、本地旁路文件或定制化侵入逻辑。
+- **多语言 README 同步**：代码行为/命令/配置发生变化时，必须同步更新 `README.md` 和 `README.zh-CN.md`，两份文档保持一致。
 
 ## 运维速查
 
