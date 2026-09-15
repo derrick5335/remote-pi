@@ -425,9 +425,10 @@ function loadConfig() {
     : savedState.cwd || (file.cwd ? resolvePath(file.cwd, configDir) : null);
   if (!targetCwd) throw new Error(`"cwd" is required: set "cwd" in ${path} or export PI_CWD`);
 
+  const telegram = typeof file.telegram === "object" && file.telegram !== null ? file.telegram : {};
   const config = {
-    botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
-    allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
+    botToken: process.env.TELEGRAM_BOT_TOKEN || telegram.botToken,
+    allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || telegram.allowedUserId || ""),
     cwd: targetCwd,
     configPath: path,
     piBin: resolvePiBin(process.env.PI_BIN || file.piBin),
@@ -437,13 +438,13 @@ function loadConfig() {
     enableCompanionExtension,
     extensions,
     sttCommand: file.sttCommand || "",
-    ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "\u{1F440}",
-    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "\u{1FAE1}",
+    ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
+    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || telegram.doneEmoji || "\u{1FAE1}",
   };
   config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
-  if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
-  if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid telegram.botToken in ${path}`);
+  if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid telegram.allowedUserId in ${path}`);
   let cwdIsDir = false;
   try { cwdIsDir = statSync(config.cwd).isDirectory(); } catch {}
   if (!cwdIsDir) throw new Error(`Pi working directory does not exist or is not a directory: ${config.cwd}`);
@@ -2226,8 +2227,7 @@ async function selfTest() {
     writeFileSync(
       validCfgPath,
       JSON.stringify({
-        botToken: "123456:abcdef",
-        allowedUserId: "999",
+        telegram: { botToken: "123456:abcdef", allowedUserId: "999" },
         cwd: tmpCfgDir,
         stateDir: tmpCfgDir,
         extensions: ["./my-ext.js"],
@@ -2254,8 +2254,7 @@ async function selfTest() {
     writeFileSync(
       invalidExtCfgPath,
       JSON.stringify({
-        botToken: "123456:abcdef",
-        allowedUserId: "999",
+        telegram: { botToken: "123456:abcdef", allowedUserId: "999" },
         cwd: tmpCfgDir,
         extensions: ["./non-existent-ext.js"],
       })
@@ -2275,8 +2274,7 @@ async function selfTest() {
     writeFileSync(
       noCwdCfgPath,
       JSON.stringify({
-        botToken: "123456:abcdef",
-        allowedUserId: "999",
+        telegram: { botToken: "123456:abcdef", allowedUserId: "999" },
         stateDir: emptyStateDir,
       })
     );

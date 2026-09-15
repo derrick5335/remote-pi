@@ -121,8 +121,10 @@ chmod 600 ~/.config/remote-pi/config.json
 
 ```json
 {
-  "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
-  "allowedUserId": "123456789",
+  "telegram": {
+    "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
+    "allowedUserId": "123456789"
+  },
   "cwd": "~/dev/my-project"
 }
 ```
@@ -161,12 +163,12 @@ pi-remote-gateway stop     # 停止后台服务
 
 ### 核心配置
 
-首启时 `botToken`、`allowedUserId` 和 `cwd` 为必填项（cwd 缺失或目录无效会在启动时快速报错）。运行时通过 `/cwd` 切换的工作目录及最近项目均保存在 `state.json`（`~/.local/var/remote-pi/state.json`）中，保持 `config.json` 纯净只读。
+首启时 `telegram.botToken`、`telegram.allowedUserId` 和 `cwd` 为必填项（cwd 缺失或目录无效会在启动时快速报错）。运行时通过 `/cwd` 切换的工作目录及最近项目均保存在 `state.json`（`~/.local/var/remote-pi/state.json`）中，保持 `config.json` 纯净只读。
 
 | 配置键 | 对应环境变量 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
-| `botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | BotFather 生成的 Telegram Bot Token |
-| `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *必填* | 允许访问的 Telegram 纯数字用户 ID |
+| `telegram.botToken` | `TELEGRAM_BOT_TOKEN` | *必填* | BotFather 生成的 Telegram Bot Token |
+| `telegram.allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *必填* | 允许访问的 Telegram 纯数字用户 ID |
 | `cwd` | `PI_CWD` | *首次启动必填* | Pi 启动时的初始工作目录；除非 `state.json` 中已记录，否则必填（支持 `~/` 展开；运行期切换由 `state.json` 记录） |
 
 ### 进阶选项（开箱即用默认值）
@@ -180,8 +182,8 @@ pi-remote-gateway stop     # 停止后台服务
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
 | `stateDir` | - | `~/.local/var/remote-pi` | 运行时状态、会话文件、下载附件与套接字锁的存放目录 |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
-| `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
-| `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
+| `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
+| `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
 
 > **环境变量覆盖说明**：环境变量优先级高于配置文件。例如 `REMOTE_PI_EXTENSIONS` 可以传入 JSON 数组字符串（如 `'["~/ext.ts"]'`）或逗号分隔的路径列表。
 

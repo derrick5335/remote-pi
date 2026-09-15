@@ -121,8 +121,10 @@ Edit `~/.config/remote-pi/config.json` with your credentials and workspace path:
 
 ```json
 {
-  "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
-  "allowedUserId": "123456789",
+  "telegram": {
+    "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
+    "allowedUserId": "123456789"
+  },
   "cwd": "~/dev/my-project"
 }
 ```
@@ -161,12 +163,12 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 
 ### Core Configuration
 
-`botToken`, `allowedUserId`, and `cwd` (on first run) are strictly required. Runtime workspace switches via `/cwd` and recent projects are tracked cleanly in `state.json` (`~/.local/var/remote-pi/state.json`), keeping `config.json` immutable.
+`telegram.botToken`, `telegram.allowedUserId`, and `cwd` (on first run) are strictly required. Runtime workspace switches via `/cwd` and recent projects are tracked cleanly in `state.json` (`~/.local/var/remote-pi/state.json`), keeping `config.json` immutable.
 
 | Key | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `botToken` | `TELEGRAM_BOT_TOKEN` | *Required* | Telegram Bot Token provided by @BotFather |
-| `allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *Required* | Numeric Telegram User ID permitted to access the bot |
+| `telegram.botToken` | `TELEGRAM_BOT_TOKEN` | *Required* | Telegram Bot Token provided by @BotFather |
+| `telegram.allowedUserId` | `TELEGRAM_ALLOWED_USER_ID` | *Required* | Numeric Telegram User ID permitted to access the bot |
 | `cwd` | `PI_CWD` | *Required on first run* | Initial workspace directory; required unless restored from `state.json`. Supports `~/`. Runtime `/cwd` switches persist in `state.json` |
 
 ### Advanced Options (Sensible Defaults)
@@ -180,8 +182,8 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |
 | `stateDir` | - | `~/.local/var/remote-pi` | Directory for runtime state, session files, downloads, and lock socket |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | Gateway output log file |
-| `ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
-| `doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
+| `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
+| `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
 
 > **Environment Variable Precedence**: Environment variables always take precedence over `config.json`. For `REMOTE_PI_EXTENSIONS`, you can pass a JSON array string (`'["~/my-ext.ts"]'`) or a comma-separated list.
 

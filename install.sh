@@ -94,8 +94,10 @@ install() {
     chmod 700 "$CONFIG_DIR"
     (umask 077 && cat > "$CONFIG" <<EOF
 {
-  "botToken": "$token",
-  "allowedUserId": "$user_id",
+  "telegram": {
+    "botToken": "$token",
+    "allowedUserId": "$user_id"
+  },
   "cwd": "$ROOT"
 }
 EOF
