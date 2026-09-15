@@ -1322,8 +1322,8 @@ class Gateway {
         const text = res.buf.trim() || "（无输出）";
         if (res.code !== 0) return this.telegram.send(this.chatId, `❌ 升级失败\n${text}`);
         if (text.includes("已是最新")) return this.telegram.send(this.chatId, text);
-        await this.telegram.send(this.chatId, `${text}\n🔄 正在重启 Gateway…`);
-        return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId);
+        await this.telegram.send(this.chatId, text);
+        return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId); // graceful restart: 回执落盘 → exit → launchd 拉起新版
       }
       case "restart": {
         await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
