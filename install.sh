@@ -17,15 +17,70 @@ CONFIG="$CONFIG_DIR/config.json"
 LOG_DIR="$HOME/.local/var/log"
 LOG_FILE="$LOG_DIR/remote-pi.log"
 COMMAND="$HOME/.local/bin/pi-telegram-gateway"
-NODE="$(command -v node)"
-PI="$(command -v pi || echo /opt/homebrew/bin/pi)"
+NODE="$(command -v node || true)"
+[[ -n "$NODE" ]] || { echo "❌ 未找到 node 可执行文件，请先安装 Node.js (>=22.18.0)" >&2; exit 1; }
+PI="$(command -v pi || true)"
+[[ -n "$PI" ]] || { echo "❌ 未找到 pi 可执行文件，请先安装并登录 pi 命令行工具" >&2; exit 1; }
+
+xml_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    s="${s//\'/&apos;}"
+    echo "$s"
+}
 
 install_command() {
     mkdir -p "$(dirname "$COMMAND")"
     ln -sf "$ROOT/install.sh" "$COMMAND"
 }
 
+setup_plist() {
+    local esc_node esc_gateway esc_root esc_log
+    esc_node="$(xml_escape "$NODE")"
+    esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
+    esc_root="$(xml_escape "$ROOT")"
+    esc_log="$(xml_escape "$LOG_FILE")"
+
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>/usr/bin/caffeinate</string><string>-s</string><string>-i</string><string>--</string><string>$esc_node</string><string>$esc_gateway</string></array>
+    <key>WorkingDirectory</key><string>$esc_root</string>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>$esc_log</string>
+    <key>StandardErrorPath</key><string>$esc_log</string>
+</dict>
+</plist>
+EOF
+    plutil -lint "$PLIST"
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    sleep 2
+    status
+}
+
 install() {
+    if [[ -f "$CONFIG" ]]; then
+        echo "发现已有配置文件：$CONFIG"
+        printf '是否保留现有配置并直接安装/更新服务？(Y/n): '
+        read -r keep_config
+        if [[ ! "$keep_config" =~ ^[Nn]$ ]]; then
+            echo "保留现有配置。"
+            install_command
+            (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
+            setup_plist
+            return
+        fi
+    fi
+
     local token user_id
     printf 'Telegram Bot Token: '
     read -rs token
@@ -37,7 +92,7 @@ install() {
 
     mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
     chmod 700 "$CONFIG_DIR"
-    cat > "$CONFIG" <<EOF
+    (umask 077 && cat > "$CONFIG" <<EOF
 {
   "botToken": "$token",
   "allowedUserId": "$user_id",
@@ -47,31 +102,11 @@ install() {
   "logFile": "$LOG_FILE"
 }
 EOF
+    )
     chmod 600 "$CONFIG"
     install_command
     (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
-
-    cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>$LABEL</string>
-    <key>ProgramArguments</key>
-    <array><string>/usr/bin/caffeinate</string><string>-s</string><string>-i</string><string>--</string><string>$NODE</string><string>$ROOT/gateway.mjs</string></array>
-    <key>WorkingDirectory</key><string>$ROOT</string>
-    <key>KeepAlive</key><true/>
-    <key>ProcessType</key><string>Background</string>
-    <key>StandardOutPath</key><string>$LOG_FILE</string>
-    <key>StandardErrorPath</key><string>$LOG_FILE</string>
-</dict>
-</plist>
-EOF
-    plutil -lint "$PLIST"
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$PLIST"
-    sleep 2
-    status
+    setup_plist
 }
 
 start() {
@@ -107,7 +142,7 @@ status() {
     if [[ "$state" == "running" ]]; then
         echo "✅ remote-pi is running (logs: $LOG_FILE)"
     else
-        echo "🛑 remote-pi is ${state:-stopped} (logs: $LOG_FILE)"
+        echo "⚠️ remote-pi is ${state:-stopped} (logs: $LOG_FILE)"
         [[ -f "$LOG_FILE" ]] && tail -n 10 "$LOG_FILE"
         return 1
     fi

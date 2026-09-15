@@ -1,8 +1,25 @@
 {
   "name": "remote-pi",
+  "version": "0.1.0",
+  "description": "Telegram Bot gateway for Pi coding agent RPC",
+  "license": "MIT",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node gateway.mjs --self-test",
+    "start": "node gateway.mjs"
+  },
   "dependencies": {
     "markdown-it": "^15.0.2"
-  }
+  },
+  "keywords": [
+    "pi",
+    "telegram",
+    "bot",
+    "coding-agent",
+    "rpc"
+  ]
 }

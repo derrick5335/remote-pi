@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, openAsBlob, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -21,7 +21,7 @@ const HELP = `Remote Pi
 
 /help               显示帮助
 /commands           扩展、Prompt 和 Skill 命令
-/cwd                查看或切换 ~/dev 下的项目
+/cwd                查看或切换项目工作目录
 /sh <命令>           直接执行 Shell 命令
 /get <文件路径>      从当前项目下载文件
 /model [关键词|provider/model]
@@ -255,10 +255,8 @@ function renderToolPanel(tools, isSettled = false) {
   const hidden = tools.length - recent.length;
   const prefix = hidden > 0 ? [`… 之前已完成 ${hidden} 项`] : [];
   const body = [...prefix, ...recent].join("\n");
-  if (tools.length >= 3 || isSettled) {
-    return `${header}\n${expandableBlockquote(body)}`;
-  }
-  return [header, ...prefix, ...recent].join("\n");
+  // ponytail: 面板是同一条消息反复 edit，实体结构必须首帧即定（官方 entities 不跨 edit 保留），避免中途跳变
+  return `${header}\n${expandableBlockquote(body)}`;
 }
 
 function formatContextTokens(count) {
@@ -268,16 +266,7 @@ function formatContextTokens(count) {
   return String(count);
 }
 
-// ponytail: reads the extension's last quota refresh; may lag one refresh if the model was switched seconds ago
-function readQuota() {
-  try {
-    return readFileSync(join(homedir(), ".local/var/remote-pi/quota.txt"), "utf8").trim();
-  } catch {
-    return "";
-  }
-}
-
-function formatSessionReset({ model, cwd, quota }) {
+function formatSessionReset({ model, cwd }) {
   const modelId = model?.id || "unknown";
   const provider = model?.provider || "unknown";
   const contextTokens = formatContextTokens(model?.contextWindow);
@@ -291,7 +280,6 @@ function formatSessionReset({ model, cwd, quota }) {
     `◆ Context: ${context}`,
     `◆ Endpoint: ${endpoint}`,
     `◆ CWD: ${cwd}`,
-    ...(quota ? [`◆ Quota: ${quota}`] : []),
   ].join("\n");
 }
 
@@ -335,30 +323,106 @@ function runStt(sttCommand, audioPath) {
   });
 }
 
+function resolvePath(pathStr, baseDir = process.cwd()) {
+  if (!pathStr || typeof pathStr !== "string") return "";
+  const expanded = pathStr.startsWith("~/") ? join(homedir(), pathStr.slice(2)) : pathStr === "~" ? homedir() : pathStr;
+  return resolve(baseDir, expanded);
+}
+
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
+  const configDir = dirname(path);
   let file = {};
-  if (existsSync(path)) file = JSON.parse(readFileSync(path, "utf8"));
+  if (existsSync(path)) {
+    try {
+      file = JSON.parse(readFileSync(path, "utf8"));
+    } catch (err) {
+      throw new Error(`Failed to parse config file ${path}: ${err.message}`);
+    }
+  }
+
+  let devRoot = null;
+  const rawDevRoot = process.env.DEV_ROOT ?? file.devRoot;
+  if (rawDevRoot !== undefined && rawDevRoot !== null && rawDevRoot !== "") {
+    const resolvedDevRoot = resolvePath(rawDevRoot, configDir);
+    try {
+      if (statSync(resolvedDevRoot).isDirectory()) {
+        devRoot = resolvedDevRoot;
+      } else {
+        console.warn(`[config] devRoot is not a directory: ${resolvedDevRoot}`);
+      }
+    } catch {
+      console.warn(`[config] devRoot does not exist or is inaccessible: ${resolvedDevRoot}`);
+    }
+  } else {
+    const defaultDev = join(homedir(), "dev");
+    try {
+      if (statSync(defaultDev).isDirectory()) {
+        devRoot = defaultDev;
+      }
+    } catch {}
+  }
+
+  let rawExtensions = [];
+  if (process.env.REMOTE_PI_EXTENSIONS !== undefined) {
+    const envExt = process.env.REMOTE_PI_EXTENSIONS.trim();
+    if (envExt.startsWith("[")) {
+      try {
+        rawExtensions = JSON.parse(envExt);
+      } catch (err) {
+        throw new Error(`Invalid JSON in REMOTE_PI_EXTENSIONS: ${err.message}`);
+      }
+    } else if (envExt) {
+      rawExtensions = envExt.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+  } else if (file.extensions !== undefined) {
+    if (!Array.isArray(file.extensions)) {
+      throw new Error(`Invalid extensions configuration in ${path}: expected an array of strings`);
+    }
+    rawExtensions = file.extensions;
+  }
+
+  const extensions = [];
+  for (const item of rawExtensions) {
+    if (typeof item !== "string" || !item.trim()) {
+      throw new Error("Invalid extension path in configuration: expected non-empty string");
+    }
+    const resolvedExt = resolvePath(item.trim(), configDir);
+    if (!existsSync(resolvedExt)) {
+      throw new Error(`Configured extension not found: ${item} (resolved to ${resolvedExt})`);
+    }
+    if (!extensions.includes(resolvedExt)) {
+      extensions.push(resolvedExt);
+    }
+  }
+
+  const enableCompanionExtension = process.env.REMOTE_PI_COMPANION_EXTENSION !== undefined
+    ? process.env.REMOTE_PI_COMPANION_EXTENSION !== "false" && process.env.REMOTE_PI_COMPANION_EXTENSION !== "0"
+    : file.enableCompanionExtension !== false;
+
+  const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
+
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || file.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || file.allowedUserId || ""),
-    cwd: resolve(process.env.PI_CWD || file.cwd || process.cwd()),
+    cwd: resolvePath(process.env.PI_CWD || file.cwd || process.cwd(), configDir),
     configPath: path,
-    devRoot: join(homedir(), "dev"),
+    devRoot,
     piBin: process.env.PI_BIN || file.piBin || "pi",
-    stateDir: resolve(file.stateDir || join(homedir(), ".local", "var", "remote-pi")),
-    logFile: resolve(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log")),
+    stateDir,
+    logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     approve: file.approve !== false,
+    enableCompanionExtension,
+    extensions,
     sttCommand: file.sttCommand || "",
-    ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "👀",
-    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "🫡",
+    ackEmoji: process.env.TELEGRAM_ACK_EMOJI || file.ackEmoji || "\u{1F440}",
+    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || file.doneEmoji || "\u{1FAE1}",
   };
   config.sessionDir = join(config.stateDir, "sessions", config.cwd.replace(/^\//, "").replaceAll("/", "-"));
   config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid allowedUserId in ${path}`);
   if (!existsSync(config.cwd)) throw new Error(`Pi working directory does not exist: ${config.cwd}`);
-  if (!existsSync(config.devRoot)) throw new Error(`Project directory does not exist: ${config.devRoot}`);
   return config;
 }
 
@@ -568,9 +632,26 @@ class PiRpc {
     this.missedPings = 0; // 新进程从零计失联，避免上个进程被杀后的余数误杀新进程
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
-    const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
-    if (existsSync(extensionPath)) args.push("-e", extensionPath);
-    const env = { ...process.env, REMOTE_PI_GATEWAY: "1", PATH: buildDevPath(process.env.PATH) };
+    const companionPath = join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
+    const extensionsToLoad = [];
+    if (this.config.enableCompanionExtension && existsSync(companionPath)) {
+      extensionsToLoad.push(companionPath);
+    }
+    if (Array.isArray(this.config.extensions)) {
+      for (const ext of this.config.extensions) {
+        if (!extensionsToLoad.includes(ext)) {
+          extensionsToLoad.push(ext);
+        }
+      }
+    }
+    for (const ext of extensionsToLoad) {
+      args.push("-e", ext);
+    }
+    const env = {
+      ...process.env,
+      REMOTE_PI_GATEWAY: "1",
+      PATH: buildDevPath(process.env.PATH),
+    };
     this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(process.stderr);
     await new Promise((resolveSpawn, reject) => {
@@ -1103,7 +1184,7 @@ class Gateway {
           this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
-        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd, quota: readQuota() });
+        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
         return this.telegram.send(this.chatId, text);
       }
       case "name": {
@@ -1255,10 +1336,27 @@ class Gateway {
   }
 
   async showCwds() {
-    const projects = (await readdir(this.config.devRoot, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择 ~/dev 下的项目：`, this.keyboard(projects.map((entry) => ({
+    if (!this.config.devRoot) {
+      await this.telegram.send(
+        this.chatId,
+        `当前目录：${this.config.cwd}\n\n⚠️ 未配置项目根目录 (devRoot)。\n若需在 Telegram 中使用 /cwd 选择并切换项目，请在配置文件中设置 "devRoot"（例如 {"devRoot": "~/dev"}）。`,
+      );
+      return;
+    }
+    let projects = [];
+    try {
+      projects = (await readdir(this.config.devRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch (err) {
+      await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n❌ 读取 devRoot 目录失败：${err.message}`);
+      return;
+    }
+    if (projects.length === 0) {
+      await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n（目录 ${this.config.devRoot} 下无可选子项目）`);
+      return;
+    }
+    await this.telegram.send(this.chatId, `当前目录：${this.config.cwd}\n\n选择 ${this.config.devRoot} 下的项目：`, this.keyboard(projects.map((entry) => ({
       label: `${join(this.config.devRoot, entry.name) === this.config.cwd ? "●" : "○"} ${entry.name}`,
       action: { type: "cwd", path: join(this.config.devRoot, entry.name) },
     }))));
@@ -1284,9 +1382,7 @@ class Gateway {
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
         this.lastModel = { provider: exact.provider, modelId: exact.id };
-        await sleep(1500); // let the quota extension refresh for the new provider
-        const quota = readQuota();
-        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}${quota ? `\n◆ Quota: ${quota}` : ""}`);
+        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}`);
       }
     }
     const filtered = models.filter((model) => !query || `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query.toLowerCase()));
@@ -1392,9 +1488,7 @@ class Gateway {
       if (action.type === "model") {
         await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
         this.lastModel = { provider: action.provider, modelId: action.modelId };
-        await sleep(1500); // let the quota extension refresh for the new provider
-        const quota = readQuota();
-        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}${quota ? `\n◆ Quota: ${quota}` : ""}`);
+        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
       } else if (action.type === "thinking") {
         await this.pi.request("set_thinking_level", { level: action.level });
         await this.telegram.send(this.chatId, `✅ thinking: ${action.level}`);
@@ -1438,18 +1532,38 @@ class Gateway {
   }
 
   async switchCwd(path, callbackId) {
-    const [root, target] = await Promise.all([realpath(this.config.devRoot), realpath(path)]);
-    if (!isDirectChild(root, target) || !(await stat(target)).isDirectory()) throw new Error("只能切换到 ~/dev 的一级子目录");
+    if (!this.config.devRoot) {
+      await this.telegram.answer(callbackId, "devRoot 未配置", { show_alert: true });
+      return;
+    }
+    let root, target, targetStat;
+    try {
+      [root, target] = await Promise.all([realpath(this.config.devRoot), realpath(path)]);
+      targetStat = await stat(target);
+    } catch {
+      await this.telegram.answer(callbackId, "目标目录已失效或不存在", { show_alert: true });
+      return;
+    }
+    if (!isDirectChild(root, target) || !targetStat.isDirectory()) {
+      await this.telegram.answer(callbackId, "只能切换到 devRoot 的一级子目录", { show_alert: true });
+      return;
+    }
     if (target === this.config.cwd) {
       await this.telegram.answer(callbackId, "已经在此目录");
       return;
     }
 
-    const config = JSON.parse(await readFile(this.config.configPath, "utf8"));
-    config.cwd = target;
-    const temporary = `${this.config.configPath}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, this.config.configPath);
+    if (existsSync(this.config.configPath)) {
+      try {
+        const config = JSON.parse(await readFile(this.config.configPath, "utf8"));
+        config.cwd = target;
+        const temporary = `${this.config.configPath}.tmp`;
+        await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+        await rename(temporary, this.config.configPath);
+      } catch (err) {
+        console.warn(`[config] failed to persist new cwd to ${this.config.configPath}: ${err.message}`);
+      }
+    }
     await this.telegram.answer(callbackId, "正在切换");
     await this.telegram.send(this.chatId, `✅ 工作目录已切换到：\n${target}\n\n正在热重启 Pi…`);
     this.pi.stop();
@@ -1838,6 +1952,7 @@ async function selfTest() {
   assert.equal(toolSummary("bash", { command: "git status" }), "bash: git status");
   assert.equal(toolSummary("read", { path: "foo.txt" }), "read: foo.txt");
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("⏳"));
+  assert.ok(renderToolPanel([{ summary: "bash: git status", status: "running" }]).includes("```expandable"), "单工具也应使用折叠块，避免中途跳变");
   assert.ok(renderToolPanel([{ summary: "bash: git status", status: "done" }], true).includes("✅ 已完成 1 项操作"));
 
   assert.equal(formatContextTokens(1048576), "1.0M");
@@ -2040,27 +2155,6 @@ async function selfTest() {
         baseUrl: "http://127.0.0.1:51122/v1",
       },
       cwd: "/Users/user/dev/remote-pi",
-    }).includes("\n◆ Quota: "),
-    false,
-    "no quota line when quota missing",
-  );
-  assert.ok(
-    formatSessionReset({
-      model: { id: "gemini-3.8-flash", provider: "antigravity", contextWindow: 1048576, baseUrl: "http://x" },
-      cwd: "/tmp",
-      quota: "93%:3h55m | 82%:4d3h",
-    }).endsWith("\n◆ Quota: 93%:3h55m | 82%:4d3h"),
-    "quota line rendered below CWD",
-  );
-  assert.equal(
-    formatSessionReset({
-      model: {
-        id: "gemini-3.8-flash",
-        provider: "antigravity",
-        contextWindow: 1048576,
-        baseUrl: "http://127.0.0.1:51122/v1",
-      },
-      cwd: "/Users/user/dev/remote-pi",
     }),
     [
       "✨ Session reset! Starting fresh.",
@@ -2072,6 +2166,73 @@ async function selfTest() {
       "◆ CWD: /Users/user/dev/remote-pi",
     ].join("\n")
   );
+
+  // Open-source configuration tests
+  {
+    assert.equal(resolvePath("~/foo"), join(homedir(), "foo"));
+    assert.equal(resolvePath("bar", "/tmp"), "/tmp/bar");
+    assert.equal(resolvePath("", "/tmp"), "");
+
+    // loadConfig with test configs
+    const tmpCfgDir = join(tmpdir(), `test-cfg-${Date.now()}`);
+    await mkdir(tmpCfgDir, { recursive: true });
+    const dummyExt = join(tmpCfgDir, "my-ext.js");
+    writeFileSync(dummyExt, "// dummy extension");
+
+    const validCfgPath = join(tmpCfgDir, "config.json");
+    writeFileSync(
+      validCfgPath,
+      JSON.stringify({
+        botToken: "123456:abcdef",
+        allowedUserId: "999",
+        cwd: tmpCfgDir,
+        devRoot: tmpCfgDir,
+        extensions: ["./my-ext.js"],
+        enableCompanionExtension: false,
+      })
+    );
+
+    const prevEnvCfg = process.env.REMOTE_PI_CONFIG;
+    process.env.REMOTE_PI_CONFIG = validCfgPath;
+    try {
+      const cfg = loadConfig();
+      assert.equal(cfg.botToken, "123456:abcdef");
+      assert.equal(cfg.allowedUserId, "999");
+      assert.equal(cfg.cwd, tmpCfgDir);
+      assert.equal(cfg.devRoot, tmpCfgDir);
+      assert.deepEqual(cfg.extensions, [dummyExt]);
+      assert.equal(cfg.enableCompanionExtension, false);
+    } finally {
+      if (prevEnvCfg) process.env.REMOTE_PI_CONFIG = prevEnvCfg;
+      else delete process.env.REMOTE_PI_CONFIG;
+    }
+
+    // verify loadConfig throws when configured extension is missing
+    const invalidExtCfgPath = join(tmpCfgDir, "invalid-ext.json");
+    writeFileSync(
+      invalidExtCfgPath,
+      JSON.stringify({
+        botToken: "123456:abcdef",
+        allowedUserId: "999",
+        cwd: tmpCfgDir,
+        extensions: ["./non-existent-ext.js"],
+      })
+    );
+    process.env.REMOTE_PI_CONFIG = invalidExtCfgPath;
+    try {
+      assert.throws(() => loadConfig(), /Configured extension not found/);
+    } finally {
+      if (prevEnvCfg) process.env.REMOTE_PI_CONFIG = prevEnvCfg;
+      else delete process.env.REMOTE_PI_CONFIG;
+    }
+
+    // verify showCwds handles devRoot: null gracefully
+    const gwNoDev = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir, devRoot: null });
+    let sentMsg = "";
+    gwNoDev.telegram.send = async (_chat, text) => { sentMsg = text; };
+    await gwNoDev.showCwds();
+    assert.ok(sentMsg.includes("未配置项目根目录 (devRoot)"), "showCwds should guide user when devRoot is null");
+  }
 
   {
     const tg = new Telegram("123456:fake-token", "/tmp/fake-offset");
