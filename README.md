@@ -66,6 +66,7 @@
 | `/compact [focus]` | Trigger context compaction and summarization |
 | `/fork` | Branch the session from a previous user message |
 | `/abort` | Stop current agent execution immediately |
+| `/upgrade` | Self-upgrade the gateway: fast-forward git pull → npm install → offline self-test (auto-rollback on failure) → restart |
 | `/help` | Show full help menu |
 
 > **Tip**: Skills and custom commands installed in Pi are automatically surfaced in Telegram as callable commands (e.g. `/skill_name`).
@@ -150,6 +151,7 @@ Manage the service anytime via the installed helper CLI:
 
 ```bash
 pi-remote-gateway status   # Check service state and recent logs
+pi-remote-gateway upgrade  # Self-upgrade: git pull (ff-only) + npm install + self-test + auto-restart
 pi-remote-gateway restart  # Restart service after code/config edits
 pi-remote-gateway logs     # Tail output log in real time (tail -f)
 pi-remote-gateway stop     # Stop background daemon

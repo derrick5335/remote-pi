@@ -66,6 +66,7 @@
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/fork` | 从历史用户消息创建分支会话 |
 | `/abort` | 立即中断当前正在运行的任务 |
+| `/upgrade` | 自升级：fast-forward git pull → npm install → 离线自检（失败自动回滚）→ 重启 |
 | `/help` | 显示完整的操作帮助 |
 
 > **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。
@@ -150,6 +151,7 @@ npm start
 
 ```bash
 pi-remote-gateway status   # 查看运行状态与近期日志
+pi-remote-gateway upgrade  # 自升级：git pull（仅 ff）+ npm install + 自检 + 自动重启
 pi-remote-gateway restart  # 代码更新后重启服务生效
 pi-remote-gateway logs     # 持续跟踪日志输出 (tail -f)
 pi-remote-gateway stop     # 停止后台服务

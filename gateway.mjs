@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
@@ -37,6 +37,7 @@ const HELP = `Remote Pi
 /abort              停止当前任务（排队消息保留）
 /abort clear        停止并清空队列
 /restart            重启 Gateway
+/upgrade            升级 Gateway 到最新版本（git pull + 自检 + 重启）
 /queue [clear]       查看或清空消息队列
 /followup <消息>     追加为排队后续任务`;
 
@@ -49,6 +50,7 @@ const BOT_COMMANDS = [
   ["fork", "从历史分支"], ["clone", "克隆当前分支"],
   ["compact", "压缩上下文"], ["export", "导出会话"], ["abort", "停止当前任务（保留队列）"],
   ["restart", "重启 Gateway"],
+  ["upgrade", "升级 Gateway 到最新版本"],
   ["queue", "查看或清空队列"],
   ["followup", "排队追加后续任务"],
 ].map(([command, description]) => ({ command, description }));
@@ -1300,6 +1302,28 @@ class Gateway {
         if (!clear) this.queue = kept;
         this.settleActiveReactions();
         return this.telegram.send(this.chatId, clear ? "⏹ 已停止，队列已清空" : "⏹ 已停止（排队消息保留，/abort clear 可清空）");
+      }
+      case "upgrade": {
+        // 复用 install.sh upgrade（dirty check / ff-only pull / npm install / self-test / 自动回滚），
+        // --no-restart 防止脚本 kickstart 杀掉自身导致回复发不出去；重启复用 /restart。
+        // ref: staged self-update best practice — verify before swap, restart via supervisor
+        // (https://docs.rs/update-rs/latest/update_rs/index.html)
+        this.startTyping();
+        const script = join(dirname(fileURLToPath(import.meta.url)), "install.sh");
+        const res = await new Promise((done) => {
+          const child = spawn("bash", [script, "upgrade", "--no-restart"], { timeout: 300_000 });
+          let buf = "";
+          child.stdout.on("data", (c) => { buf += c; });
+          child.stderr.on("data", (c) => { buf += c; });
+          child.on("close", (code) => done({ code, buf }));
+          child.on("error", (err) => done({ code: 1, buf: String(err) }));
+        });
+        this.stopTyping();
+        const text = res.buf.trim() || "（无输出）";
+        if (res.code !== 0) return this.telegram.send(this.chatId, `❌ 升级失败\n${text}`);
+        if (text.includes("已是最新")) return this.telegram.send(this.chatId, text);
+        await this.telegram.send(this.chatId, `${text}\n🔄 正在重启 Gateway…`);
+        return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId);
       }
       case "restart": {
         await this.telegram.send(this.chatId, "🔄 正在重启 Gateway…");
@@ -2559,6 +2583,12 @@ async function selfTest() {
     assert.equal(readFileSync(join(tmpOffset, "offset"), "utf8"), "8", "处理完后 offset 应为 update_id+1");
   }
 
+  {
+    const r = spawnSync("bash", ["-n", join(dirname(fileURLToPath(import.meta.url)), "install.sh")]);
+    assert.equal(r.status, 0, "install.sh bash syntax check");
+  }
+  assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
+  assert.ok(BOT_COMMANDS.some((c) => c.command === "upgrade"), "BOT_COMMANDS registers upgrade");
   console.log("self-test: ok");
 }
 

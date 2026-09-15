@@ -147,13 +147,49 @@ status() {
     fi
 }
 
+# ponytail: rollback only covers npm/self-test failures; a new version that boots but crashes loops under KeepAlive — recover manually with `git reset --hard <old>`
+upgrade() {
+    local flag="${1:-}"
+    cd "$ROOT"
+    command -v git >/dev/null 2>&1 || { echo "❌ 未找到 git" >&2; exit 1; }
+    local old branch remote_name
+    old="$(git rev-parse HEAD 2>/dev/null)" || { echo "❌ $ROOT 不是 git 仓库" >&2; exit 1; }
+    [[ -z "$(git status --porcelain)" ]] || { echo "❌ working tree 存在未提交修改，拒绝升级（先提交或清理）" >&2; exit 1; }
+    branch="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || { echo "❌ 当前分支未设置 upstream（git push -u origin <branch>）" >&2; exit 1; }
+    remote_name="${branch%%/*}"
+    git fetch --quiet "$remote_name" || { echo "❌ git fetch 失败" >&2; exit 1; }
+    if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$branch")" ]]; then
+        echo "✅ 已是最新：$(git log -1 --format='(%h) %s')"
+        return 0
+    fi
+    git merge --ff-only --quiet "$branch" || { echo "❌ 无法 fast-forward（本地与远端分叉）" >&2; exit 1; }
+    echo "⬆️ 已更新到：$(git log -1 --format='(%h) %s')"
+    if ! npm install --omit=dev --no-audit --no-fund --silent; then
+        git reset --hard --quiet "$old"
+        echo "❌ npm install 失败，已回滚到 $old" >&2; exit 1
+    fi
+    if ! "$NODE" "$ROOT/gateway.mjs" --self-test >/dev/null 2>&1; then
+        git reset --hard --quiet "$old"
+        npm install --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1
+        echo "❌ self-test 失败，已回滚到 $old" >&2; exit 1
+    fi
+    echo "✅ 升级完成"
+    [[ "$flag" == "--no-restart" ]] && return 0
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+        restart
+    else
+        echo "（服务未运行，跳过重启；可执行 pi-remote-gateway start 启动）"
+    fi
+}
+
 case "${1:-install}" in
     install)   install ;;
+    upgrade)   upgrade "${2:-}" ;;
     start)     start ;;
     stop)      stop ;;
     restart)   restart ;;
     status)    status ;;
     logs)      tail -f "$LOG_FILE" ;;
     uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; echo "Removed service; kept $CONFIG" ;;
-    *) echo "Usage: $0 [install|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [install|upgrade|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
 esac
