@@ -65,7 +65,15 @@ setup_plist() {
 EOF
     plutil -lint "$PLIST"
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$PLIST"
+    # launchctl bootout 是异步的；同一 label 立刻 bootstrap 会撞上拆除中的旧服务 →
+    # "Bootstrap failed: 5: Input/output error"，所以先等一下，失败再重试。
+    local attempt
+    sleep 1
+    for attempt in 1 2 3; do
+        if launchctl bootstrap "$DOMAIN" "$PLIST"; then break; fi
+        [[ "$attempt" == 3 ]] && { echo "❌ launchctl bootstrap failed after 3 attempts" >&2; return 1; }
+        sleep 1
+    done
     sleep 2
     status
 }
