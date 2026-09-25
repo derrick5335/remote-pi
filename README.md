@@ -179,6 +179,7 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | :--- | :--- | :--- | :--- |
 | `piBin` | `PI_BIN` | Auto-detected | Path to the `pi` executable (auto-detects Homebrew / global npm paths) |
 | `approve` | - | `true` | Pass `--approve` to Pi (trusts project-local settings and extensions for this run) |
+| `herdr` | `REMOTE_PI_HERDR` | `true` | Automatically integrate with Herdr (connects to existing server or launches headless server; assigns workspace/pane envs) |
 | `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | Load companion extension (`remote_attach` and `remote_ask` tools) |
 | `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | Additional Pi extension file paths to pass via `-e` |
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |

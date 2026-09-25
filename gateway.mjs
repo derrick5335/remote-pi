@@ -419,6 +419,10 @@ function loadConfig() {
     ? process.env.REMOTE_PI_COMPANION_EXTENSION !== "false" && process.env.REMOTE_PI_COMPANION_EXTENSION !== "0"
     : file.enableCompanionExtension !== false;
 
+  const herdr = process.env.REMOTE_PI_HERDR !== undefined
+    ? process.env.REMOTE_PI_HERDR !== "false" && process.env.REMOTE_PI_HERDR !== "0"
+    : file.herdr !== false;
+
   const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
   const savedState = loadState(stateDir);
 
@@ -438,6 +442,7 @@ function loadConfig() {
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     approve: file.approve !== false,
     enableCompanionExtension,
+    herdr,
     extensions,
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
@@ -637,6 +642,117 @@ class Telegram {
   }
 }
 
+function runCommand(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+    let stdout = "";
+    let stderr = "";
+    cp.stdout?.on("data", (d) => { stdout += d; });
+    cp.stderr?.on("data", (d) => { stderr += d; });
+    const timer = options.timeout ? setTimeout(() => {
+      cp.kill("SIGKILL");
+      reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
+    }, options.timeout) : null;
+    cp.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+    cp.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`Command failed (${code}): ${stderr.trim() || stdout.trim()}`));
+    });
+  });
+}
+
+// ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
+async function resolveHerdrEnvironment(cwd, { piBin, disabled } = {}) {
+  if (disabled || piBin === "echo" || process.env.NODE_ENV === "test") return {};
+
+  let herdrBin;
+  try {
+    herdrBin = (await runCommand("which", ["herdr"], { timeout: 2000 })).trim();
+  } catch {
+    const fallback = join(homedir(), ".local", "bin", "herdr");
+    if (existsSync(fallback)) herdrBin = fallback;
+    else return {};
+  }
+
+  // 1. 检查 Herdr Server 是否运行；若未运行，启动 headless server（有则进，无则建）
+  let status = null;
+  try {
+    const raw = await runCommand(herdrBin, ["status", "server", "--json"], { timeout: 3000 });
+    const parsed = JSON.parse(raw);
+    if (parsed.running) status = parsed;
+  } catch {
+    status = null;
+  }
+
+  if (!status) {
+    try {
+      const serverProc = spawn(herdrBin, ["server"], { detached: true, stdio: "ignore" });
+      serverProc.unref();
+      const start = Date.now();
+      while (Date.now() - start < 3000) {
+        await sleep(100);
+        try {
+          const raw = await runCommand(herdrBin, ["status", "server", "--json"], { timeout: 1000 });
+          const parsed = JSON.parse(raw);
+          if (parsed.running) {
+            status = parsed;
+            break;
+          }
+        } catch {}
+      }
+    } catch (err) {
+      console.warn(`${new Date().toISOString()} [herdr] failed to start herdr server: ${err.message}`);
+      return {};
+    }
+  }
+
+  if (!status?.socket) return {};
+  const socketPath = status.socket;
+
+  // 2. 查找或创建对应 cwd 的 Workspace 与 Pane
+  let workspaceId;
+  let tabId;
+  let paneId;
+  try {
+    const panesRaw = await runCommand(herdrBin, ["pane", "list"], { timeout: 3000 });
+    const panesData = JSON.parse(panesRaw);
+    const existingPane = panesData.result?.panes?.find((p) => p.cwd === cwd);
+    if (existingPane) {
+      workspaceId = existingPane.workspace_id;
+      tabId = existingPane.tab_id;
+      paneId = existingPane.pane_id;
+    }
+  } catch {}
+
+  if (!paneId) {
+    try {
+      const label = basename(cwd) || "remote-pi";
+      const createdRaw = await runCommand(herdrBin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], { timeout: 5000 });
+      const created = JSON.parse(createdRaw);
+      workspaceId = created.result?.workspace?.workspace_id;
+      tabId = created.result?.tab?.tab_id;
+      paneId = created.result?.root_pane?.pane_id;
+    } catch (err) {
+      console.warn(`${new Date().toISOString()} [herdr] failed to create workspace for ${cwd}: ${err.message}`);
+    }
+  }
+
+  if (!paneId) return {};
+
+  return {
+    HERDR_ENV: "1",
+    HERDR_SOCKET_PATH: socketPath,
+    HERDR_BIN_PATH: herdrBin,
+    HERDR_WORKSPACE_ID: workspaceId,
+    HERDR_TAB_ID: tabId,
+    HERDR_PANE_ID: paneId,
+  };
+}
+
 class PiRpc {
   constructor(config, onEvent, onClose) {
     this.config = config;
@@ -676,10 +792,22 @@ class PiRpc {
     for (const ext of extensionsToLoad) {
       args.push("-e", ext);
     }
+    let herdrEnv = {};
+    if (this.config.herdr !== false) {
+      try {
+        herdrEnv = await resolveHerdrEnvironment(this.config.cwd, { piBin: this.config.piBin });
+        if (herdrEnv.HERDR_PANE_ID) {
+          console.log(`${new Date().toISOString()} [herdr] attached to pane ${herdrEnv.HERDR_PANE_ID} (workspace ${herdrEnv.HERDR_WORKSPACE_ID})`);
+        }
+      } catch (err) {
+        console.warn(`${new Date().toISOString()} [herdr] resolveHerdrEnvironment failed: ${err.message}`);
+      }
+    }
     const env = {
       ...process.env,
       REMOTE_PI_GATEWAY: "1",
       PATH: buildDevPath(process.env.PATH),
+      ...herdrEnv,
     };
     this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.pipe(process.stderr);
@@ -1967,6 +2095,9 @@ async function selfTest() {
   assert.equal(parseCommand("hello"), null);
   assert.ok(buildDevPath("/usr/bin:/bin").includes("/opt/homebrew/bin"));
   assert.ok(buildDevPath("/usr/bin:/bin").includes(join(homedir(), ".local", "bin")));
+  assert.equal(await runCommand("echo", ["ok"]), "ok");
+  assert.deepEqual(await resolveHerdrEnvironment(tmpdir(), { piBin: "echo" }), {});
+  assert.deepEqual(await resolveHerdrEnvironment(tmpdir(), { disabled: true }), {});
   assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
   assert.equal(telegramCommandName({ name: `skill:${"a".repeat(40)}`, source: "skill" }).length, 32);
   assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");

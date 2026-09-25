@@ -179,6 +179,7 @@ pi-remote-gateway stop     # 停止后台服务
 | :--- | :--- | :--- | :--- |
 | `piBin` | `PI_BIN` | 自动探测 | Pi CLI 可执行文件路径（自动探测 Homebrew / 全局 npm 路径） |
 | `approve` | - | `true` | 是否向 Pi 传递 `--approve`（信任当前项目本地配置与扩展；详见 Pi 官方信任机制） |
+| `herdr` | `REMOTE_PI_HERDR` | `true` | 是否自动接入 Herdr（有 server 则直接加入，无则拉起 headless server，并为 Pi 注入工作区与窗格环境变量） |
 | `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | 是否加载自带的伴侣扩展（提供 `remote_attach` 与 `remote_ask` 工具） |
 | `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | 额外注入 Pi 的自定义扩展文件路径数组（支持 `~/` 及相对于配置文件的路径） |
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
