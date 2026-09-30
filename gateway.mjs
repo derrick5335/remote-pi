@@ -464,23 +464,28 @@ class Telegram {
     this.fileBase = `https://api.telegram.org/file/bot${token}`;
     this.offsetPath = offsetPath;
     this.retryNotBefore = 0; // ref: Telegram ResponseParameters retry_after (https://core.telegram.org/bots/api#responseparameters)
+    this.wakeTimer = null;
+    this.wakePromise = null;
+    this.currentPollAc = null;
   }
 
-  async call(method, body = {}, timeout = 35_000, maxAttempts = 3) {
+  async call(method, body = {}, timeout = 35_000, maxAttempts = 3, signal = null) {
     let lastError;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let response;
       let data;
       const t0 = performance.now();
       try {
+        const reqSignal = signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout);
         response = await fetch(`${this.base}/${method}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(timeout),
+          signal: reqSignal,
         });
         data = await response.json();
       } catch (error) {
+        if (signal?.aborted) throw error; // 外部主动 abort（如唤醒重置），不再内部重试死等
         const ms = Math.round(performance.now() - t0);
         console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed in ${ms}ms:`, error.message);
         lastError = error;
@@ -606,15 +611,77 @@ class Telegram {
     }
   }
 
+  // ref: Alex MacCaw heartbeat drift technique for OS sleep/wake detection (http://blog.alexmaccaw.com/javascript-wake-event)
+  startWakeMonitor() {
+    if (this.wakeTimer) return;
+    let lastTick = Date.now();
+    this.wakeTimer = setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - lastTick;
+      lastTick = now;
+      // 正常每 1000ms 一跳；若间隔超过 3500ms 说明系统经历合盖休眠与唤醒
+      if (elapsed > 3500) {
+        this.handleWake(Math.round(elapsed / 1000));
+      }
+    }, 1000);
+    this.wakeTimer.unref?.();
+  }
+
+  stopWakeMonitor() {
+    if (this.wakeTimer) {
+      clearInterval(this.wakeTimer);
+      this.wakeTimer = null;
+    }
+  }
+
+  handleWake(sleepSec = 0) {
+    if (this.wakePromise) return this.wakePromise;
+    console.log(`${new Date().toISOString()} [tg:wake] System wake detected (slept ~${sleepSec}s). Aborting stale poll...`);
+    if (this.currentPollAc) {
+      try { this.currentPollAc.abort("system_wake"); } catch {}
+      this.currentPollAc = null;
+    }
+    this.wakePromise = (async () => {
+      const t0 = performance.now();
+      let online = false;
+      // 快速探测网络连通性（短超时 2s，最多探测 8 次，每次间隔 500ms）
+      for (let probe = 0; probe < 8; probe++) {
+        try {
+          const res = await fetch(`${this.base}/getMe`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            signal: AbortSignal.timeout(2000),
+          });
+          const data = await res.json().catch(() => null);
+          if (res.ok && data?.ok) {
+            online = true;
+            break;
+          }
+        } catch {
+          await sleep(500);
+        }
+      }
+      const probeMs = Math.round(performance.now() - t0);
+      console.log(`${new Date().toISOString()} [tg:wake] Network probe ${online ? "succeeded" : "timeout"} in ${probeMs}ms. Resuming instant poll.`);
+    })().finally(() => {
+      this.wakePromise = null;
+    });
+    return this.wakePromise;
+  }
+
   async poll(handler) {
     let offset = Number(await readFile(this.offsetPath, "utf8").catch(() => "0")) || 0;
     // at-least-once：普通消息处理完才落盘 offset，崩溃后由 Telegram 重投（重复优于丢失）；p0/p1 只推进内存 offset
     let persistChain = Promise.resolve();
+    this.startWakeMonitor();
     for (;;) {
+      if (this.wakePromise) await this.wakePromise;
       try {
+        this.currentPollAc = new AbortController();
         const updates = await this.call("getUpdates", {
           offset, timeout: 50, allowed_updates: ["message", "callback_query", "stopped_message_generation"],
-        }, 60_000);
+        }, 60_000, 3, this.currentPollAc.signal);
+        this.currentPollAc = null;
         for (const update of updates) {
           offset = update.update_id + 1;
           const done = handler(update);
@@ -631,6 +698,11 @@ class Telegram {
           }
         }
       } catch (error) {
+        this.currentPollAc = null;
+        if (this.wakePromise) {
+          await this.wakePromise;
+          continue;
+        }
         console.error(`${new Date().toISOString()} [tg:poll] error:`, error.message);
         if (error.message?.includes("Conflict")) {
           await sleep(15_000);
@@ -941,8 +1013,6 @@ class Gateway {
     this.eventChain = Promise.resolve();
     this.telegramChain = Promise.resolve();
     this.uploadChain = Promise.resolve();
-    this.draftSupport = "unknown";
-    this.nextDraftId = 0;
     this.activeMessageIds = [];
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
@@ -1826,7 +1896,7 @@ class Gateway {
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
-      this.draft = { text: "", messageId: null, timer: null, draftId: null, closed: false };
+      this.draft = { text: "", messageId: null, timer: null, closed: false };
     }
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
@@ -1952,6 +2022,7 @@ class Gateway {
     }
   }
 
+  // ref: OpenClaw PR #40013 - avoid DM duplicate flash by using sendMessage + editMessageText in-place (https://github.com/openclaw/openclaw/pull/40013)
   async flushDraft(draft) {
     if (!draft.text || draft.flushing || draft.closed) return;
     if (this.telegram.retryNotBefore > Date.now()) return; // 429 冷却中
@@ -1959,30 +2030,12 @@ class Gateway {
     const t0 = performance.now();
     try {
       const text = previewText(draft.text);
-      if (text === draft.sentPreview) return; // 去重：冻结预览不再每 1.2s 重发（循环播放的根因）
-      if (this.draftSupport !== "unsupported") {
-        if (draft.draftId === null) draft.draftId = ++this.nextDraftId;
-        try {
-          await this.telegram.sendDraft(this.chatId, draft.draftId, text);
-          this.draftSupport = "supported";
-          draft.sentPreview = text;
-          this.logFirstUi(t0, "draft");
-          return;
-        } catch (error) {
-          const msg = String(error.message || "");
-          if (/not found|unknown method|404/i.test(msg)) {
-            this.draftSupport = "unsupported";
-            console.error("sendMessageDraft unavailable; falling back to send+edit:", error.message);
-          } else {
-            console.error("sendMessageDraft transient error:", error.message);
-            if (this.draftSupport === "supported" || /429|too many requests/i.test(msg)) return;
-          }
-        }
-      }
+      if (text === draft.sentPreview) return; // 去重：内容未变跳过更新
       if (draft.messageId) {
         await this.telegram.edit(this.chatId, draft.messageId, text, true);
       } else {
-        draft.messageId = (await this.telegram.sendOne(this.chatId, text, { disable_notification: true })).message_id;
+        const sent = await this.telegram.sendOne(this.chatId, text, { disable_notification: true });
+        draft.messageId = sent.message_id;
       }
       draft.sentPreview = text;
       this.logFirstUi(t0, "edit");
@@ -2007,16 +2060,23 @@ class Gateway {
     draft.closed = true;
     const t0 = performance.now();
     try {
-      // 先交付最终回复，成功后再清理预览；失败时预览保留为可恢复副本
       const parts = chunks(draft.text);
-      for (const part of parts) await this.telegram.sendOne(this.chatId, part);
-      if (draft.messageId) await this.telegram.deleteMessage(this.chatId, draft.messageId).catch(() => {});
+      if (draft.messageId) {
+        // 原地更新首段为最终内容，重试保证交付；同一条消息无重复对话框与残留
+        await this.telegram.edit(this.chatId, draft.messageId, parts[0], false);
+        for (let i = 1; i < parts.length; i++) {
+          await this.telegram.sendOne(this.chatId, parts[i]);
+        }
+      } else {
+        for (const part of parts) {
+          await this.telegram.sendOne(this.chatId, part);
+        }
+      }
       const apiMs = Math.round(performance.now() - t0);
       const turnMs = this.runStartedAt ? ` (total turn: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
       console.log(`${new Date().toISOString()} [ui] final reply sent (${parts.length} parts, took ${apiMs}ms)${turnMs}`);
     } catch (error) {
       console.error(`${new Date().toISOString()} [ui] final reply delivery failed:`, error.message);
-      // draft 模式预览 30s 即过期，失败副本落盘防丢内容
       const copy = join(this.config.stateDir, `failed-reply-${Date.now()}.txt`);
       await writeFile(copy, draft.text).catch(() => {});
       await this.telegram.send(this.chatId, `❌ Reply delivery failed: ${error.message}\nContent saved to: ${copy}`).catch(() => {});
@@ -2070,6 +2130,7 @@ class Gateway {
 
   stop() {
     this.resetSessionState();
+    this.telegram?.stopWakeMonitor?.();
     if (this.lockServer) {
       try { this.lockServer.close(); } catch {}
       this.lockServer = null;
@@ -2161,40 +2222,54 @@ async function selfTest() {
 
   {
     const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-    gw.telegram.edit = async () => {};
-    gw.telegram.sendDraft = async () => { throw new Error("fetch failed"); };
-    gw.telegram.sendOne = async () => ({ message_id: 123 });
-    const draft = { text: "hello", flushing: false, draftId: null, messageId: null };
-    await gw.flushDraft(draft);
-    assert.equal(gw.draftSupport, "unknown");
+    const sendOneCalls = [];
+    const editCalls = [];
+    gw.telegram.sendOne = async (_chat, text, extra = {}) => {
+      sendOneCalls.push({ text, extra });
+      return { message_id: 123 };
+    };
+    gw.telegram.edit = async (_chat, messageId, text, ephemeral = false) => {
+      editCalls.push({ messageId, text, ephemeral });
+      return true;
+    };
 
-    gw.telegram.sendDraft = async () => { throw new Error("Telegram sendMessageDraft: Not Found"); };
+    // 1. 初次流式刷新发送静音消息
+    const draft = { text: "hello", flushing: false, messageId: null, sentPreview: "" };
+    await gw.flushDraft(draft);
+    assert.equal(draft.messageId, 123);
+    assert.equal(sendOneCalls.length, 1);
+    assert.equal(sendOneCalls[0].extra.disable_notification, true);
+    assert.equal(editCalls.length, 0);
+
+    // 2. 后续流式刷新原地编辑同一消息
     draft.text = "hello world";
     await gw.flushDraft(draft);
-    assert.equal(gw.draftSupport, "unsupported");
+    assert.equal(editCalls.length, 1);
+    assert.equal(editCalls[0].messageId, 123);
+    assert.equal(editCalls[0].text, "hello world");
+    assert.equal(editCalls[0].ephemeral, true);
 
-    // 回归：预览内容不变时跳过重复发送（冻结预览不再每 1.2s 重发）
-    let draftCalls = 0;
-    gw.draftSupport = "unknown";
-    gw.telegram.sendDraft = async () => { draftCalls++; };
-    draft.text = "hello world again";
+    // 3. 预览内容不变时跳过重复编辑
     await gw.flushDraft(draft);
-    assert.equal(draftCalls, 1);
-    draft.text += "!";
-    await gw.flushDraft(draft);
-    assert.equal(draftCalls, 2);
-    await gw.flushDraft(draft);
-    assert.equal(draftCalls, 2);
+    assert.equal(editCalls.length, 1);
 
-    // 回归：最终交付不再发送空文本清除草稿；closed 拦截过期刷新
-    const sentParts = [];
-    gw.telegram.sendOne = async (_chat, text) => { sentParts.push(text); return { message_id: 1 }; };
-    gw.telegram.deleteMessage = async () => {};
-    await gw.finishDraft({ text: "final answer", messageId: 9, draftId: 4 });
-    assert.deepEqual(sentParts, ["final answer"]);
-    assert.equal(draftCalls, 2);
+    // 4. 原地交付最终回复：首段 edit，无多余 sendOne
+    await gw.finishDraft(draft);
+    assert.equal(editCalls.length, 2);
+    assert.equal(editCalls[1].messageId, 123);
+    assert.equal(editCalls[1].text, "hello world");
+    assert.equal(editCalls[1].ephemeral, false);
+    assert.equal(sendOneCalls.length, 1);
+
+    // 5. closed 拦截过期刷新
     await gw.flushDraft({ text: "stale", closed: true });
-    assert.equal(draftCalls, 2);
+    assert.equal(editCalls.length, 2);
+
+    // 6. 未曾触发流式（无 messageId），finishDraft 直接 sendOne 交付
+    const unstreamed = { text: "direct send", messageId: null };
+    await gw.finishDraft(unstreamed);
+    assert.equal(sendOneCalls.length, 2);
+    assert.equal(sendOneCalls[1].text, "direct send");
 
     // 回归：最终交付失败时文本落盘为可恢复副本
     {
@@ -2296,13 +2371,10 @@ async function selfTest() {
       const errs = [];
       const origError = console.error;
       console.error = (...a) => errs.push(a.map(String).join(" "));
-      const prevSupport = gw.draftSupport;
       const prevSendOne = gw.telegram.sendOne;
-      gw.draftSupport = "unsupported";
       gw.telegram.sendOne = async () => { throw new Error("preview boom"); };
-      await gw.flushDraft({ text: "boom draft", flushing: false, draftId: null, messageId: null });
+      await gw.flushDraft({ text: "boom draft", flushing: false, messageId: null });
       console.error = origError;
-      gw.draftSupport = prevSupport;
       gw.telegram.sendOne = prevSendOne;
       assert.ok(errs.some((e) => e.includes("preview update failed")), "flushDraft 失败应留日志");
     }
@@ -2700,10 +2772,13 @@ async function selfTest() {
     {
       const gwRate = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
       gwRate.telegram.retryNotBefore = Date.now() + 5000;
-      let draftCalled = false;
-      gwRate.telegram.sendDraft = async () => { draftCalled = true; };
-      await gwRate.flushDraft({ text: "test rate limit", flushing: false, closed: false, draftId: null, messageId: null });
-      assert.equal(draftCalled, false, "429 冷却期内 flushDraft 应跳过发送");
+      let editCalled = false;
+      let sendCalled = false;
+      gwRate.telegram.sendOne = async () => { sendCalled = true; };
+      gwRate.telegram.edit = async () => { editCalled = true; };
+      await gwRate.flushDraft({ text: "test rate limit", flushing: false, closed: false, messageId: null });
+      assert.equal(sendCalled, false, "429 冷却期内 flushDraft 应跳过发送");
+      assert.equal(editCalled, false);
     }
 
     await sleep(80);
@@ -2712,6 +2787,34 @@ async function selfTest() {
     await sleep(80);
     assert.deepEqual(handled, [7]);
     assert.equal(readFileSync(join(tmpOffset, "offset"), "utf8"), "8", "处理完后 offset 应为 update_id+1");
+
+    // 回归：macOS 休眠唤醒自愈（秒级中止死轮询 + 快速网络探测重连）
+    {
+      const tgWake = new Telegram("123456:fake-token", "/tmp/fake-offset");
+      let pollAborted = false;
+      const ac = new AbortController();
+      ac.signal.addEventListener("abort", () => { pollAborted = true; });
+      tgWake.currentPollAc = ac;
+
+      const origFetch = globalThis.fetch;
+      let probeCalls = 0;
+      globalThis.fetch = async (url) => {
+        if (String(url).includes("/getMe")) {
+          probeCalls++;
+          return { ok: true, json: async () => ({ ok: true }) };
+        }
+        return { ok: false };
+      };
+
+      const wakeTask = tgWake.handleWake(15);
+      assert.equal(pollAborted, true, "唤醒时应立即 abort 悬挂的长轮询");
+      await wakeTask;
+      assert.equal(probeCalls, 1, "唤醒后应执行快速网络探测");
+      assert.equal(tgWake.wakePromise, null, "探测结束后 wakePromise 应复位");
+
+      globalThis.fetch = origFetch;
+      tgWake.stopWakeMonitor();
+    }
   }
 
   {

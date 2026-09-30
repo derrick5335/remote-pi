@@ -20,7 +20,7 @@
 
 ## 平台与定位说明
 
-- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessageDraft` 流式草稿实时预览、内联按钮、消息 Reaction 表情状态机、多模态附件解析与可折叠引用块）。
+- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessage` + `editMessageText` 原地消息流式实时呈现、内联按钮、消息 Reaction 表情状态机、多模态附件解析与可折叠引用块）。
 - **运行环境**：
   - **macOS**：提供开箱即用的 `./install.sh` 脚本，将网关注册为 launchd 用户守护进程，配合 `caffeinate` 保持接电状态下常驻防睡眠。
   - **Linux**：支持直接前台运行或由用户编写 systemd 服务常驻。
@@ -30,9 +30,10 @@
 ## 核心特性
 
 - ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
+-  **休眠唤醒秒级自愈**：内置笔记本休眠与唤醒时间漂移检测。在合盖唤醒（开盖）时，毫秒级主动切断挂起的旧长轮询死连接，并在 Wi-Fi 连通的瞬间（1~2 秒内）快速探测并恢复 Telegram 连接，告别 60 秒死等超时。
 - 🔒 **配置与状态严格解耦（12-Factor 原则）**：`config.json` 保持只读；运行期工作区切换（`/cwd`）与最近项目持久化于 `state.json`；Session 目录采用稳定摘要防碰撞。
 - 🎯 **100% 基于 Pi 原生状态与能力**：会话状态、模型列表、上下文统计、参数配置等全部通过 JSON-RPC 严格依赖 Pi 原生提供的数据接口，无私有黑盒或非标准文件桥接。
-- 🌊 **原生流式输出**：优先利用 Telegram 官方流式草稿（`sendMessageDraft`）实时输出思考过程与回复（在聊天界面中自带暂停/停止按钮）；不支持时平滑降级为静音消息编辑。
+- 🌊 **原生流式输出**：通过静音消息创建与原地实时编辑（`sendMessage` + `editMessageText`）呈现思考过程与回复，从根源上杜绝跨接口草稿转换导致的幽灵气泡、残留与重复闪烁。
 - 🛠️ **原生可折叠工具卡片**：Agent 连续调用工具（Bash、读写文件、Grep 等）时，自动生成原生可折叠引用块（`<blockquote expandable>`），保持手机端信息整洁不刷屏。
 - 🎮 **Telegram Companion 扩展**：
   - 自带 `remote-extension.mjs`，向模型提供 `remote_attach`（主动将本地生成的文件/产物发回聊天窗口）与 `remote_ask`（交互按钮问答）两个工具（保持对 `telegram_attach`/`telegram_ask` 的兼容）。

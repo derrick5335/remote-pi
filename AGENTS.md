@@ -21,7 +21,7 @@ Telegram Bot gateway for Pi RPC。Pi 在本仓库工作，通过 Telegram 收发
 
 ## 架构
 
-- `gateway.mjs`：单文件核心，无额外框架（仅依赖 `markdown-it` 用于 Telegram HTML 格式渲染）。轮询 Telegram → RPC 驱动 Pi 子进程；流式草稿（`sendMessageDraft`）不支持时回退静音消息 + 编辑。
+- `gateway.mjs`：单文件核心，无额外框架（仅依赖 `markdown-it` 用于 Telegram HTML 格式渲染）。轮询 Telegram → RPC 驱动 Pi 子进程；流式输出采用静音消息 + 原地编辑（`sendMessage` + `editMessageText`）。
 - `remote-extension.mjs`：Companion extension，给模型提供 `remote_attach`（发文件）和 `remote_ask`（内联按钮提问）两个工具（兼容别名 `telegram_attach`/`telegram_ask`）。可通过配置禁用或添加更多自定义扩展。
 - `install.sh`：安装 launchd 服务，`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - Telegram 命令：`/sh`（直跑 shell）、`/get`（下载文件）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。

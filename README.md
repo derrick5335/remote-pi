@@ -20,7 +20,7 @@
 
 ## Scope & Platform Notice
 
-- **Chat Interface**: **Currently Telegram Only**. The gateway is deeply integrated with the Telegram Bot API (leveraging `sendMessageDraft` streaming previews, inline button keyboards, emoji reaction state machines, expandable blockquotes, and media downloads).
+- **Chat Interface**: **Currently Telegram Only**. The gateway is deeply integrated with the Telegram Bot API (leveraging real-time in-place streaming messages via `sendMessage` + `editMessageText`, inline button keyboards, emoji reaction state machines, expandable blockquotes, and media downloads).
 - **Supported OS**:
   - **macOS**: Provides an out-of-the-box `./install.sh` script to install the gateway as a persistent launchd daemon, paired with `caffeinate` to keep Pi responsive while connected to power without preventing normal sleep.
   - **Linux**: Can be run directly in the foreground or managed via standard systemd user units.
@@ -30,9 +30,10 @@
 ## Key Features
 
 - ⚡ **Lightweight & Minimalist**: Built around a clean, single-file core (`gateway.mjs`) using only the Node.js standard library plus `markdown-it` for Telegram HTML rendering. No heavy frameworks.
+-  **Sleep & Wake Self-Healing**: Automatically detects system sleep/wake drift on laptops. Upon lid opening or wake, immediately aborts stale poll sockets and probes network connectivity, restoring the connection in 1–2 seconds instead of hanging on 60-second socket timeouts.
 - 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspace switches and recent projects are tracked cleanly in `state.json`, and session paths use stable digests to prevent collision.
 - 🎯 **100% Pi-Native**: Driven strictly via Pi's JSON-RPC protocol (`get_state`, `get_session_stats`, `new_session`, etc.). No private hacks, out-of-band files, or intrusive patches.
-- 🌊 **Native Draft Streaming**: Streams thoughts and responses in real time using Telegram's official `sendMessageDraft` API (including an in-app Stop button); automatically falls back to silent message editing when drafts are unsupported.
+- 🌊 **Native Draft Streaming**: Streams thoughts and responses in real time using silent message creation and in-place editing (`sendMessage` + `editMessageText`), eliminating duplicate dialogs, ghost bubbles, and delivery flashes across all clients.
 - 🛠️ **Expandable Tool Cards**: Ongoing tool executions (Bash commands, file read/write, grep) are grouped into native collapsible blockquotes (`<blockquote expandable>`) to keep mobile chat clean and readable.
 - 🎮 **Telegram Companion Extension**:
   - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons; aliases `telegram_attach` / `telegram_ask` retained for compatibility).
