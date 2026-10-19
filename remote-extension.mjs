@@ -3,6 +3,7 @@
 //   remote_attach — deliver local files to the chat
 //   remote_ask    — ask a multiple-choice question with interactive buttons
 import { stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Type } from "typebox";
 
 const ASK_TIMEOUT_MS = 5 * 60_000;
@@ -18,13 +19,14 @@ function registerAttach(pi, name, label, desc, promptSnippet, promptGuidelines) 
       paths: Type.Array(Type.String({ description: "Absolute local file path" }), { minItems: 1, maxItems: 10 }),
     }),
     async execute(_toolCallId, params) {
-      for (const path of params.paths) {
+      const resolvedPaths = params.paths.map((p) => resolve(process.cwd(), p));
+      for (const path of resolvedPaths) {
         const info = await stat(path);
         if (!info.isFile()) throw new Error(`Not a file: ${path}`);
       }
       return {
-        content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s) for delivery.` }],
-        details: { paths: params.paths },
+        content: [{ type: "text", text: `Queued ${resolvedPaths.length} attachment(s) for delivery.` }],
+        details: { paths: resolvedPaths },
       };
     },
   });

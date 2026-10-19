@@ -66,7 +66,7 @@
 | `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
 | `/new` | 开启新会话，重置上下文并以卡片汇报当前模型、环境与工作目录 |
 | `/resume` | 弹出最近历史会话列表供选择恢复，支持浏览并恢复当前目录的桌面端会话 |
-| `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应 |
+| `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应。注意：此处对服务重启/停止命令的拦截仅为误操作防护，并非安全边界 —— 持有 Bot 者本就拥有完整 Shell 权限 |
 | `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
 | `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
@@ -116,6 +116,12 @@ npm install --omit=dev
 ```bash
 npm test
 # 输出 "self-test: ok" 即表示全部核心逻辑正常
+```
+
+Lint（ESLint，仅安全规则）：
+
+```bash
+npm run lint
 ```
 
 ### 3. 创建配置文件
@@ -195,10 +201,11 @@ pi-remote-gateway stop     # 停止后台服务
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
 | `stateDir` | - | `~/.local/var/remote-pi` | 运行时状态、会话文件、下载附件与套接字锁的存放目录 |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
-| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | 非流式 Topic 会话无活动的空闲分钟数，达到后自动停止其 Pi 进程（下次消息自动恢复；主会话永不休眠） |
+| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | 非流式 Topic 会话无活动的空闲分钟数，达到后自动停止其 Pi 进程（下次消息自动恢复；主会话永不休眠）；设为 `0` 完全关闭空闲停止 |
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | 所有会话中允许同时运行的最大 Pi 进程数（超限时自动挂起最近最少使用的非流式 Topic） |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | 超过该长度的回复改为发送 HTML 文档（聊天中保留首段预览与提示）；设 `0` 关闭 |
+| `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | 下载目录内文件与 `failed-reply-*.txt` 副本的保留天数（启动时及每 24 小时按 mtime 清理）；设 `0` 关闭清理 |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送带通知的运行摘要与变更卡片（含 Diff/Commit/Undo 按钮） |
 | `statusBoard` | `REMOTE_PI_STATUS_BOARD` | `true` | 是否为每个会话维护并置顶状态看板（节流更新状态、工具、模型、上下文与追问） |
@@ -251,13 +258,15 @@ pi-remote-gateway stop     # 停止后台服务
    - 每个 Telegram 会话（主会话及各 Topic）都会在 Herdr 中拥有独立工作区，标签统一为 `📱 <basename>`（或 `📱 <basename>#<threadId>`）。
    - 网关直接通过 socket（source `remote-pi`）向 Herdr 实时汇报状态（`working`、`idle`，或包含提问标题的 `blocked` 待确认状态），在 `herdr agent list` 中与本地 agent 一同展示。
    - 对应窗格内启动紧凑 ANSI 观察器（`gateway.mjs --watch-session`），实时滚动展示只读会话日志（用户指令、模型回答、工具调用及报错、上下文压缩等）。
-2. **桌面 Pi Agent 状态推送（按 agent 手动开启）**：
-   - 在桌面端跑其他 Pi agent 时，可在该 Pi 中输入 `/remote-pi`（或 `/remote-pi on|off|status`）开启推送通知。
+2. **桌面 Pi 远程控制 Topic 联动（按 agent 手动开启）**：
+   - 在桌面端跑其他 Pi agent 时，开启远程控制可将该 agent 桥接到**专属 Telegram Topic**。在桌面 Pi 中输入 `/remote-control`（或 `/remote-control on|off|status`；兼容老命令别名 `/remote-pi`）开启。
+   - **前置要求**：Telegram 需为该 Bot 开启 Threaded Mode / 话题模式（在 @BotFather Mini App 中设置：Bot Settings → Threads Settings → Threaded Mode）。若未开启话题模式，通知将自动降级回退至主会话。
    - `install.sh`（以及 `pi-remote-gateway upgrade`）会把 `herdr-extension.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`。
    - 开关作为 Herdr 原生 pane metadata token（`remote_pi=on`）存在 pane 上，Pi 退出时自动清除。
-   - `/agents` 列出 Herdr 中所有 agent：`📱` 标出 Telegram 会话，`📡` 标出已开启推送的桌面 agent。
-   - **需要确认**（`blocked`）：推送屏幕末尾内容，附带识别出的编号选项按钮（`1. Yes`、`2. …`）以及 `⏎ Enter` / `⎋ Esc`。
-   - **完成**（`working → done/idle`）：推送输出末尾内容。直接**回复**任意一条通知，即可给该 agent 发送新指令。
+   - **实时会话流式同步**：桌面 Pi 的会话内容按消息粒度实时流式推送到该 Topic（包含用户消息、模型回复文本及超长文档导出、工具调用原地更新折叠面板；忽略模型思考过程与原始工具执行结果）。
+   - **双向交互与控制**：在 Topic 内直接发送普通文本即可给桌面 agent 发送新指令（具备回声抑制，避免重复输出）；`/status` 查看当前 agent 状态与终端屏幕，`/abort` 发送 `Esc` 中断当前任务。
+   - **需要确认**（`blocked`）：推送屏幕末尾内容，附带识别出的编号选项按钮（`1. Yes`、`2. …`）以及 `⏎ Enter` / `⎋ Esc`。`blocked` 状态带有通知提示，`done` 完成通知则静音推送。
+   - `/agents` 列出 Herdr 中所有 agent：`📱` 标出 Telegram 会话，`📡` 标出已桥接远程控制的桌面 agent。
 
 ### 手机 ↔ 桌面端会话无缝流转 (Handoff)
 

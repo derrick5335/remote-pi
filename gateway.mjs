@@ -5,10 +5,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import MarkdownIt from "markdown-it";
@@ -16,6 +17,7 @@ import MarkdownIt from "markdown-it";
 const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 let HERDR_DISABLED_FOR_TEST = false;
+let stateWriteCounter = 0;
 const HELP = `Remote Pi
 
 Just send text to chat with Pi; messages sent while it is working act as steering.
@@ -209,23 +211,27 @@ rules.hr = () => "─ ─ ─\n\n";
 
 const rawRender = md.renderer.render.bind(md.renderer);
 md.renderer.render = (tokens, options, env) => {
-  const out = rawRender(tokens, options, env)
-    .replaceAll("<strong>", "<b>").replaceAll("</strong>", "</b>")
-    .replaceAll("<em>", "<i>").replaceAll("</em>", "</i>")
-    .replaceAll("\n</blockquote>", "</blockquote>")
-    // Telegram 无 <table>：拆成手机友好的标题行 + bullet 行（保留单元格内行内标记）
-    .replace(/<table>[\s\S]*?<\/table>/g, (m) => {
-      const rows = m.match(/<tr>[\s\S]*?<\/tr>/g) || [];
-      const cells = rows
-        .map((r) => (r.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/g) || [])
-          .map((c) => c.replace(/<\/?t[hd][^>]*>/g, "").trim()));
-      const body = cells.filter((cs) => !cs.every((c) => !c || /^:?-+:?$/.test(c.replace(/<[^>]+>/g, ""))));
-      if (body.length < 2) return m;
-      const [head, ...data] = body;
-      return [`<b>${head.join(" · ")}</b>`, ...data.map((r) => `• ${r.join(" — ")}`)].join("\n") + "\n\n";
-    });
   listStack = [];
-  return out.replace(/\n{3,}/g, "\n\n").trim();
+  try {
+    const out = rawRender(tokens, options, env)
+      .replaceAll("<strong>", "<b>").replaceAll("</strong>", "</b>")
+      .replaceAll("<em>", "<i>").replaceAll("</em>", "</i>")
+      .replaceAll("\n</blockquote>", "</blockquote>")
+      // Telegram 无 <table>：拆成手机友好的标题行 + bullet 行（保留单元格内行内标记）
+      .replace(/<table>[\s\S]*?<\/table>/g, (m) => {
+        const rows = m.match(/<tr>[\s\S]*?<\/tr>/g) || [];
+        const cells = rows
+          .map((r) => (r.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/g) || [])
+            .map((c) => c.replace(/<\/?t[hd][^>]*>/g, "").trim()));
+        const body = cells.filter((cs) => !cs.every((c) => !c || /^:?-+:?$/.test(c.replace(/<[^>]+>/g, ""))));
+        if (body.length < 2) return m;
+        const [head, ...data] = body;
+        return [`<b>${head.join(" · ")}</b>`, ...data.map((r) => `• ${r.join(" — ")}`)].join("\n") + "\n\n";
+      });
+    return out.replace(/\n{3,}/g, "\n\n").trim();
+  } finally {
+    listStack = [];
+  }
 };
 
 function telegramHtml(text) {
@@ -570,35 +576,34 @@ function formatRunCard({ durationMs, costDelta, tokensDelta, ctxPercent, files }
   return lines.join("\n");
 }
 
+// ref: git-diff docs `-z` / `--numstat` ("pathnames are output verbatim, NUL-terminated"); git-config core.quotePath.
 function parseNumstat(text) {
   if (!text || typeof text !== "string") return [];
-  const lines = text.trim().split("\n");
+  const tokens = text.split("\0");
   const result = [];
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const parts = line.split("\t");
-    if (parts.length < 3) continue;
-    const [addStr, delStr, rawPath] = parts;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token) continue;
+    const tabIdx1 = token.indexOf("\t");
+    if (tabIdx1 === -1) continue;
+    const tabIdx2 = token.indexOf("\t", tabIdx1 + 1);
+    if (tabIdx2 === -1) continue;
+    const addStr = token.slice(0, tabIdx1);
+    const delStr = token.slice(tabIdx1 + 1, tabIdx2);
+    const rest = token.slice(tabIdx2 + 1);
     const binary = addStr === "-" && delStr === "-";
     const added = binary ? 0 : parseInt(addStr, 10) || 0;
     const deleted = binary ? 0 : parseInt(delStr, 10) || 0;
 
-    const unquoted = rawPath.replace(/^"(.*)"$/, "$1");
-    let path = unquoted;
-    let oldPath;
-    if (unquoted.includes(" => ")) {
-      const braceMatch = unquoted.match(/^(.*?)\{(.*?) => (.*?)\}(.*)$/);
-      if (braceMatch) {
-        const [, prefix, oldPart, newPart, suffix] = braceMatch;
-        oldPath = `${prefix}${oldPart}${suffix}`.replace(/\/{2,}/g, "/").replace(/^(\.\/)+/, "").replace(/^\//, "");
-        path = `${prefix}${newPart}${suffix}`.replace(/\/{2,}/g, "/").replace(/^(\.\/)+/, "").replace(/^\//, "");
-      } else {
-        const arrowParts = unquoted.split(" => ");
-        oldPath = arrowParts[0].trim();
-        path = arrowParts[1].trim();
+    if (rest === "") {
+      const oldPath = tokens[++i];
+      const path = tokens[++i];
+      if (oldPath !== undefined && path !== undefined) {
+        result.push({ path, added, deleted, binary, oldPath });
       }
+    } else {
+      result.push({ path: rest, added, deleted, binary });
     }
-    result.push({ path, added, deleted, binary, ...(oldPath !== undefined ? { oldPath } : {}) });
   }
   return result;
 }
@@ -709,6 +714,8 @@ function runStt(sttCommand, audioPath) {
     const child = spawn("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
     let out = "";
     let err = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => (out += chunk));
     child.stderr.on("data", (chunk) => (err += chunk));
     child.on("error", rejectStt);
@@ -741,7 +748,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {}, remoteBridges: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -780,6 +787,18 @@ function loadState(stateDir) {
         }
       }
     }
+    const remoteBridges = {};
+    if (typeof raw.remoteBridges === "object" && raw.remoteBridges !== null) {
+      for (const [paneId, info] of Object.entries(raw.remoteBridges)) {
+        if (typeof paneId === "string" && paneId && typeof info?.threadId === "number" && typeof info?.name === "string") {
+          remoteBridges[paneId] = {
+            threadId: info.threadId,
+            name: info.name,
+            ...(typeof info.sessionFile === "string" ? { sessionFile: info.sessionFile } : {}),
+          };
+        }
+      }
+    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
@@ -789,9 +808,10 @@ function loadState(stateDir) {
       handoffs,
       statusBoards,
       herdrPanes,
+      remoteBridges,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {} };
+    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {}, remoteBridges: {} };
   }
 }
 
@@ -934,6 +954,16 @@ function resolvePiBin(configured) {
   return "pi";
 }
 
+function parseNumberConfig(envVal, fileVal, defaultVal, { min, integer = false } = {}) {
+  const raw = envVal !== undefined ? envVal : fileVal;
+  if (raw === undefined || raw === null || raw === "") return defaultVal;
+  const num = Number(raw);
+  if (!Number.isFinite(num)) return defaultVal;
+  if (integer && !Number.isInteger(num)) return defaultVal;
+  if (min !== undefined && num < min) return defaultVal;
+  return num;
+}
+
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
   const configDir = dirname(path);
@@ -1022,9 +1052,10 @@ function loadConfig() {
     extensions,
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
-    idleStopMinutes: Number(process.env.REMOTE_PI_IDLE_STOP_MINUTES || file.idleStopMinutes || 30),
-    maxSessions: Number(process.env.REMOTE_PI_MAX_SESSIONS || file.maxSessions || 4),
-    longReplyChars: Number.isNaN(longReplyChars) ? 8000 : longReplyChars,
+    idleStopMinutes: parseNumberConfig(process.env.REMOTE_PI_IDLE_STOP_MINUTES, file.idleStopMinutes, 30, { min: 0 }),
+    maxSessions: parseNumberConfig(process.env.REMOTE_PI_MAX_SESSIONS, file.maxSessions, 4, { min: 1, integer: true }),
+    downloadRetentionDays: parseNumberConfig(process.env.REMOTE_PI_DOWNLOAD_RETENTION_DAYS, file.downloadRetentionDays, 30, { min: 0 }),
+    longReplyChars: parseNumberConfig(process.env.REMOTE_PI_LONG_REPLY_CHARS, file.longReplyChars, 8000, { min: 0 }),
     fallbackModels,
     doneCard: process.env.REMOTE_PI_DONE_CARD !== undefined
       ? process.env.REMOTE_PI_DONE_CARD !== "false" && process.env.REMOTE_PI_DONE_CARD !== "0"
@@ -1388,6 +1419,8 @@ function runCommand(cmd, args = [], options = {}) {
     const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOptions });
     let stdout = "";
     let stderr = "";
+    cp.stdout?.setEncoding("utf8");
+    cp.stderr?.setEncoding("utf8");
     cp.stdout?.on("data", (d) => { stdout += d; });
     cp.stderr?.on("data", (d) => { stderr += d; });
     const timer = spawnOptions.timeout ? setTimeout(() => {
@@ -1712,6 +1745,94 @@ function renderSessionEntry(entry) {
   }
 }
 
+class SessionTail {
+  constructor(filePath, { onEntries, onLines, interval = 500, startAtEnd = false } = {}) {
+    this.filePath = filePath;
+    this.onEntries = onEntries;
+    this.onLines = onLines;
+    this.interval = interval;
+    this.offset = 0;
+    this.leftover = "";
+    this.decoder = new StringDecoder("utf8");
+    this.timer = null;
+    this.stopped = false;
+    this.reading = false;
+    this.startAtEnd = startAtEnd;
+  }
+
+  start() {
+    this.stopped = false;
+    this.timer = setInterval(() => this.readNew(), this.interval);
+    this.timer.unref?.();
+    return this;
+  }
+
+  stop() {
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  async readNew() {
+    if (this.reading || this.stopped) return [];
+    this.reading = true;
+    let fh;
+    const resultLines = [];
+    const resultEntries = [];
+    try {
+      let statInfo;
+      try {
+        statInfo = await stat(this.filePath);
+      } catch {
+        return [];
+      }
+      if (this.startAtEnd) {
+        this.offset = statInfo.size;
+        this.startAtEnd = false;
+        return [];
+      }
+      if (statInfo.size < this.offset) {
+        this.offset = 0;
+        this.leftover = "";
+        this.decoder = new StringDecoder("utf8");
+      }
+      if (statInfo.size === this.offset) return [];
+
+      fh = await open(this.filePath, "r");
+      const len = statInfo.size - this.offset;
+      const buf = Buffer.alloc(len);
+      const { bytesRead } = await fh.read(buf, 0, len, this.offset);
+      this.offset += bytesRead;
+      const text = this.leftover + this.decoder.write(buf.subarray(0, bytesRead));
+      const lines = text.split("\n");
+      this.leftover = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        resultLines.push(line);
+        if (this.onEntries) {
+          try {
+            resultEntries.push(JSON.parse(line));
+          } catch {}
+        }
+      }
+      if (resultLines.length && this.onLines) {
+        await this.onLines(resultLines);
+      }
+      if (resultEntries.length && this.onEntries) {
+        await this.onEntries(resultEntries);
+      }
+      return resultLines;
+    } catch {
+      return [];
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+      this.reading = false;
+    }
+  }
+}
+
 async function watchSessionViewer(sessionFile) {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, () => process.exit(0));
@@ -1728,48 +1849,19 @@ async function watchSessionViewer(sessionFile) {
   console.log(`\x1b[2mSession: ${sessionFile}\x1b[0m`);
   console.log("\x1b[2m---\x1b[0m");
 
-  let offset = 0;
-  let leftover = "";
-  async function readNew() {
-    let statInfo;
-    try {
-      statInfo = await stat(sessionFile);
-    } catch {
-      return;
-    }
-    if (statInfo.size < offset) {
-      offset = 0;
-      leftover = "";
-    }
-    if (statInfo.size === offset) return;
-
-    let fh;
-    try {
-      fh = await open(sessionFile, "r");
-      const len = statInfo.size - offset;
-      const buf = Buffer.alloc(len);
-      const { bytesRead } = await fh.read(buf, 0, len, offset);
-      offset += bytesRead;
-      const text = leftover + buf.toString("utf8", 0, bytesRead);
-      const lines = text.split("\n");
-      leftover = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line);
-          const rendered = renderSessionEntry(entry);
-          if (rendered) console.log(rendered);
-        } catch {}
+  const tail = new SessionTail(sessionFile, {
+    interval: 500,
+    onEntries: (entries) => {
+      for (const entry of entries) {
+        const rendered = renderSessionEntry(entry);
+        if (rendered) console.log(rendered);
       }
-    } catch {} finally {
-      if (fh) await fh.close().catch(() => {});
-    }
-  }
-
-  await readNew();
+    },
+  });
+  await tail.readNew();
+  tail.start();
   while (true) {
-    await sleep(250);
-    await readNew();
+    await sleep(60_000);
   }
 }
 
@@ -1788,11 +1880,143 @@ function herdrChoices(screen) {
   return choices.length >= 2 ? choices : [];
 }
 
-// /remote-pi（herdr-remote-extension.ts）通过 herdr 原生 pane metadata token 标记订阅
+// /remote-control（herdr-extension.ts，兼容 /remote-pi）通过 herdr 原生 pane metadata token 标记订阅
 const HERDR_OPT_IN_TOKEN = "remote_pi";
 
 function herdrOptedIn(agent) {
   return agent?.agent === "pi" && agent?.tokens?.[HERDR_OPT_IN_TOKEN] === "on";
+}
+
+function isTopicGoneError(error) {
+  const msg = String(error?.message || error || "").toLowerCase();
+  return msg.includes("message thread not found") || msg.includes("topic_deleted") || msg.includes("thread not found");
+}
+
+// ref: Herdr pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
+function resolveAgentSessionFile(agent) {
+  if (agent?.agent_session?.kind === "path" && agent?.agent_session?.value) {
+    return agent.agent_session.value;
+  }
+  if (typeof agent?.agent_session?.path === "string") {
+    return agent.agent_session.path;
+  }
+  if (typeof agent?.agent_session === "string") {
+    return agent.agent_session;
+  }
+  return agent?.tokens?.remote_pi_session || null;
+}
+
+async function getLastAssistantReply(sessionFile) {
+  let fh;
+  try {
+    const fileStat = await stat(sessionFile);
+    const totalSize = fileStat.size;
+    if (totalSize === 0) return null;
+
+    fh = await open(sessionFile, "r");
+    const CHUNK_SIZE = 256 * 1024;
+    const MAX_READ = 4 * 1024 * 1024;
+    let readSize = Math.min(CHUNK_SIZE, totalSize);
+
+    while (readSize <= totalSize) {
+      const position = totalSize - readSize;
+      const buf = Buffer.alloc(readSize);
+      const { bytesRead } = await fh.read(buf, 0, readSize, position);
+      let text = buf.toString("utf8", 0, bytesRead);
+      if (position > 0) {
+        const firstNewline = text.indexOf("\n");
+        if (firstNewline >= 0) text = text.slice(firstNewline + 1);
+      }
+      const lines = text.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry?.type === "message" && entry.message?.role === "assistant") {
+            const msgContent = entry.message.content;
+            if (typeof msgContent === "string" && msgContent.trim()) {
+              return msgContent.trim();
+            }
+            if (Array.isArray(msgContent)) {
+              const textParts = msgContent.filter((b) => b.type === "text" && b.text?.trim()).map((b) => b.text.trim());
+              if (textParts.length) return textParts.join("\n");
+            }
+          }
+        } catch {}
+      }
+      if (position === 0 || readSize >= MAX_READ) break;
+      readSize = Math.min(readSize * 2, MAX_READ, totalSize);
+    }
+  } catch {} finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+  return null;
+}
+
+function mapBridgeEntries(entries, { isEcho = () => false } = {}) {
+  const result = [];
+  let pendingTools = [];
+
+  function flushTools() {
+    if (!pendingTools.length) return;
+    result.push({
+      type: "tool_panel",
+      tools: [...pendingTools],
+      text: renderToolPanel(pendingTools, true),
+    });
+    pendingTools = [];
+  }
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "compaction") {
+      flushTools();
+      result.push({ type: "compaction", text: "🗜 Compacted" });
+      continue;
+    }
+    if (entry.type !== "message" || !entry.message) continue;
+    const msg = entry.message;
+    if (msg.role === "user") {
+      flushTools();
+      const rawText = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.map((c) => (c.type === "text" ? c.text : "")).filter(Boolean).join(" ")
+          : "";
+      if (rawText && !isEcho(rawText)) {
+        result.push({ type: "user", text: `👤 ${rawText.trim().slice(0, 500)}` });
+      }
+      continue;
+    }
+    if (msg.role === "assistant") {
+      if (typeof msg.content === "string") {
+        if (msg.content.trim()) {
+          flushTools();
+          result.push({ type: "assistant", text: msg.content.trim() });
+        }
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "toolCall") {
+            pendingTools.push({
+              name: block.name,
+              args: block.args,
+              summary: toolSummary(block.name, block.args),
+              status: "done",
+            });
+          } else if (block.type === "text" && block.text?.trim()) {
+            flushTools();
+            result.push({ type: "assistant", text: block.text.trim() });
+          }
+          // block.type === "thinking" is ignored
+        }
+      }
+      continue;
+    }
+    // msg.role === "toolResult" is ignored
+  }
+  flushTools();
+  return result;
 }
 
 function herdrTail(screen, maxLines = 30, maxChars = 2500) {
@@ -1801,16 +2025,18 @@ function herdrTail(screen, maxLines = 30, maxChars = 2500) {
 }
 
 // ref: Herdr socket API events.subscribe（`herdr api schema --json`；订阅后连接变为单向事件流，订阅集合变化需重连）
-// 推送负责实时性，每分钟 agent list 全量对账兜底（漏事件、herdr 重启、合盖睡眠）
+// 推送负责实时性，每 15 秒 agent list 全量对账兜底（漏事件、herdr 重启、合盖睡眠）
 class HerdrWatcher {
-  constructor({ bin, socketPath, isExcluded, onTransition }) {
+  constructor({ bin, socketPath, isExcluded, onTransition, onOptInChange }) {
     this.bin = bin;
     this.socketPath = socketPath;
     this.isExcluded = isExcluded;
     this.onTransition = onTransition;
+    this.onOptInChange = onOptInChange;
     this.statuses = new Map();
     this.agents = new Map();
     this.workspaces = new Map();
+    this.optedInPanes = new Map();
     this.socket = null;
     this.subscribedKey = null;
     this.syncChain = Promise.resolve();
@@ -1831,7 +2057,7 @@ class HerdrWatcher {
     this.stopped = false;
     if (HERDR_DISABLED_FOR_TEST) return;
     this.sync();
-    this.reconcileTimer = setInterval(() => this.sync(), 60_000);
+    this.reconcileTimer = setInterval(() => this.sync(), 15_000);
     this.reconcileTimer.unref?.();
   }
 
@@ -1860,6 +2086,45 @@ class HerdrWatcher {
     return this.syncChain;
   }
 
+  computeOptInDiff(agents) {
+    const currentOptedIn = new Map();
+    for (const agent of agents) {
+      if (!this.isExcluded(agent.pane_id) && herdrOptedIn(agent)) {
+        currentOptedIn.set(agent.pane_id, agent);
+      }
+    }
+    const added = [];
+    const removed = [];
+    const updated = [];
+    for (const [paneId, agent] of currentOptedIn) {
+      const prev = this.optedInPanes.get(paneId);
+      const sessionFile = resolveAgentSessionFile(agent);
+      if (!prev) {
+        added.push(agent);
+      } else if (prev.sessionFile !== sessionFile) {
+        updated.push(agent);
+      }
+    }
+    for (const paneId of this.optedInPanes.keys()) {
+      if (!currentOptedIn.has(paneId)) {
+        removed.push(paneId);
+      }
+    }
+    for (const paneId of removed) this.optedInPanes.delete(paneId);
+    for (const agent of added) {
+      this.optedInPanes.set(agent.pane_id, { agent, sessionFile: resolveAgentSessionFile(agent) });
+    }
+    for (const agent of updated) {
+      this.optedInPanes.set(agent.pane_id, { agent, sessionFile: resolveAgentSessionFile(agent) });
+    }
+    for (const [paneId, agent] of currentOptedIn) {
+      if (this.optedInPanes.has(paneId)) {
+        this.optedInPanes.get(paneId).agent = agent;
+      }
+    }
+    return { added, removed, updated };
+  }
+
   async doSync() {
     if (this.stopped) return;
     const [agentList, workspaceList] = await Promise.all([this.cliJson(["agent", "list"]), this.cliJson(["workspace", "list"])]);
@@ -1868,6 +2133,15 @@ class HerdrWatcher {
     this.agents = new Map(agents.map((a) => [a.pane_id, a]));
     for (const agent of agents) this.observe(agent.pane_id, agent.agent_status);
     for (const paneId of this.statuses.keys()) if (!this.agents.has(paneId)) this.statuses.delete(paneId);
+    const diff = this.computeOptInDiff(agents);
+    if (diff.added.length || diff.removed.length || diff.updated.length) {
+      const failed = await this.onOptInChange?.(diff);
+      if (Array.isArray(failed)) {
+        for (const paneId of failed) {
+          this.optedInPanes.delete(paneId);
+        }
+      }
+    }
     const paneIds = [...this.agents.keys()].sort();
     if (paneIds.join(",") !== this.subscribedKey || !this.socket) this.subscribe(paneIds);
   }
@@ -1881,7 +2155,7 @@ class HerdrWatcher {
     if (status === "blocked" || finished) this.notify(paneId, status === "blocked" ? "blocked" : "done");
   }
 
-  // 只推送在 Pi 里执行过 /remote-pi 的 pane：现取 agent get，以 pane 上的 remote_pi token 为准（默认不推送）
+  // 只推送在 Pi 里开启 /remote-control 的 pane：现取 agent get，以 pane 上的 remote_pi token 为准（默认不推送）
   async notify(paneId, status) {
     try {
       const agent = (await this.cliJson(["agent", "get", paneId]))?.agent;
@@ -1889,6 +2163,7 @@ class HerdrWatcher {
       this.agents.set(paneId, agent);
       if (!herdrOptedIn(agent)) return;
       await this.onTransition({ paneId, status, agent });
+      this.sync();
     } catch (error) {
       console.warn(`${new Date().toISOString()} [herdr] notify ${paneId} failed: ${error.message}`);
     }
@@ -1899,6 +2174,7 @@ class HerdrWatcher {
     if (HERDR_DISABLED_FOR_TEST || !this.socketPath) return;
     this.subscribedKey = paneIds.join(",");
     const socket = net.connect(this.socketPath);
+    socket.setEncoding("utf8");
     this.socket = socket;
     let buffer = "";
     socket.on("connect", () => {
@@ -2133,6 +2409,13 @@ class PiRpc {
       const proc = this.proc;
       this.proc = null;
       proc.kill("SIGTERM");
+      const killTimer = setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          try { proc.kill("SIGKILL"); } catch {}
+        }
+      }, 5000);
+      killTimer.unref?.();
+      proc.once("exit", () => clearTimeout(killTimer));
     }
   }
 }
@@ -2574,6 +2857,7 @@ class ChatSession {
         } finally {
           this.stopTyping();
         }
+        return;
       }
       case "export": {
         const result = await this.pi.request("export_html");
@@ -2600,6 +2884,7 @@ class ChatSession {
         } finally {
           this.stopTyping();
         }
+        return;
       }
       case "get": {
         if (!argument) return this.send("Usage: /get <path>");
@@ -2639,6 +2924,8 @@ class ChatSession {
         const res = await new Promise((done) => {
           const child = spawn("bash", [script, "upgrade", "--no-restart"], { timeout: 300_000 });
           let buf = "";
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
           child.stdout.on("data", (c) => { buf += c; });
           child.stderr.on("data", (c) => { buf += c; });
           child.on("close", (code) => done({ code, buf }));
@@ -2773,9 +3060,8 @@ class ChatSession {
   }
 
   async switchCwd(path, callbackId) {
-    const reply = callbackId
-      ? (text) => this.gateway.telegram.answer(callbackId, text)
-      : (text) => this.send(text);
+    // callback 场景已在 handleCallback 提前 answer，不再二次 answer；文本一律走聊天消息
+    const reply = (text) => this.send(text);
     let target, targetStat;
     try {
       target = await realpath(path);
@@ -2812,7 +3098,6 @@ class ChatSession {
       }).catch(() => {});
     }
 
-    await reply("Switching");
     await this.send(`✅ Working directory switched to:\n${target}\n\nHot-restarting Pi…`);
     const oldPaneId = this.gateway.state.herdrPanes?.[this.key] || this.pi?.herdrEnv?.HERDR_PANE_ID;
     const oldWsId = this.pi?.herdrEnv?.HERDR_WORKSPACE_ID;
@@ -3120,12 +3405,16 @@ class ChatSession {
   topicSummaryLines() {
     if (this.threadId !== null) return [];
     const topicSessions = [...this.gateway.sessions.values()].filter((s) => s.threadId !== null);
-    if (!topicSessions.length) return ["", "Topics: (none)"];
+    const bridges = Object.entries(this.gateway.state.remoteBridges || {});
+    if (!topicSessions.length && !bridges.length) return ["", "Topics: (none)"];
     const lines = ["", "Topics:"];
     for (const ts of topicSessions) {
       const status = ts.handoff ? "handed off" : ts.isStreaming ? "running" : ts.pi?.proc ? "idle" : "stopped";
       const name = basename(ts.cwd) || `topic-${ts.threadId}`;
       lines.push(`• ${name} (${status}) — ${ts.cwd}`);
+    }
+    for (const [paneId, bridge] of bridges) {
+      lines.push(`• 📡 ${bridge.name || paneId} (remote-control) — ${paneId}`);
     }
     return lines;
   }
@@ -3231,7 +3520,6 @@ class ChatSession {
     } else if (action.type === "cwd") {
       await this.switchCwd(action.path, callback.id);
     } else if (action.type === "run_diff") {
-      await this.gateway.telegram.answer(callback.id, "Generating diff…");
       const gitDir = action.toplevel || this.cwd;
       let diff = "";
       if (action.snap) {
@@ -3262,15 +3550,13 @@ class ChatSession {
         await this.sendDocument(diffPath);
       }
     } else if (action.type === "run_commit") {
-      await this.gateway.telegram.answer(callback.id, "Committing changes…");
       await this.prompt("Review the current uncommitted changes (git status / git diff) and commit them with a concise conventional commit message. Do not push.");
     } else if (action.type === "run_undo") {
       if (this.isStreaming) {
-        await this.gateway.telegram.answer(callback.id, "Cannot undo while running.");
+        await this.send("Cannot undo while running.");
         return;
       }
       if (action.confirmed === undefined) {
-        await this.gateway.telegram.answer(callback.id);
         const keyboard = {
           reply_markup: {
             inline_keyboard: [
@@ -3288,14 +3574,12 @@ class ChatSession {
         if (callback.message) {
           await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, "Undo cancelled.").catch(() => {});
         }
-        await this.gateway.telegram.answer(callback.id, "Cancelled");
         return;
       }
       if (action.confirmed === true) {
         if (callback.message) {
           await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, "Undoing run changes…").catch(() => {});
         }
-        await this.gateway.telegram.answer(callback.id, "Undoing…");
         const gitDir = action.toplevel || this.cwd;
         const restoredTracked = [];
         if (action.snap && action.trackedFiles?.length) {
@@ -3494,7 +3778,9 @@ class ChatSession {
       this.currentToolSummary = runningTool ? runningTool.summary : null;
       this.scheduleStatusBoardUpdate();
       if ((event.toolName === "remote_attach" || event.toolName === "telegram_attach") && !event.isError) {
-        const paths = event.result?.details?.paths || event.args?.paths || [];
+        // 扩展返回的 details.paths 已解析为绝对路径；旧版扩展回退 args.paths 时按会话 cwd 解析
+        const rawPaths = event.result?.details?.paths || event.args?.paths || [];
+        const paths = event.result?.details?.paths ? rawPaths : rawPaths.map((p) => resolve(this.cwd, p));
         for (const path of paths) {
           this.gateway.queueUpload(async () => {
             try { await this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra()); }
@@ -3787,8 +4073,8 @@ class ChatSession {
             }
             if (!snap) return null;
 
-            const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
-            const untracked = new Set(untrackedRaw.trim().split("\n").filter(Boolean));
+            const untrackedRaw = await runCommand("git", ["ls-files", "-z", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+            const untracked = new Set(untrackedRaw.split("\0").filter(Boolean));
             return { snap, toplevel, untracked };
           } catch {
             return null;
@@ -3844,12 +4130,13 @@ class ChatSession {
 
       if (snap && toplevel) {
         try {
-          const numstatRaw = await runCommand("git", ["diff", "--numstat", snap], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+          // ref: git diff -z 输出 NUL 分隔的 verbatim 路径，中文路径不再被 core.quotePath 八进制转义
+          const numstatRaw = await runCommand("git", ["diff", "-z", "--numstat", snap], { cwd: toplevel, timeout: 5000 }).catch(() => "");
           const parsedTracked = parseNumstat(numstatRaw);
           trackedFilesChanged = parsedTracked.map((f) => f.path);
 
-          const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
-          const currentUntracked = untrackedRaw.trim().split("\n").filter(Boolean);
+          const untrackedRaw = await runCommand("git", ["ls-files", "-z", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+          const currentUntracked = untrackedRaw.split("\0").filter(Boolean);
           const startUntracked = snapshot.git.untracked || new Set();
           newUntrackedFiles = currentUntracked.filter((f) => !startUntracked.has(f));
 
@@ -3926,13 +4213,23 @@ class Gateway {
     this.als = new AsyncLocalStorage();
     this.telegramChain = Promise.resolve();
     this.uploadChain = Promise.resolve();
+    this.stateWriteChain = Promise.resolve();
+    this.bridgeChains = new Map();
+    this.downloadCleanupTimer = null;
     this.herdrWatcher = null;
     this.herdrMessages = new Map();
+    this.activeBridges = new Map();
+    this.bridgeOutbound = new Map();
+    this.state.remoteBridges = this.state.remoteBridges || {};
     this.idleTimer = null;
 
     const origSend = this.telegram.send.bind(this.telegram);
     this.telegram.send = (chatId, text, extra = {}) =>
       this.queueTelegram(() => origSend(chatId, text, extra));
+
+    const origSendOne = this.telegram.sendOne.bind(this.telegram);
+    this.telegram.sendOne = (chatId, text, extra = {}) =>
+      this.queueTelegram(() => origSendOne(chatId, text, extra));
 
     const origEdit = this.telegram.edit.bind(this.telegram);
     this.telegram.edit = (chatId, messageId, text, ephemeral = false) =>
@@ -4005,7 +4302,8 @@ class Gateway {
   }
 
   checkIdleSessions() {
-    const maxIdleMs = (this.config.idleStopMinutes || 30) * 60_000;
+    const maxIdleMs = this.config.idleStopMinutes * 60_000;
+    if (maxIdleMs <= 0) return; // 0 = 永不空闲停止
     const now = Date.now();
     for (const session of this.sessions.values()) {
       if (session.threadId === null) continue; // 主会话永不空闲停止
@@ -4052,6 +4350,9 @@ class Gateway {
     await this.registerBotCommands();
     this.startHerdrWatcher();
     this.startIdleStopTimer();
+    this.cleanupDownloads();
+    this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000);
+    this.downloadCleanupTimer.unref?.();
     const sessionInfo = this.mainSession.handoff ? "handed off" : (state?.sessionId ? `session ${state.sessionId}` : "ready");
     console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi ${sessionInfo}`);
     await this.telegram.poll((update) => this.dispatchUpdate(update));
@@ -4083,11 +4384,60 @@ class Gateway {
     return next;
   }
 
+  // 下载目录与 failed-reply 副本按 mtime 定期清理；0 天即关闭
+  async cleanupDownloads() {
+    const days = this.config.downloadRetentionDays;
+    if (!days || days <= 0) return;
+    const cutoff = Date.now() - days * 24 * 60 * 60_000;
+    let removed = 0;
+    try {
+      const entries = await readdir(this.config.downloadsDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const path = join(this.config.downloadsDir, entry.name);
+        try {
+          const s = await stat(path);
+          if (s.mtimeMs < cutoff) {
+            await unlink(path).catch(() => {});
+            removed++;
+          }
+        } catch {}
+      }
+      const stateEntries = await readdir(this.config.stateDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of stateEntries) {
+        if (!entry.isFile() || !entry.name.startsWith("failed-reply-")) continue;
+        const path = join(this.config.stateDir, entry.name);
+        try {
+          const s = await stat(path);
+          if (s.mtimeMs < cutoff) {
+            await unlink(path).catch(() => {});
+            removed++;
+          }
+        } catch {}
+      }
+      if (removed > 0) console.log(`${new Date().toISOString()} [cleanup] removed ${removed} expired download(s)/failed-reply file(s)`);
+    } catch (err) {
+      console.warn(`[cleanup] download retention failed: ${err.message}`);
+    }
+  }
+
   isAllowed(from, chat) {
     return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
   }
 
   dispatchUpdate(update) {
+    if (update.message && this.isAllowed(update.message.from, update.message.chat)) {
+      const bridgePaneId = this.bridgePaneIdForMessage(update.message);
+      if (bridgePaneId) {
+        this.chatReady = true;
+        // 每个 pane 独立 promise chain，保证同一 agent 的消息按序送达
+        const next = (this.bridgeChains.get(bridgePaneId) || Promise.resolve())
+          .then(() => this.handleBridgeMessage(bridgePaneId, update.message))
+          .catch((err) => console.error("[bridge] error:", err));
+        this.bridgeChains.set(bridgePaneId, next);
+        return next;
+      }
+    }
     const priority = getUpdatePriority(update);
     if (priority === "p0" || priority === "p1") {
       const p = this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
@@ -4331,13 +4681,19 @@ class Gateway {
   async saveState(patch) {
     this.state = { ...this.state, ...patch };
     const statePath = join(this.config.stateDir, "state.json");
-    const tempPath = `${statePath}.tmp.${Date.now()}`;
-    try {
-      await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
-      await rename(tempPath, statePath);
-    } catch (err) {
-      console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
-    }
+    // 串行化写入：并发 saveState 共享 tmp 路径会 ENOENT，且可能乱序完成
+    const write = async () => {
+      const tempPath = `${statePath}.${process.pid}.${++stateWriteCounter}.tmp`;
+      try {
+        await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+        await rename(tempPath, statePath);
+      } catch (err) {
+        console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
+      }
+    };
+    const next = this.stateWriteChain.then(write, write);
+    this.stateWriteChain = next;
+    return next;
   }
 
   action(payload, ttl = 10 * 60_000) {
@@ -4359,6 +4715,7 @@ class Gateway {
       // 网关自身的所有 Pi 均已在对应的对话/Topic 内流式输出，从推送中排除
       isExcluded: (paneId) => [...this.sessions.values()].some((s) => s.pi?.herdrEnv?.HERDR_PANE_ID === paneId),
       onTransition: ({ paneId, status, agent }) => this.sendHerdrAgent(paneId, status, agent),
+      onOptInChange: (diff) => this.handleOptInChange(diff),
     });
     this.herdrWatcher.start();
   }
@@ -4388,10 +4745,339 @@ class Gateway {
       rows.push([keyButton("⏎ Enter", ["enter"]), keyButton("⎋ Esc", ["esc"])]);
     }
     rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
-    const sent = await this.telegram.send(this.chatId, text, { reply_markup: { inline_keyboard: rows } });
+    const bridge = this.state.remoteBridges?.[paneId];
+    const extra = {
+      reply_markup: { inline_keyboard: rows },
+      ...(bridge?.threadId ? {
+        message_thread_id: bridge.threadId,
+        disable_notification: blocked ? false : true,
+      } : {}),
+    };
+    const sent = await this.telegram.send(this.chatId, text, extra);
     if (sent?.message_id) {
       this.herdrMessages.set(sent.message_id, paneId);
       if (this.herdrMessages.size > 200) this.herdrMessages.delete(this.herdrMessages.keys().next().value);
+    }
+  }
+
+  recordBridgeOutbound(paneId, text) {
+    if (!this.bridgeOutbound.has(paneId)) this.bridgeOutbound.set(paneId, []);
+    const list = this.bridgeOutbound.get(paneId);
+    list.push(text.trim());
+    if (list.length > 50) list.shift();
+  }
+
+  bridgePaneIdForMessage(message) {
+    const key = sessionKeyOf(message);
+    if (!key.startsWith("t:")) return null;
+    const threadId = Number(key.slice(2));
+    for (const [paneId, bridge] of Object.entries(this.state.remoteBridges || {})) {
+      if (bridge?.threadId === threadId) return paneId;
+    }
+    return null;
+  }
+
+  async sendBridgeText(chatId, threadId, text, extra = {}) {
+    const limit = this.config.longReplyChars ?? 8000;
+    if (limit > 0 && text.length > limit) {
+      try {
+        const name = `reply-${formatStamp()}.html`;
+        const path = join(this.config.downloadsDir, name);
+        await writeFile(path, renderReplyHtml(text));
+        const note = `\n\n… (full reply attached, ${text.length} chars)`;
+        const first = chunks(text)[0];
+        const head = (first.length + note.length > MAX_MESSAGE ? first.slice(0, MAX_MESSAGE - note.length) : first) + note;
+        await this.telegram.sendOne(chatId, head, { message_thread_id: threadId, ...extra });
+        await this.telegram.sendDocument(chatId, path, { message_thread_id: threadId });
+        return;
+      } catch (error) {
+        console.error(`[bridge] long reply HTML failed: ${error.message}; falling back to chunks`);
+      }
+    }
+    await this.telegram.send(chatId, text, { message_thread_id: threadId, ...extra });
+  }
+
+  processBridgeEntries(bridge, entries) {
+    bridge.promiseChain = bridge.promiseChain.then(async () => {
+      const items = mapBridgeEntries(entries, {
+        isEcho: (text) => {
+          const list = this.bridgeOutbound.get(bridge.paneId) || [];
+          const idx = list.indexOf(text.trim());
+          if (idx >= 0) {
+            list.splice(idx, 1);
+            return true;
+          }
+          return false;
+        },
+      });
+      for (const item of items) {
+        if (item.type === "tool_panel") {
+          if (bridge.toolPanelMessageId) {
+            bridge.toolPanelTools.push(...item.tools);
+            await this.telegram.edit(this.chatId, bridge.toolPanelMessageId, renderToolPanel(bridge.toolPanelTools, true));
+          } else {
+            bridge.toolPanelTools = [...item.tools];
+            const sent = await this.telegram.sendOne(this.chatId, renderToolPanel(bridge.toolPanelTools, true), {
+              message_thread_id: bridge.threadId,
+              disable_notification: true,
+            });
+            bridge.toolPanelMessageId = sent?.message_id || null;
+          }
+        } else if (item.type === "assistant") {
+          bridge.toolPanelMessageId = null;
+          bridge.toolPanelTools = [];
+          await this.sendBridgeText(this.chatId, bridge.threadId, item.text, { disable_notification: true });
+        } else if (item.type === "user" || item.type === "compaction") {
+          bridge.toolPanelMessageId = null;
+          bridge.toolPanelTools = [];
+          await this.telegram.sendOne(this.chatId, item.text, {
+            message_thread_id: bridge.threadId,
+            disable_notification: true,
+          });
+        }
+      }
+    }).catch((err) => {
+      console.error(`[bridge:${bridge.paneId}] processEntries error:`, err);
+    });
+    return bridge.promiseChain;
+  }
+
+  async handleOptInChange({ added = [], removed = [], updated = [] }) {
+    const failed = [];
+    for (const agent of added) {
+      try {
+        await this.handleBridgeAdded(agent);
+      } catch (err) {
+        console.error(`[bridge] added ${agent.pane_id} failed:`, err);
+        failed.push(agent.pane_id);
+      }
+    }
+    for (const paneId of removed) {
+      try {
+        await this.handleBridgeRemoved(paneId);
+      } catch (err) {
+        console.error(`[bridge] removed ${paneId} failed:`, err);
+      }
+    }
+    for (const agent of updated) {
+      try {
+        await this.handleBridgeUpdated(agent);
+      } catch (err) {
+        console.error(`[bridge] updated ${agent.pane_id} failed:`, err);
+        const b = this.activeBridges.get(agent.pane_id);
+        if (b) {
+          b.tail?.stop();
+          b.tail = null;
+          this.activeBridges.delete(agent.pane_id);
+        }
+        failed.push(agent.pane_id);
+      }
+    }
+    return failed;
+  }
+
+  async handleBridgeAdded(agent) {
+    const paneId = agent.pane_id;
+    if (this.activeBridges.has(paneId)) return;
+    const sessionFile = resolveAgentSessionFile(agent);
+    let storedBridge = this.state.remoteBridges?.[paneId];
+    let threadId = storedBridge?.threadId;
+    let isReused = Boolean(threadId);
+    const prevStoredSession = storedBridge?.sessionFile;
+
+    const agentName = agent.name || agent.agent || "pi";
+    const where = this.herdrWatcher?.workspaces?.get(agent.workspace_id) || (agent.cwd ? basename(agent.cwd) : "");
+    const topicName = `📡 ${agentName}${where ? ` · ${where}` : ""}`.slice(0, 128);
+
+    if (!threadId) {
+      const me = await this.telegram.call("getMe").catch(() => null);
+      if (!me?.has_topics_enabled) {
+        console.warn(`[herdr] Topics not enabled, cannot create bridge topic for ${paneId}; notifications stay in main chat`);
+        return;
+      }
+      const created = await this.telegram.call("createForumTopic", {
+        chat_id: this.chatId,
+        name: topicName,
+      });
+      threadId = created.message_thread_id;
+      this.state.remoteBridges[paneId] = {
+        threadId,
+        name: topicName,
+        ...(sessionFile ? { sessionFile } : {}),
+      };
+      await this.saveState({ remoteBridges: this.state.remoteBridges });
+    } else if (sessionFile && sessionFile !== prevStoredSession) {
+      this.state.remoteBridges[paneId] = {
+        ...this.state.remoteBridges[paneId],
+        sessionFile,
+      };
+      await this.saveState({ remoteBridges: this.state.remoteBridges });
+    }
+
+    const label = this.herdrWatcher?.label(paneId) || paneId;
+    const cwd = agent.cwd || "";
+    const onMessage = `📡 Remote control on — ${label}\n${cwd}\nMessages you send here go to this agent.`;
+
+    try {
+      await this.telegram.sendOne(this.chatId, onMessage, {
+        message_thread_id: threadId,
+        ...(isReused ? { disable_notification: true } : {}),
+      });
+    } catch (err) {
+      if (isReused && isTopicGoneError(err)) {
+        console.warn(`[bridge] Topic #${threadId} for ${paneId} was deleted; recreating fresh topic`);
+        delete this.state.remoteBridges[paneId];
+        await this.saveState({ remoteBridges: this.state.remoteBridges });
+        const created = await this.telegram.call("createForumTopic", {
+          chat_id: this.chatId,
+          name: topicName,
+        });
+        threadId = created.message_thread_id;
+        isReused = false;
+        this.state.remoteBridges[paneId] = {
+          threadId,
+          name: topicName,
+          ...(sessionFile ? { sessionFile } : {}),
+        };
+        await this.saveState({ remoteBridges: this.state.remoteBridges });
+        await this.telegram.sendOne(this.chatId, onMessage, {
+          message_thread_id: threadId,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    if (!sessionFile) {
+      await this.telegram.sendOne(this.chatId, "⚠️ Can't find this agent's session file; only done/needs-confirmation notices will be sent.", {
+        message_thread_id: threadId,
+      });
+    }
+
+    const bridge = {
+      paneId,
+      threadId,
+      sessionFile,
+      toolPanelMessageId: null,
+      toolPanelTools: [],
+      promiseChain: Promise.resolve(),
+      tail: null,
+    };
+    this.activeBridges.set(paneId, bridge);
+
+    if (sessionFile) {
+      const shouldSkipLastReply = isReused && sessionFile === prevStoredSession;
+      if (!shouldSkipLastReply) {
+        const lastReply = await getLastAssistantReply(sessionFile);
+        if (lastReply) {
+          await this.sendBridgeText(this.chatId, threadId, `Last reply:\n${lastReply}`, { disable_notification: true });
+        }
+      }
+      const tail = new SessionTail(sessionFile, {
+        startAtEnd: true,
+        interval: 500,
+        onEntries: (entries) => this.processBridgeEntries(bridge, entries),
+      });
+      bridge.tail = tail;
+      tail.start();
+    }
+  }
+
+  async handleBridgeRemoved(paneId) {
+    const bridge = this.activeBridges.get(paneId);
+    const threadId = this.state.remoteBridges?.[paneId]?.threadId;
+    if (bridge) {
+      bridge.tail?.stop();
+      bridge.tail = null;
+      this.activeBridges.delete(paneId);
+    }
+    if (threadId) {
+      await this.telegram.sendOne(this.chatId, "⏸ Remote control off.", {
+        message_thread_id: threadId,
+      });
+    }
+  }
+
+  async handleBridgeUpdated(agent) {
+    const paneId = agent.pane_id;
+    const threadId = this.state.remoteBridges?.[paneId]?.threadId;
+    const bridge = this.activeBridges.get(paneId);
+    if (!bridge || !threadId) return;
+
+    bridge.tail?.stop();
+    bridge.tail = null;
+    bridge.toolPanelMessageId = null;
+    bridge.toolPanelTools = [];
+
+    const newSession = resolveAgentSessionFile(agent);
+    bridge.sessionFile = newSession;
+    if (this.state.remoteBridges[paneId]) {
+      this.state.remoteBridges[paneId] = {
+        ...this.state.remoteBridges[paneId],
+        ...(newSession ? { sessionFile: newSession } : {}),
+      };
+      await this.saveState({ remoteBridges: this.state.remoteBridges });
+    }
+    if (!newSession) return;
+
+    await this.telegram.sendOne(this.chatId, `🔄 Switched session: ${basename(newSession)}`, {
+      message_thread_id: threadId,
+    });
+    const lastReply = await getLastAssistantReply(newSession);
+    if (lastReply) {
+      await this.sendBridgeText(this.chatId, threadId, `Last reply:\n${lastReply}`, { disable_notification: true });
+    }
+    const tail = new SessionTail(newSession, {
+      startAtEnd: true,
+      interval: 500,
+      onEntries: (entries) => this.processBridgeEntries(bridge, entries),
+    });
+    bridge.tail = tail;
+    tail.start();
+  }
+
+  async handleBridgeMessage(paneId, message) {
+    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+    const watcher = this.herdrWatcher;
+    const threadId = message.message_thread_id;
+    if (!watcher) {
+      return this.telegram.sendOne(this.chatId, "❌ Herdr is not available.", { message_thread_id: threadId });
+    }
+    const agent = (await watcher.cliJson(["agent", "get", paneId]).catch(() => null))?.agent;
+    if (!agent || !herdrOptedIn(agent)) {
+      return this.telegram.sendOne(this.chatId, "❌ This agent is no longer remote-controlled.", { message_thread_id: threadId });
+    }
+
+    const text = (message.text || "").trim();
+    const cmd = parseCommand(text);
+    if (cmd?.name === "status") {
+      return this.sendHerdrAgent(paneId, agent.agent_status, agent);
+    }
+    if (cmd?.name === "abort") {
+      await watcher.cli(["agent", "send-keys", paneId, "esc"]);
+      return this.telegram.sendOne(this.chatId, "⎋ Sent Esc", { message_thread_id: threadId });
+    }
+    if (cmd?.name === "close") {
+      return this.telegram.sendOne(this.chatId, "This topic is bridged to a desktop agent. Turn it off from the desktop agent with /remote-control off.", { message_thread_id: threadId });
+    }
+    if (cmd || text.startsWith("/") || message.photo || message.voice || message.document || !text) {
+      return this.telegram.sendOne(this.chatId, "This topic is bridged to a desktop agent; only text, /status and /abort work here.", { message_thread_id: threadId });
+    }
+
+    this.recordBridgeOutbound(paneId, text);
+    try {
+      if (agent.agent_status === "blocked") {
+        await watcher.cli(["pane", "send-text", paneId, text]);
+        await watcher.cli(["agent", "send-keys", paneId, "enter"]);
+      } else {
+        await watcher.cli(["agent", "prompt", paneId, text]);
+      }
+      return this.telegram.sendOne(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, {
+        message_thread_id: threadId,
+        disable_notification: true,
+      });
+    } catch (error) {
+      return this.telegram.sendOne(this.chatId, `❌ ${error.message}`, { message_thread_id: threadId });
     }
   }
 
@@ -4453,12 +5139,14 @@ class Gateway {
     const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
     const action = this.actions.get(token);
     this.actions.delete(token);
+    // ref: Telegram Bot API answerCallbackQuery — 收到即应答，客户端转圈等待且过晚会 "query is too old"；每个 callback 只 answer 一次
     if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
+    this.telegram.answer(callback.id).catch(() => {});
     try {
       console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
       if (action.type === "herdr_peek") {
         const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
-        if (!agent) return this.telegram.answer(callback.id, "Agent is gone");
+        if (!agent) return this.telegram.send(this.chatId, "Agent is gone");
         await this.sendHerdrAgent(action.paneId, agent.agent_status, agent);
       } else if (action.type === "herdr_keys") {
         for (const [k, v] of this.actions) {
@@ -4471,7 +5159,7 @@ class Gateway {
         if (agent?.agent_status !== "blocked") {
           await removeButtons();
           await this.telegram.send(this.chatId, `⚠️ ${this.herdrWatcher.label(action.paneId)} is no longer waiting (${agent?.agent_status || "gone"}); nothing sent.`);
-          return this.telegram.answer(callback.id, "Not waiting");
+          return;
         }
         await this.herdrWatcher.cli(["agent", "send-keys", action.paneId, ...action.keys]);
         await removeButtons();
@@ -4508,13 +5196,11 @@ class Gateway {
           if (callback.message) {
             await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Topic closed.").catch(() => {});
           }
-          await this.telegram.answer(callback.id, "Topic closed");
           return;
         } else {
           if (callback.message) {
             await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Close cancelled.").catch(() => {});
           }
-          await this.telegram.answer(callback.id, "Cancelled");
           return;
         }
       } else {
@@ -4523,9 +5209,7 @@ class Gateway {
         targetSession.touchActivity();
         await targetSession.handleCallbackAction(action, callback);
       }
-      await this.telegram.answer(callback.id, "Done");
     } catch (error) {
-      await this.telegram.answer(callback.id, "Failed");
       const targetSession = this.sessions.get(action?.sessionKey) || session || this.mainSession;
       await targetSession.send(`❌ ${error.message}`);
     } finally {
@@ -4621,6 +5305,10 @@ class Gateway {
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
+    }
+    if (this.downloadCleanupTimer) {
+      clearInterval(this.downloadCleanupTimer);
+      this.downloadCleanupTimer = null;
     }
     this.telegram?.stopPolling?.();
     this.telegram?.stopWakeMonitor?.();
@@ -5855,7 +6543,7 @@ async function selfTest() {
 
     const token = gwClose.action({ type: "close_topic", threadId: tid, confirmed: true });
     await gwClose.handleCallback({ id: "cb-close", data: token, message: { chat: { id: 1 }, message_id: 10 } });
-    assert.deepEqual(answers, ["Topic closed"], "close_topic 应只回复一次 answerCallbackQuery");
+    assert.deepEqual(answers, [undefined], "close_topic 应只回复一次 answerCallbackQuery");
     assert.equal(gwClose.sessions.has(`t:${tid}`), false);
   }
 
@@ -5909,7 +6597,7 @@ async function selfTest() {
     assert.ok(!redacted.includes("xyz") && !redacted.includes("Bearer b"), "token-style pairs removed");
     assert.ok(redacted.includes("plain line"), "non-secret lines kept");
   }
-  // Phase 2: parseNumstat (handles binary, renames, and normal files)
+  // Phase 2: parseNumstat — 解析 git diff -z --numstat 输出（含二进制、重命名与中文路径）
   {
     assert.deepEqual(parseNumstat(""), []);
     assert.deepEqual(parseNumstat(null), []);
@@ -5917,20 +6605,16 @@ async function selfTest() {
     const raw = [
       "10\t5\tsrc/index.js",
       "-\t-\tassets/logo.png",
-      "3\t1\tsrc/{old.js => new.js}",
-      "0\t0\t{oldDir => newDir}/file.txt",
-      "2\t0\tdir/{ => sub}/b.txt",
-      "1\t1\told.txt => new.txt",
-    ].join("\n");
+      "3\t1\t中文文件.txt",
+      "0\t0\t", // rename: path 字段为空，后两个 NUL 段是 old/new
+    ].join("\0") + "\0old/dir/旧名.txt\u0000new/dir/新名.txt\0";
 
     const parsed = parseNumstat(raw);
-    assert.equal(parsed.length, 6);
+    assert.equal(parsed.length, 4);
     assert.deepEqual(parsed[0], { path: "src/index.js", added: 10, deleted: 5, binary: false });
     assert.deepEqual(parsed[1], { path: "assets/logo.png", added: 0, deleted: 0, binary: true });
-    assert.deepEqual(parsed[2], { path: "src/new.js", oldPath: "src/old.js", added: 3, deleted: 1, binary: false });
-    assert.deepEqual(parsed[3], { path: "newDir/file.txt", oldPath: "oldDir/file.txt", added: 0, deleted: 0, binary: false });
-    assert.deepEqual(parsed[4], { path: "dir/sub/b.txt", oldPath: "dir/b.txt", added: 2, deleted: 0, binary: false });
-    assert.deepEqual(parsed[5], { path: "new.txt", oldPath: "old.txt", added: 1, deleted: 1, binary: false });
+    assert.deepEqual(parsed[2], { path: "中文文件.txt", added: 3, deleted: 1, binary: false });
+    assert.deepEqual(parsed[3], { path: "new/dir/新名.txt", added: 0, deleted: 0, binary: false, oldPath: "old/dir/旧名.txt" });
   }
 
   // Phase 2: formatRunCard
@@ -6135,12 +6819,12 @@ async function selfTest() {
       const newUntrackedFile = join(subDir, "new-sub.txt");
       await writeFile(newUntrackedFile, "hello from subdir\n");
 
-      const diffNumstat = await runCommand("git", ["diff", "--numstat", snapObj.git.snap], { cwd: snapObj.git.toplevel, timeout: 5000 });
+      const diffNumstat = await runCommand("git", ["diff", "-z", "--numstat", snapObj.git.snap], { cwd: snapObj.git.toplevel, timeout: 5000 });
       const parsedTracked = parseNumstat(diffNumstat);
       assert.deepEqual(parsedTracked, [{ path: "packages/sub/tracked.txt", added: 1, deleted: 1, binary: false }]);
 
-      const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: snapObj.git.toplevel, timeout: 5000 });
-      const currentUntracked = untrackedRaw.trim().split("\n").filter(Boolean);
+      const untrackedRaw = await runCommand("git", ["ls-files", "-z", "--others", "--exclude-standard"], { cwd: snapObj.git.toplevel, timeout: 5000 });
+      const currentUntracked = untrackedRaw.split("\0").filter(Boolean);
       const newUntracked = currentUntracked.filter((f) => !snapObj.git.untracked.has(f));
       assert.deepEqual(newUntracked, ["packages/sub/new-sub.txt"]);
 
@@ -6535,6 +7219,406 @@ async function selfTest() {
 
     // unknown type ignored
     assert.equal(renderSessionEntry({ type: "unknown_custom_future_type", foo: "bar" }), "");
+  }
+
+  // 1. SessionTail reads appended lines across partial writes and resets on truncation
+  {
+    const tmpFile = join(tmpdir(), `test-tail-${Date.now()}.jsonl`);
+    await writeFile(tmpFile, '{"line": 1}\n{"li');
+    const readLines = [];
+    const tail = new SessionTail(tmpFile, {
+      interval: 50,
+      onLines: (lines) => readLines.push(...lines),
+    });
+    await tail.readNew();
+    assert.deepEqual(readLines, ['{"line": 1}']);
+
+    // Append partial remainder + line 2
+    await writeFile(tmpFile, 'ne": 2}\n{"line": 3}\n', { flag: "a" });
+    await tail.readNew();
+    assert.deepEqual(readLines, ['{"line": 1}', '{"line": 2}', '{"line": 3}']);
+
+    // Truncate file (size shrink reset)
+    await writeFile(tmpFile, '{"reset": true}\n');
+    await tail.readNew();
+    assert.deepEqual(readLines, ['{"line": 1}', '{"line": 2}', '{"line": 3}', '{"reset": true}']);
+    tail.stop();
+    await unlink(tmpFile).catch(() => {});
+  }
+
+  // 2. Entry→Telegram mapper: user/assistant/toolCall/thinking/toolResult samples produce the expected messages
+  // (thinking & toolResult dropped; tool calls merged into one panel)
+  {
+    const samples = [
+      { type: "message", message: { role: "user", content: "hello world" } },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "internal thoughts" },
+            { type: "toolCall", name: "bash", args: { command: "ls" } },
+          ],
+        },
+      },
+      { type: "message", message: { role: "toolResult", toolName: "bash", content: "file.txt" } },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", name: "read", args: { path: "file.txt" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Here is the file content." },
+          ],
+        },
+      },
+      { type: "compaction" },
+    ];
+    const mapped = mapBridgeEntries(samples);
+    assert.equal(mapped.length, 4);
+    assert.equal(mapped[0].type, "user");
+    assert.equal(mapped[0].text, "👤 hello world");
+    // Tool panel with bash and read merged, thinking and toolResult dropped
+    assert.equal(mapped[1].type, "tool_panel");
+    assert.equal(mapped[1].tools.length, 2);
+    assert.equal(mapped[1].tools[0].name, "bash");
+    assert.equal(mapped[1].tools[1].name, "read");
+    assert.ok(mapped[1].text.includes("bash: ls"));
+    assert.ok(mapped[1].text.includes("read: file.txt"));
+    // Assistant message text
+    assert.equal(mapped[2].type, "assistant");
+    assert.equal(mapped[2].text, "Here is the file content.");
+    // Compaction
+    assert.equal(mapped[3].type, "compaction");
+    assert.equal(mapped[3].text, "🗜 Compacted");
+  }
+
+  // 3. Session-file resolution prefers agent_session.path, falls back to tokens.remote_pi_session
+  {
+    const withKind = {
+      agent_session: { kind: "path", value: "/path/from/kind.jsonl" },
+      tokens: { remote_pi_session: "/path/from/tokens.jsonl" },
+    };
+    assert.equal(resolveAgentSessionFile(withKind), "/path/from/kind.jsonl");
+
+    const withPath = {
+      agent_session: { path: "/path/from/path.jsonl" },
+      tokens: { remote_pi_session: "/path/from/tokens.jsonl" },
+    };
+    assert.equal(resolveAgentSessionFile(withPath), "/path/from/path.jsonl");
+
+    const withTokensOnly = {
+      tokens: { remote_pi_session: "/path/from/tokens.jsonl" },
+    };
+    assert.equal(resolveAgentSessionFile(withTokensOnly), "/path/from/tokens.jsonl");
+
+    assert.equal(resolveAgentSessionFile({}), null);
+  }
+
+  // 4. loadState keeps valid remoteBridges entries and drops malformed ones
+  {
+    const tmpStateDir = join(tmpdir(), `test-bridge-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true });
+    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
+      remoteBridges: {
+        "p1": { threadId: 101, name: "📡 pi · repo", sessionFile: "/path/to/s.jsonl" },
+        "p2": { threadId: "not-a-number", name: "bad" },
+        "p3": { threadId: 103 },
+        "": { threadId: 104, name: "no-key" },
+        "p5": null,
+        "p6": "bad-string",
+      },
+    }));
+    const state = loadState(tmpStateDir);
+    assert.deepEqual(state.remoteBridges, {
+      "p1": { threadId: 101, name: "📡 pi · repo", sessionFile: "/path/to/s.jsonl" },
+    });
+    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 5. Dispatcher: a message in a bridged thread does NOT create a ChatSession and calls the bridge handler;
+  // a message in a normal topic still creates one.
+  {
+    const tmpStateDir = join(tmpdir(), `test-dispatch-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true });
+    const gw = new Gateway({
+      botToken: "fake:token",
+      allowedUserId: "42",
+      stateDir: tmpStateDir,
+      sessionDir: tmpStateDir,
+      cwd: tmpStateDir,
+    });
+    gw.state.remoteBridges = {
+      "pane-bridge": { threadId: 501, name: "📡 test bridge" },
+    };
+    let bridgeHandledPane = null;
+    gw.handleBridgeMessage = async (paneId) => {
+      bridgeHandledPane = paneId;
+    };
+    gw.handleUpdate = async () => {};
+    gw.telegram = {
+      call: async () => ({}),
+      send: async () => ({ message_id: 1 }),
+      sendOne: async () => ({ message_id: 1 }),
+      setReaction: () => {},
+    };
+
+    // Message in bridged topic
+    await gw.dispatchUpdate({
+      message: {
+        message_id: 10,
+        message_thread_id: 501,
+        text: "hello desktop",
+        from: { id: 42 },
+        chat: { type: "private" },
+      },
+    });
+    assert.equal(bridgeHandledPane, "pane-bridge", "bridge handler was called");
+    assert.equal(gw.sessions.has("t:501"), false, "ChatSession must NOT be created for bridged topic");
+
+    // Message in normal unbridged topic
+    await gw.dispatchUpdate({
+      message: {
+        message_id: 11,
+        message_thread_id: 601,
+        text: "normal topic message",
+        from: { id: 42 },
+        chat: { type: "private" },
+      },
+    });
+    assert.equal(gw.sessions.has("t:601"), true, "ChatSession MUST be created for normal topic");
+    await gw.saveState({});
+    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 6. HerdrWatcher opt-in diff produces correct added/removed/updated sets
+  {
+    const watcher = new HerdrWatcher({
+      bin: "herdr",
+      socketPath: "",
+      isExcluded: (id) => id === "w1:p9",
+      onTransition: () => {},
+    });
+
+    const a1 = { pane_id: "p1", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s1.jsonl" } };
+    const a2 = { pane_id: "w1:p9", agent: "pi", tokens: { remote_pi: "on" } }; // excluded
+    const a3 = { pane_id: "p3", agent: "claude", tokens: { remote_pi: "on" } }; // not pi
+
+    const diff1 = watcher.computeOptInDiff([a1, a2, a3]);
+    assert.deepEqual(diff1.added.map((a) => a.pane_id), ["p1"]);
+    assert.deepEqual(diff1.removed, []);
+    assert.deepEqual(diff1.updated, []);
+
+    // Session changed for p1, and p4 added
+    const a1Updated = { pane_id: "p1", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s2.jsonl" } };
+    const a4 = { pane_id: "p4", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s4.jsonl" } };
+    const diff2 = watcher.computeOptInDiff([a1Updated, a4]);
+    assert.deepEqual(diff2.added.map((a) => a.pane_id), ["p4"]);
+    assert.deepEqual(diff2.updated.map((a) => a.pane_id), ["p1"]);
+    assert.deepEqual(diff2.removed, []);
+
+    // p1 opt-out (token removed)
+    const a1Off = { pane_id: "p1", agent: "pi" };
+    const diff3 = watcher.computeOptInDiff([a1Off, a4]);
+    assert.deepEqual(diff3.added, []);
+    assert.deepEqual(diff3.updated, []);
+    assert.deepEqual(diff3.removed, ["p1"]);
+  }
+
+  // 7. Echo suppression: a user entry matching recently forwarded text is skipped
+  {
+    const entries = [
+      { type: "message", message: { role: "user", content: "echo this text" } },
+      { type: "message", message: { role: "user", content: "keep this text" } },
+    ];
+    const mapped = mapBridgeEntries(entries, {
+      isEcho: (text) => text.trim() === "echo this text",
+    });
+    assert.equal(mapped.length, 1);
+    assert.equal(mapped[0].type, "user");
+    assert.equal(mapped[0].text, "👤 keep this text");
+  }
+
+  // 8. isTopicGoneError helper
+  {
+    assert.equal(isTopicGoneError(new Error("Bad Request: message thread not found")), true);
+    assert.equal(isTopicGoneError(new Error("Telegram: TOPIC_DELETED")), true);
+    assert.equal(isTopicGoneError(new Error("thread not found")), true);
+    assert.equal(isTopicGoneError(new Error("Network timeout")), false);
+    assert.equal(isTopicGoneError(null), false);
+  }
+
+  // 9. Failed bridge setup retries: doSync deletes failed paneIds from optedInPanes
+  {
+    const watcher = new HerdrWatcher({
+      bin: "herdr",
+      socketPath: "",
+      isExcluded: () => false,
+      onTransition: () => {},
+    });
+    const a1 = { pane_id: "p_fail", agent: "pi", tokens: { remote_pi: "on" } };
+    const diff = watcher.computeOptInDiff([a1]);
+    assert.deepEqual(diff.added.map((a) => a.pane_id), ["p_fail"]);
+    const failedPanes = ["p_fail"];
+    for (const id of failedPanes) watcher.optedInPanes.delete(id);
+    const diffNext = watcher.computeOptInDiff([a1]);
+    assert.deepEqual(diffNext.added.map((a) => a.pane_id), ["p_fail"]);
+  }
+
+  // 10. Topic recreation on deleted topic error & restart noise suppression
+  {
+    const tmpStateDir = join(tmpdir(), `test-recreate-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true });
+    const gw = new Gateway({
+      botToken: "fake:token",
+      allowedUserId: "42",
+      stateDir: tmpStateDir,
+      sessionDir: tmpStateDir,
+      cwd: tmpStateDir,
+    });
+    gw.state.remoteBridges = {
+      "p_del": { threadId: 999, name: "📡 old", sessionFile: "/old.jsonl" },
+    };
+    let sends = [];
+    gw.telegram = {
+      call: async (method) => {
+        if (method === "createForumTopic") {
+          return { message_thread_id: 1000 };
+        }
+        return { has_topics_enabled: true };
+      },
+      sendOne: async (chatId, text, extra = {}) => {
+        if (extra.message_thread_id === 999) {
+          throw new Error("Bad Request: message thread not found");
+        }
+        sends.push({ text, extra });
+        return { message_id: 1 };
+      },
+      send: async () => ({ message_id: 1 }),
+      setReaction: () => {},
+    };
+    const agent = { pane_id: "p_del", agent: "pi", tokens: { remote_pi: "on" } };
+    await gw.handleBridgeAdded(agent);
+    assert.equal(gw.state.remoteBridges["p_del"].threadId, 1000, "Deleted topic should be replaced with fresh threadId");
+    assert.ok(sends.some((s) => s.extra.message_thread_id === 1000), "Should send on-message to new topic");
+    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 11. Command with bot-suffix in parseCommand
+  {
+    assert.equal(parseCommand("/status@my_bot")?.name, "status");
+    assert.equal(parseCommand("/abort@my_bot")?.name, "abort");
+    assert.equal(parseCommand("/close@my_bot")?.name, "close");
+    assert.equal(parseCommand("/status@my_bot arg")?.argument, "arg");
+  }
+
+  // 12. 回归：/compact、/sh 在 RPC 报 abort 错误时不得 fall-through 到下一个 case
+  {
+    const gwAbort2 = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const sess = gwAbort2.mainSession;
+    let exported = 0;
+    const sent = [];
+    sess.sendDocument = async () => { exported++; return { message_id: 1 }; };
+    sess.send = async (t) => { sent.push(t); return { message_id: 1 }; };
+    sess.pi.request = async (cmd) => {
+      if (cmd === "compact" || cmd === "bash") throw new Error("Pi aborted the current run");
+      if (cmd === "export_html") { exported++; return { path: "/tmp/x.html" }; }
+      return {};
+    };
+    await sess.handleCommand({ name: "compact", argument: "" }, "/compact");
+    assert.equal(exported, 0, "/compact abort 后不得 fall-through 到 /export");
+    await sess.handleCommand({ name: "sh", argument: "echo hi" }, "/sh echo hi");
+    assert.equal(exported, 0, "/sh abort 后不得 fall-through 到 /get 发送附件");
+    assert.ok(!sent.some((t) => t.includes("File missing")), "/sh abort 后不得 fall-through 到 /get");
+  }
+
+  // 13. 回归：并发 saveState 全部成功落盘且最终文件包含全部键
+  {
+    const tmpStateDir = join(tmpdir(), `test-save-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true });
+    const gwSave = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpStateDir });
+    await Promise.all([
+      gwSave.saveState({ cwd: "/a" }),
+      gwSave.saveState({ recentProjects: ["/a"] }),
+      gwSave.saveState({ topics: { 1: { cwd: "/a" } } }),
+      gwSave.saveState({ herdrPanes: { main: "p1" } }),
+      gwSave.saveState({ statusBoards: { main: 5 } }),
+    ]);
+    const final = JSON.parse(readFileSync(join(tmpStateDir, "state.json"), "utf8"));
+    assert.equal(final.cwd, "/a");
+    assert.deepEqual(final.recentProjects, ["/a"]);
+    assert.deepEqual(final.topics, { 1: { cwd: "/a" } });
+    assert.deepEqual(final.herdrPanes, { main: "p1" });
+    assert.deepEqual(final.statusBoards, { main: 5 });
+    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 14. 回归：runCommand 多字节字符跨 chunk 分割不损坏
+  {
+    const out = await runCommand(process.execPath, ["-e", "const b = Buffer.from('中文测试', 'utf8'); process.stdout.write(b.subarray(0, 1)); await new Promise(r => setTimeout(r, 20)); process.stdout.write(b.subarray(1));"]);
+    assert.equal(out, "中文测试");
+  }
+
+  // 15. 回归：数字配置解析 — idleStopMinutes 0 生效、非法 maxSessions 回退默认
+  {
+    assert.equal(parseNumberConfig(undefined, undefined, 30, { min: 0 }), 30);
+    assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
+    assert.equal(parseNumberConfig(undefined, 0, 30, { min: 0 }), 0);
+    assert.equal(parseNumberConfig("abc", undefined, 4, { min: 1, integer: true }), 4);
+    assert.equal(parseNumberConfig(undefined, "abc", 4, { min: 1, integer: true }), 4);
+    assert.equal(parseNumberConfig("2.5", undefined, 4, { min: 1, integer: true }), 4);
+    assert.equal(parseNumberConfig("8", undefined, 4, { min: 1, integer: true }), 8);
+    assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
+    // idleStopMinutes=0 时 checkIdleSessions 不得停任何会话
+    {
+      const gwIdle = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), idleStopMinutes: 0 });
+      let stopped = false;
+      const t = new ChatSession(gwIdle, { threadId: 501, cwd: tmpdir(), sessionDir: join(tmpdir(), "sIdle") });
+      t.stop = () => { stopped = true; };
+      t.lastActiveAt = 0;
+      t.pi = { proc: {} };
+      gwIdle.sessions.set("t:501", t);
+      gwIdle.checkIdleSessions();
+      assert.equal(stopped, false, "idleStopMinutes=0 时不得空闲停止");
+    }
+  }
+
+  // 16. 回归：send 与 sendOne 背靠背投递保序（sendOne 纳入输出队列）
+  {
+    const gwSendOne = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const order = [];
+    gwSendOne.telegram.call = async (method, body = {}) => {
+      if (method === "sendMessage") order.push(body.text);
+      return { message_id: order.length };
+    };
+    const p1 = gwSendOne.telegram.sendOne("1", "first-sendOne");
+    const p2 = gwSendOne.telegram.send("1", "second-send");
+    await Promise.all([p1, p2]);
+    assert.deepEqual(order, ["first-sendOne", "second-send"], "sendOne 应与 send 一样走输出队列且保持顺序");
+  }
+
+  // 16. 回归：getLastAssistantReply 只读尾部且找不到时向头部扩窗
+  {
+    const tmpLast = join(tmpdir(), `test-last-reply-${Date.now()}.jsonl`);
+    const head = [
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi" } }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "早期回复" }] } }),
+    ].join("\n") + "\n";
+    const tail = Array.from({ length: 600 }, (_, i) => JSON.stringify({ type: "message", message: { role: "user", content: `msg ${i}`.padEnd(500, "x") } })).join("\n") + "\n";
+    await writeFile(tmpLast, head + tail);
+    assert.equal(await getLastAssistantReply(tmpLast), "早期回复");
+    // 尾部直接是 assistant 文本时立即返回
+    await writeFile(tmpLast, tail + JSON.stringify({ type: "message", message: { role: "assistant", content: "最新回复" } }) + "\n");
+    assert.equal(await getLastAssistantReply(tmpLast), "最新回复");
+    await unlink(tmpLast).catch(() => {});
   }
 
   console.log("self-test: ok");

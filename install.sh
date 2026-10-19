@@ -108,16 +108,15 @@ install() {
 
     mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
     chmod 700 "$CONFIG_DIR"
-    (umask 077 && cat > "$CONFIG" <<EOF
-{
-  "telegram": {
-    "botToken": "$token",
-    "allowedUserId": "$user_id"
-  },
-  "cwd": "$ROOT"
-}
-EOF
-    )
+    (umask 077 && CFG_TOKEN="$token" CFG_USER_ID="$user_id" CFG_CWD="$ROOT" "$NODE" -e '
+      process.stdout.write(JSON.stringify({
+        telegram: {
+          botToken: process.env.CFG_TOKEN,
+          allowedUserId: process.env.CFG_USER_ID,
+        },
+        cwd: process.env.CFG_CWD,
+      }, null, 2) + "\n");
+    ' > "$CONFIG")
     chmod 600 "$CONFIG"
     install_command
     (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)

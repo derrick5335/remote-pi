@@ -66,7 +66,7 @@
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
 | `/resume` | Show recently saved sessions to resume, with access to desktop Pi sessions in the workspace |
-| `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response) |
+| `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response). Note: the block on service restart/stop commands here is only an accident guard, not a security boundary — the bot holder already has full shell access |
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
 | `/session` or `/status`| Show current session ID, active model, token context usage, and cost |
@@ -116,6 +116,12 @@ Verify parsing, commands, and core logic without connecting to Telegram:
 ```bash
 npm test
 # Outputs "self-test: ok" upon success
+```
+
+Lint (ESLint, safety rules only):
+
+```bash
+npm run lint
 ```
 
 ### 3. Configure
@@ -195,10 +201,11 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |
 | `stateDir` | - | `~/.local/var/remote-pi` | Directory for runtime state, session files, downloads, and lock socket |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | Gateway output log file |
-| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | Inactivity minutes before a non-streaming topic session's Pi process is stopped (restarts on next message; main session never idle-stopped) |
+| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | Inactivity minutes before a non-streaming topic session's Pi process is stopped (restarts on next message; main session never idle-stopped); `0` disables idle-stopping entirely |
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | Maximum concurrently running Pi processes across all sessions (stops least recently active non-streaming topic when limit is reached) |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | Replies longer than this are sent as an HTML document (first chunk stays in chat with a note); `0` disables |
+| `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | Days to keep downloaded files in the state downloads dir and `failed-reply-*.txt` copies (cleaned up on start and every 24h by mtime); `0` disables cleanup |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | Comma-separated `provider/modelId` list offering a "Retry with <model>" button on errors (picks the next entry after the current model, wrapping) |
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | Send a summary and change card with notification and diff/commit/undo buttons at the end of each run |
 | `statusBoard` | `REMOTE_PI_STATUS_BOARD` | `true` | Maintain a pinned status board per session with throttled updates showing status, tool, model, context, and follow-ups |
@@ -251,13 +258,15 @@ When you run [Herdr](https://herdr.dev), the gateway integrates deeply with Herd
    - Each Telegram chat session (main chat and each topic) gets its own dedicated Herdr workspace labeled `📱 <basename>` (or `📱 <basename>#<threadId>`).
    - The gateway reports agent status (`working`, `idle`, `blocked` with the question title) directly to Herdr over its socket (source `remote-pi`), so Telegram sessions appear live in Herdr's agent list (`herdr agent list`).
    - Inside the pane, a compact ANSI viewer (`gateway.mjs --watch-session`) renders a read-only live transcript of the conversation (user messages, assistant text, tool executions, errors, and compactions).
-2. **Desktop Pi Agent Notifications (opt-in per agent)**:
-   - When running other desktop Pi agents in Herdr, the gateway can ping you on Telegram when one of them **finishes** or **needs your confirmation**. Nothing is pushed by default: opt in per agent by typing `/remote-pi` (or `/remote-pi on|off|status`) inside that desktop Pi.
+2. **Desktop Pi Remote Control via Topics (opt-in per agent)**:
+   - When running other desktop Pi agents in Herdr, turning on remote control bridges that agent to its **own Telegram forum topic**. Opt in per agent by typing `/remote-control` (or `/remote-control on|off|status`; `/remote-pi` kept as a deprecated alias) inside that desktop Pi.
+   - **Prerequisite**: Threaded Mode / forum topics must be enabled for your bot in Telegram (via @BotFather Mini App: Bot Settings → Threads Settings → Threaded Mode). If topics are not enabled, notifications fall back to the main chat.
    - `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`.
    - The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits.
-   - `/agents` lists all Herdr agents: `📱` marks Telegram sessions, while `📡` marks desktop agents opted into Telegram push notifications.
-   - **Needs confirmation** (`blocked`): you get the screen tail plus buttons for detected options (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`.
-   - **Finished** (`working → done/idle`): you get the tail of its output. **Reply** to any notification to send that agent a prompt.
+   - **Live Streaming**: The pane's Pi conversation streams into the topic at message-level granularity (user messages, assistant replies chunked or exported as HTML documents, and tool calls merged in-place into an expandable tool panel; thinking parts and raw tool results are omitted).
+   - **Interactive Prompting & Control**: Send text messages directly into the topic to prompt the desktop agent (with automatic echo suppression). `/status` displays the agent status and current screen, `/abort` sends `Esc` to interrupt the running task.
+   - **Needs confirmation** (`blocked`): you get the screen tail plus buttons for detected options (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`. Notifications for `blocked` ping you, while `done` notifications arrive silently.
+   - `/agents` lists all Herdr agents: `📱` marks Telegram sessions, while `📡` marks desktop agents bridged via remote control.
 
 ### Phone ↔ Desktop Handoff
 
