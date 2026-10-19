@@ -47,7 +47,7 @@
   - Send messages while Pi is working to dynamically steer the agent turn without waiting for it to finish.
   - Immediate emoji reactions on user messages (`👀` upon receipt, updated to `🫡` upon completion) eliminate mobile waiting anxiety.
 - 📊 **Run Summary Card & Quick Actions**: At the end of every run, sends a summary card with notification (`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`), listing changed files (`+a −d`). Includes inline action buttons: `📄 Diff` (view inline or download unified diff), `✅ Commit` (streamed conventional commit prompt), and `↩️ Undo run` (interactive restore and cleanup).
-- 📌 **Pinned Session Status Board**: Lazily creates and pins a single status board per session (`⏳ Working / 💤 Idle / ⚠️ Pi stopped`), updated in place with 3-second throttling and a 15-second live ticker. Displays running tool summary, active model, thinking level, context window percent, queued follow-ups, and last run stats.
+- 📌 **Pinned Session Status Board**: Lazily creates and pins a single status board per session (`⏳ Working / 💤 Idle / ⚠️ Pi stopped / 🖥 On desktop`), updated in place with 3-second throttling and a 15-second live ticker. Displays running tool summary, active model, thinking level, context window percent, queued follow-ups, and last run stats.
 - 🔒 **Single-Instance Mutex & Strict Whitelist**:
   - Unix domain socket file lock prevents concurrent instances from interfering with the same session.
   - Strict numeric `allowedUserId` whitelist only accepts messages from your private chat; rejects unauthorized users and ignores all group chats.
@@ -270,7 +270,7 @@ Two Pi processes must never write to the same session file simultaneously. The g
     ```bash
     cd '<cwd>' && pi --session '<sessionFile>'
     ```
-  - While handed off, messages sent in Telegram are not sent to Pi. Tap `⬅️ Take back` to resume the session on Telegram (reloads the session updated on desktop, along with a 1-line preview of the latest assistant output), or tap `✨ New session here`.
+  - While handed off, the pinned status board displays `🖥 On desktop since HH:MM`, and messages sent in Telegram are not sent to Pi. Tap `⬅️ Take back` to resume the session on Telegram (reloads the session updated on desktop, along with a 1-line preview of the latest assistant output), or tap `✨ New session here`.
   - A best-effort guard checks Herdr before taking back, warning you if a desktop Pi is still working in that directory.
 - **Desktop → Phone (Desktop Sessions in `/resume`)**:
   - Run `/resume`. If previous desktop Pi sessions exist for the current directory, a `🖥 Desktop sessions` button appears.

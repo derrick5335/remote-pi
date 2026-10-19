@@ -606,7 +606,15 @@ function formatStatusBoard(state = {}) {
   const lines = [];
 
   // 1. 运行状态与耗时
-  if (state.status === "working") {
+  const handoff = state.handoff ?? (state.status === "handoff" ? (state.handoffAt ?? state.at ?? Date.now()) : null);
+  if (handoff) {
+    const at = typeof handoff === "object" && handoff !== null && handoff.at
+      ? handoff.at
+      : (typeof handoff === "number" || handoff instanceof Date ? handoff : Date.now());
+    const d = new Date(at);
+    const pad = (n) => String(n).padStart(2, "0");
+    lines.push(`🖥 On desktop since ${pad(d.getHours())}:${pad(d.getMinutes())}`);
+  } else if (state.status === "working") {
     const durMs = state.elapsedMs ?? (state.runStartedAt ? Math.max(0, Date.now() - state.runStartedAt) : null);
     const dur = durMs != null ? formatDuration(durMs) : null;
     lines.push(dur ? `⏳ Working · ${dur}` : "⏳ Working");
@@ -2087,6 +2095,7 @@ class ChatSession {
           this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
+        this.scheduleStatusBoardUpdate();
         const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
         return this.send(text);
       }
@@ -2492,6 +2501,10 @@ class ChatSession {
       if (state?.model?.provider && state?.model?.id) {
         this.lastModel = { provider: state.model.provider, modelId: state.model.id };
       }
+      if (state?.thinkingLevel) {
+        this.currentThinking = state.thinkingLevel;
+      }
+      this.scheduleStatusBoardUpdate();
     }
     return this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
   }
@@ -2513,6 +2526,7 @@ class ChatSession {
       [this.key]: { sessionFile, at },
     };
     await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+    this.scheduleStatusBoardUpdate();
     const cmd = `cd ${shellQuote(this.cwd)} && pi --session ${shellQuote(sessionFile)}`;
     return this.send(`🖥 Continue on desktop:\n\`\`\`\n${cmd}\n\`\`\``, this.keyboard([
       { label: "⬅️ Take back", action: { type: "take_back" } },
@@ -2578,7 +2592,11 @@ class ChatSession {
       if (state?.model?.provider && state?.model?.id) {
         this.lastModel = { provider: state.model.provider, modelId: state.model.id };
       }
+      if (state?.thinkingLevel) {
+        this.currentThinking = state.thinkingLevel;
+      }
     }
+    this.scheduleStatusBoardUpdate();
     const last = await this.pi.request("get_last_assistant_text").catch(() => null);
     const rawText = (last?.text || "").trim();
     const preview = rawText ? rawText.split("\n").filter(Boolean)[0] || "" : "";
@@ -2595,6 +2613,13 @@ class ChatSession {
     await this.pi.start();
     await this.pi.request("new_session");
     const state = await this.pi.request("get_state").catch(() => null);
+    if (state?.model?.provider && state?.model?.id) {
+      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
+    if (state?.thinkingLevel) {
+      this.currentThinking = state.thinkingLevel;
+    }
+    this.scheduleStatusBoardUpdate();
     const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
     return this.send(text);
   }
@@ -3168,6 +3193,7 @@ class ChatSession {
 
     return formatStatusBoard({
       status,
+      handoff: this.handoff,
       elapsedMs: this.runStartedAt ? Math.max(0, performance.now() - this.runStartedAt) : 0,
       lastRunEndedAt: this.lastRunEndedAt,
       tool: this.currentToolSummary,
@@ -4116,6 +4142,11 @@ class Gateway {
 }
 
 async function selfTest() {
+  const origGlobalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    throw new Error(`self-test: unexpected network call to ${url}`);
+  };
+  try {
   assert.deepEqual(parseCommand("/model openai/gpt-5"), { name: "model", argument: "openai/gpt-5" });
   assert.deepEqual(parseCommand("/help@my_bot"), { name: "help", argument: "" });
   assert.deepEqual(parseCommand("/sh ls -la"), { name: "sh", argument: "ls -la" });
@@ -4245,6 +4276,7 @@ async function selfTest() {
       await mkdir(tmpUi, { recursive: true, mode: 0o700 });
       const gwFail = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpUi });
       gwFail.telegram.sendOne = async () => { throw new Error("network down"); };
+      gwFail.mainSession.send = async () => {};
       await gwFail.mainSession.finishDraft({ text: "recover me", messageId: null, draftId: null });
       const copies = (await readdir(tmpUi)).filter((f) => f.startsWith("failed-reply-"));
       assert.equal(copies.length, 1);
@@ -5280,6 +5312,7 @@ async function selfTest() {
     await mkdir(p1, { recursive: true });
     await mkdir(p2, { recursive: true });
     const gwTopCwd = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: p1 });
+    gwTopCwd.telegram.call = async () => ({});
     const topSession = new ChatSession(gwTopCwd, { threadId: 55, cwd: p1, sessionDir: join(tmpDir, "s55") });
     gwTopCwd.sessions.set("t:55", topSession);
     topSession.send = async () => {};
@@ -5430,6 +5463,19 @@ async function selfTest() {
     assert.equal(stoppedBoard, [
       "⚠️ Pi stopped",
       "📁 remote-pi  🧠 openai/gpt-4o",
+    ].join("\n"));
+
+    const handoffDate = new Date(2026, 9, 19, 14, 30);
+    const pad = (n) => String(n).padStart(2, "0");
+    const expectedTime = `${pad(handoffDate.getHours())}:${pad(handoffDate.getMinutes())}`;
+    const handoffBoard = formatStatusBoard({
+      handoff: { sessionFile: "/tmp/fake.jsonl", at: handoffDate.getTime() },
+      cwd: "remote-pi",
+      model: "provider/model",
+    });
+    assert.equal(handoffBoard, [
+      `🖥 On desktop since ${expectedTime}`,
+      "📁 remote-pi  🧠 provider/model",
     ].join("\n"));
   }
 
@@ -5667,6 +5713,9 @@ async function selfTest() {
     const sess = gwHandoff.mainSession;
     let sent = [];
     sess.send = async (text, extra) => { sent.push({ text, extra }); return {}; };
+    let boardUpdates = 0;
+    const origSchedule = sess.scheduleStatusBoardUpdate.bind(sess);
+    sess.scheduleStatusBoardUpdate = () => { boardUpdates++; origSchedule(); };
 
     // 1. Refuse while streaming
     sess.isStreaming = true;
@@ -5685,6 +5734,8 @@ async function selfTest() {
     assert.equal(sess.handoff.sessionFile, fakeSessionFile);
     assert.ok(sent[1].text.includes("Continue on desktop:"), "Reply must include copyable desktop command");
     assert.ok(sent[1].text.includes(fakeSessionFile));
+    assert.equal(boardUpdates, 1, "Status board update scheduled on handoff");
+    assert.ok(sess.renderCurrentStatusBoard().startsWith("🖥 On desktop since "), "Board shows desktop handoff status");
 
     // 2b. /status while handed off does not restart Pi
     await sess.showSession();
@@ -5725,9 +5776,30 @@ async function selfTest() {
     assert.equal(switchedPath, fakeSessionFile);
     assert.ok(sent[6].text.includes("Back on Telegram"));
     assert.ok(sent[6].text.includes("Previous answer from desktop"));
+    assert.equal(boardUpdates, 2, "Status board update scheduled on take back");
+    assert.ok(!sess.renderCurrentStatusBoard().includes("On desktop"), "Board clears desktop handoff on take back");
+
+    // 6. New session here clears handoff and refreshes status board
+    gwHandoff.state.handoffs = { [sess.key]: { sessionFile: fakeSessionFile, at: Date.now() } };
+    assert.ok(sess.renderCurrentStatusBoard().startsWith("🖥 On desktop since "));
+    sess.createPi = () => ({
+      start: async () => {},
+      request: async (cmd) => {
+        if (cmd === "new_session") return { cancelled: false };
+        if (cmd === "get_state") return { model: { provider: "anthropic", id: "claude" } };
+        return {};
+      },
+    });
+    await sess.handleNewSessionHere();
+    assert.equal(sess.handoff, null);
+    assert.equal(boardUpdates, 3, "Status board update scheduled on new session here");
+    assert.ok(!sess.renderCurrentStatusBoard().includes("On desktop"), "Board clears desktop handoff on new session here");
   }
 
   console.log("self-test: ok");
+  } finally {
+    globalThis.fetch = origGlobalFetch;
+  }
 }
 
 if (import.meta.main) {
