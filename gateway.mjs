@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -497,6 +497,180 @@ function formatSessionReset({ model, cwd }) {
   ].join("\n");
 }
 
+function formatDuration(ms) {
+  if (typeof ms !== "number" || isNaN(ms) || ms < 0) return null;
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m < 60) return `${m}m${s}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h${remM}m${s}s`;
+}
+
+function formatTokensDelta(tokens) {
+  if (typeof tokens !== "number" || isNaN(tokens)) return null;
+  if (tokens >= 1_000_000) {
+    const val = (tokens / 1_000_000).toFixed(1).replace(/\.0$/, "");
+    return `${val}M tok`;
+  }
+  if (tokens >= 1_000) {
+    const val = (tokens / 1_000).toFixed(1).replace(/\.0$/, "");
+    return `${val}k tok`;
+  }
+  return `${tokens} tok`;
+}
+
+function formatRunCard({ durationMs, costDelta, tokensDelta, ctxPercent, files } = {}) {
+  const parts = ["✅ Done"];
+  const dur = formatDuration(durationMs);
+  if (dur) parts.push(dur);
+
+  if (typeof costDelta === "number" && !isNaN(costDelta)) {
+    parts.push(costDelta >= 0 ? `+$${costDelta.toFixed(2)}` : `-$${Math.abs(costDelta).toFixed(2)}`);
+  }
+
+  const tok = formatTokensDelta(tokensDelta);
+  if (tok) parts.push(tok);
+
+  if (typeof ctxPercent === "number" && !isNaN(ctxPercent)) {
+    parts.push(`ctx ${Math.round(ctxPercent)}%`);
+  }
+
+  const header = parts.join(" · ");
+  if (!files || !Array.isArray(files) || files.length === 0) {
+    return header;
+  }
+
+  let totalAdded = 0;
+  let totalDeleted = 0;
+  for (const f of files) {
+    totalAdded += (f.added || 0);
+    totalDeleted += (f.deleted || 0);
+  }
+
+  const countLabel = files.length === 1 ? "1 file" : `${files.length} files`;
+  const lines = [header, "", `📝 ${countLabel} changed this run (+${totalAdded} \u2212${totalDeleted})`];
+  const maxDisplay = Math.min(files.length, 8);
+  for (let i = 0; i < maxDisplay; i++) {
+    const f = files[i];
+    if (f.untracked || f.new || f.status === "new") {
+      lines.push(`• ${f.path} new`);
+    } else if (f.binary) {
+      lines.push(`• ${f.path} binary`);
+    } else {
+      lines.push(`• ${f.path} +${f.added || 0} \u2212${f.deleted || 0}`);
+    }
+  }
+  if (files.length > 8) {
+    lines.push(`…and ${files.length - 8} more`);
+  }
+  return lines.join("\n");
+}
+
+function parseNumstat(text) {
+  if (!text || typeof text !== "string") return [];
+  const lines = text.trim().split("\n");
+  const result = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const [addStr, delStr, rawPath] = parts;
+    const binary = addStr === "-" && delStr === "-";
+    const added = binary ? 0 : parseInt(addStr, 10) || 0;
+    const deleted = binary ? 0 : parseInt(delStr, 10) || 0;
+
+    const unquoted = rawPath.replace(/^"(.*)"$/, "$1");
+    let path = unquoted;
+    let oldPath;
+    if (unquoted.includes(" => ")) {
+      const braceMatch = unquoted.match(/^(.*?)\{(.*?) => (.*?)\}(.*)$/);
+      if (braceMatch) {
+        const [, prefix, oldPart, newPart, suffix] = braceMatch;
+        oldPath = `${prefix}${oldPart}${suffix}`.replace(/\/{2,}/g, "/").replace(/^(\.\/)+/, "").replace(/^\//, "");
+        path = `${prefix}${newPart}${suffix}`.replace(/\/{2,}/g, "/").replace(/^(\.\/)+/, "").replace(/^\//, "");
+      } else {
+        const arrowParts = unquoted.split(" => ");
+        oldPath = arrowParts[0].trim();
+        path = arrowParts[1].trim();
+      }
+    }
+    result.push({ path, added, deleted, binary, ...(oldPath !== undefined ? { oldPath } : {}) });
+  }
+  return result;
+}
+
+function formatStatusBoard(state = {}) {
+  const lines = [];
+
+  // 1. 运行状态与耗时
+  if (state.status === "working") {
+    const durMs = state.elapsedMs ?? (state.runStartedAt ? Math.max(0, Date.now() - state.runStartedAt) : null);
+    const dur = durMs != null ? formatDuration(durMs) : null;
+    lines.push(dur ? `⏳ Working · ${dur}` : "⏳ Working");
+  } else if (state.status === "stopped") {
+    lines.push("⚠️ Pi stopped");
+  } else {
+    const agoMs = state.lastRunAgoMs ?? (state.lastRunEndedAt ? Math.max(0, Date.now() - state.lastRunEndedAt) : null);
+    const ago = agoMs != null ? formatDuration(agoMs) : null;
+    lines.push(ago ? `💤 Idle · last run ${ago} ago` : "💤 Idle");
+  }
+
+  // 2. 正在执行的工具（空闲时省略）
+  if (state.status === "working" && state.tool) {
+    lines.push(`🔧 ${state.tool}`);
+  }
+
+  // 3. 目录、模型/Thinking、上下文百分比
+  const cwdName = state.cwd ? (basename(state.cwd) || state.cwd) : "unknown";
+  const midParts = [`📁 ${cwdName}`];
+
+  let modelName = "";
+  if (typeof state.model === "object" && state.model !== null) {
+    modelName = state.model.provider ? `${state.model.provider}/${state.model.id || state.model.modelId || ""}` : (state.model.id || "");
+  } else if (typeof state.model === "string" && state.model) {
+    modelName = state.model;
+  }
+  const thinking = state.thinking && state.thinking !== "off" && state.thinking !== "none" ? ` · ${state.thinking}` : "";
+  if (modelName) {
+    midParts.push(`🧠 ${modelName}${thinking}`);
+  }
+
+  if (typeof state.ctxPercent === "number" && !isNaN(state.ctxPercent)) {
+    midParts.push(`📊 ctx ${Math.round(state.ctxPercent)}%`);
+  }
+
+  lines.push(midParts.join("  "));
+
+  // 4. 排队追加信息（为 0 时省略）
+  const queued = Number(state.queuedFollowUps || 0);
+  if (queued > 0) {
+    lines.push(`↪ ${queued} queued follow-up${queued === 1 ? "" : "s"}`);
+  }
+
+  // 5. 上次运行摘要（首次运行前省略）
+  if (state.lastRun) {
+    if (typeof state.lastRun === "string") {
+      lines.push(`Last: ${state.lastRun}`);
+    } else if (typeof state.lastRun === "object") {
+      const parts = [];
+      if (state.lastRun.filesCount != null) {
+        parts.push(`✅ ${state.lastRun.filesCount} file${state.lastRun.filesCount === 1 ? "" : "s"}`);
+        if (state.lastRun.costDelta != null) {
+          parts.push(`+$${state.lastRun.costDelta.toFixed(2)}`);
+        }
+      } else {
+        parts.push(state.lastRun.costDelta != null ? `✅ +$${state.lastRun.costDelta.toFixed(2)}` : "✅ done");
+      }
+      lines.push(`Last: ${parts.join(" · ")}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function extensionFromMime(mime = "") {
   const map = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "video/quicktime": ".mov", "application/pdf": ".pdf" };
   return map[String(mime).toLowerCase()] || "";
@@ -558,7 +732,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -580,6 +754,14 @@ function loadState(stateDir) {
         }
       }
     }
+    const statusBoards = {};
+    if (typeof raw.statusBoards === "object" && raw.statusBoards !== null) {
+      for (const [key, msgId] of Object.entries(raw.statusBoards)) {
+        if (typeof msgId === "number") {
+          statusBoards[key] = msgId;
+        }
+      }
+    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
@@ -587,9 +769,10 @@ function loadState(stateDir) {
         : [],
       topics,
       handoffs,
+      statusBoards,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {}, handoffs: {} };
+    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {} };
   }
 }
 
@@ -825,6 +1008,12 @@ function loadConfig() {
     maxSessions: Number(process.env.REMOTE_PI_MAX_SESSIONS || file.maxSessions || 4),
     longReplyChars: Number.isNaN(longReplyChars) ? 8000 : longReplyChars,
     fallbackModels,
+    doneCard: process.env.REMOTE_PI_DONE_CARD !== undefined
+      ? process.env.REMOTE_PI_DONE_CARD !== "false" && process.env.REMOTE_PI_DONE_CARD !== "0"
+      : file.doneCard !== false,
+    statusBoard: process.env.REMOTE_PI_STATUS_BOARD !== undefined
+      ? process.env.REMOTE_PI_STATUS_BOARD !== "false" && process.env.REMOTE_PI_STATUS_BOARD !== "0"
+      : file.statusBoard !== false,
   };
   config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
@@ -1005,6 +1194,15 @@ class Telegram {
     }
   }
 
+  async pinChatMessage(chatId, messageId) {
+    try {
+      return await this.call("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true }, 10_000, 1);
+    } catch (error) {
+      console.error(`[tg:call] pinChatMessage failed:`, error.message);
+      return null;
+    }
+  }
+
   // ref: Alex MacCaw heartbeat drift technique for OS sleep/wake detection (http://blog.alexmaccaw.com/javascript-wake-event)
   startWakeMonitor() {
     if (this.wakeTimer) return;
@@ -1164,23 +1362,24 @@ class Telegram {
 }
 
 function runCommand(cmd, args, options = {}) {
+  const { okCodes = [0], ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
-    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOptions });
     let stdout = "";
     let stderr = "";
     cp.stdout?.on("data", (d) => { stdout += d; });
     cp.stderr?.on("data", (d) => { stderr += d; });
-    const timer = options.timeout ? setTimeout(() => {
+    const timer = spawnOptions.timeout ? setTimeout(() => {
       cp.kill("SIGKILL");
       reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
-    }, options.timeout) : null;
+    }, spawnOptions.timeout) : null;
     cp.on("error", (err) => {
       if (timer) clearTimeout(timer);
       reject(err);
     });
     cp.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      if (code === 0) resolve(stdout.trim());
+      if (okCodes.includes(code)) resolve(stdout.trim());
       else reject(new Error(`Command failed (${code}): ${stderr.trim() || stdout.trim()}`));
     });
   });
@@ -1666,6 +1865,21 @@ class ChatSession {
     this.updateChain = Promise.resolve();
     this.lastActiveAt = Date.now();
 
+    this.statusBoardMessageId = gateway.state.statusBoards?.[this.key] || null;
+    this.statusBoardLastText = null;
+    this.statusBoardLastEditAt = 0;
+    this.statusBoardTimer = null;
+    this.statusBoardTickTimer = null;
+    this.statusBoardUpdating = false;
+    this.statusBoardPending = false;
+    this.hasHadRun = Boolean(this.statusBoardMessageId);
+    this.lastRunSummary = null;
+    this.lastRunEndedAt = null;
+    this.currentToolSummary = null;
+    this.currentCtxPercent = null;
+    this.currentThinking = null;
+    this.runSnapshotPromise = null;
+
     this.pi = this.createPi();
   }
 
@@ -1758,6 +1972,7 @@ class ChatSession {
     const pendingUi = this.pendingUi;
     this.resetSessionState();
     this.settleActiveReactions();
+    this.scheduleStatusBoardUpdate();
     if (wasStreaming || pendingUi) {
       console.error(`${new Date().toISOString()} [pi${this.threadId ? `:${this.threadId}` : ""}] process exited unexpectedly (${code ?? signal})`);
       this.gateway.queueTelegram(() => this.send(`⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`, errorActions(this, `Pi process exited unexpectedly (${code ?? signal})`)));
@@ -1787,6 +2002,15 @@ class ChatSession {
     }
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     this.toolPanel = null;
+    if (this.statusBoardTimer) {
+      clearTimeout(this.statusBoardTimer);
+      this.statusBoardTimer = null;
+    }
+    if (this.statusBoardTickTimer) {
+      clearInterval(this.statusBoardTickTimer);
+      this.statusBoardTickTimer = null;
+    }
+    this.runSnapshotPromise = null;
     if (this.draft) {
       if (this.draft.timer) clearTimeout(this.draft.timer);
       this.draft.closed = true;
@@ -2145,6 +2369,10 @@ class ChatSession {
     if (state?.model?.provider && state?.model?.id) {
       this.lastModel = { provider: state.model.provider, modelId: state.model.id };
     }
+    if (state?.thinkingLevel) {
+      this.currentThinking = state.thinkingLevel;
+    }
+    this.scheduleStatusBoardUpdate();
     await this.send(`✅ Pi ready; Session: ${state.sessionId}`);
   }
 
@@ -2156,6 +2384,7 @@ class ChatSession {
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
         this.lastModel = { provider: exact.provider, modelId: exact.id };
+        this.scheduleStatusBoardUpdate();
         return this.send(`✅ ${exact.provider}/${exact.id}`);
       }
     }
@@ -2174,6 +2403,8 @@ class ChatSession {
     if (argument) {
       if (!data.levels.includes(argument)) return this.send(`Available levels: ${data.levels.join(", ")}`);
       await this.pi.request("set_thinking_level", { level: argument });
+      this.currentThinking = argument;
+      this.scheduleStatusBoardUpdate();
       return this.send(`✅ thinking: ${argument}`);
     }
     return this.send("Pick a thinking level:", this.keyboard(data.levels.map((level) => ({
@@ -2417,6 +2648,7 @@ class ChatSession {
     if (action.type === "model") {
       await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
       this.lastModel = { provider: action.provider, modelId: action.modelId };
+      this.scheduleStatusBoardUpdate();
       await this.send(`✅ ${action.provider}/${action.modelId}`);
     } else if (action.type === "retry" || action.type === "retry_fallback") {
       if (!this.lastPrompt) return this.send("No prompt to retry");
@@ -2437,6 +2669,8 @@ class ChatSession {
       await this.sendGatewayLog();
     } else if (action.type === "thinking") {
       await this.pi.request("set_thinking_level", { level: action.level });
+      this.currentThinking = action.level;
+      this.scheduleStatusBoardUpdate();
       await this.send(`✅ thinking: ${action.level}`);
     } else if (action.type === "take_back") {
       await this.handleTakeBack(action.confirmed);
@@ -2463,6 +2697,10 @@ class ChatSession {
         if (state?.model?.provider && state?.model?.id) {
           this.lastModel = { provider: state.model.provider, modelId: state.model.id };
         }
+        if (state?.thinkingLevel) {
+          this.currentThinking = state.thinkingLevel;
+        }
+        this.scheduleStatusBoardUpdate();
       }
       await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
     } else if (action.type === "fork") {
@@ -2472,6 +2710,100 @@ class ChatSession {
       await this.send(result.cancelled ? "Fork cancelled" : `✅ Forked from "${result.text.slice(0, 80)}"`);
     } else if (action.type === "cwd") {
       await this.switchCwd(action.path, callback.id);
+    } else if (action.type === "run_diff") {
+      await this.gateway.telegram.answer(callback.id, "Generating diff…");
+      const gitDir = action.toplevel || this.cwd;
+      let diff = "";
+      if (action.snap) {
+        try {
+          diff = await runCommand("git", ["diff", action.snap], { cwd: gitDir, timeout: 10_000 });
+        } catch (err) {
+          console.warn(`[run_diff] git diff ${action.snap} failed: ${err.message}`);
+        }
+      }
+      for (const file of (action.untrackedFiles || [])) {
+        try {
+          const out = await runCommand("git", ["diff", "--no-index", "--", "/dev/null", file], { cwd: gitDir, timeout: 5000, okCodes: [0, 1] });
+          if (out) diff = diff ? `${diff}\n${out}` : out;
+        } catch {}
+      }
+      diff = diff.trim();
+      if (!diff) {
+        await this.send("No changes detected in working tree.");
+        return;
+      }
+      if (diff.length < 3500) {
+        await this.send(`\`\`\`diff\n${diff}\n\`\`\``);
+      } else {
+        const downloadsDir = this.gateway.config.downloadsDir;
+        await mkdir(downloadsDir, { recursive: true, mode: 0o700 });
+        const diffPath = join(downloadsDir, `run-${Date.now()}.diff`);
+        await writeFile(diffPath, diff, "utf8");
+        await this.sendDocument(diffPath);
+      }
+    } else if (action.type === "run_commit") {
+      await this.gateway.telegram.answer(callback.id, "Committing changes…");
+      await this.prompt("Review the current uncommitted changes (git status / git diff) and commit them with a concise conventional commit message. Do not push.");
+    } else if (action.type === "run_undo") {
+      if (this.isStreaming) {
+        await this.gateway.telegram.answer(callback.id, "Cannot undo while running.");
+        return;
+      }
+      if (action.confirmed === undefined) {
+        await this.gateway.telegram.answer(callback.id);
+        const keyboard = {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "Confirm", callback_data: this.action({ type: "run_undo", toplevel: action.toplevel, snap: action.snap, trackedFiles: action.trackedFiles, untrackedFiles: action.untrackedFiles, confirmed: true }, 600_000) },
+                { text: "Cancel", callback_data: this.action({ type: "run_undo", confirmed: false }, 600_000) },
+              ],
+            ],
+          },
+        };
+        await this.send("↩️ Undo changes from this run?", keyboard);
+        return;
+      }
+      if (action.confirmed === false) {
+        if (callback.message) {
+          await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, "Undo cancelled.").catch(() => {});
+        }
+        await this.gateway.telegram.answer(callback.id, "Cancelled");
+        return;
+      }
+      if (action.confirmed === true) {
+        if (callback.message) {
+          await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, "Undoing run changes…").catch(() => {});
+        }
+        await this.gateway.telegram.answer(callback.id, "Undoing…");
+        const gitDir = action.toplevel || this.cwd;
+        const restoredTracked = [];
+        if (action.snap && action.trackedFiles?.length) {
+          try {
+            await runCommand("git", ["restore", `--source=${action.snap}`, "--worktree", "--", ...action.trackedFiles], { cwd: gitDir, timeout: 10_000 });
+            restoredTracked.push(...action.trackedFiles);
+          } catch (err) {
+            console.warn(`[run_undo] git restore failed: ${err.message}`);
+          }
+        }
+        const deletedUntracked = [];
+        for (const file of (action.untrackedFiles || [])) {
+          try {
+            const filePath = resolve(gitDir, file);
+            await unlink(filePath);
+            deletedUntracked.push(file);
+          } catch (err) {
+            console.warn(`[run_undo] failed to delete untracked file ${file}: ${err.message}`);
+          }
+        }
+        const restored = [...restoredTracked, ...deletedUntracked];
+        if (restored.length > 0) {
+          await this.send(`↩️ Restored ${restored.length} file(s):\n${restored.map((f) => `• ${f}`).join("\n")}`);
+        } else {
+          await this.send("↩️ No files were restored.");
+        }
+        return;
+      }
     } else if (action.type === "ui") {
       for (const [k, v] of this.gateway.actions) {
         if (v.type === "ui" && v.requestId === action.requestId) this.gateway.actions.delete(k);
@@ -2487,21 +2819,41 @@ class ChatSession {
   async handleEvent(event) {
     this.touchActivity();
     if (event.type === "agent_start") {
+      const isInitialStart = !this.isStreaming;
       this.isStreaming = true;
       this.pendingUi = null;
       this.repliedInRun = false;
       this.abortedRun = false;
+      this.hasHadRun = true;
       this.startTyping();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       this.toolPanel = null;
+      if (isInitialStart) {
+        this.runStartedAt = this.runStartedAt || performance.now();
+        this.runSnapshotPromise = this.takeRunSnapshot();
+        if (!this.statusBoardTickTimer) {
+          this.statusBoardTickTimer = setInterval(() => {
+            this.scheduleStatusBoardUpdate();
+          }, 15_000);
+          this.statusBoardTickTimer.unref?.();
+        }
+      }
+      this.scheduleStatusBoardUpdate();
       const since = this.runStartedAt ? ` (+${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
       this.isStreaming = false;
       this.pendingUi = null;
+      this.currentToolSummary = null;
+      this.lastRunEndedAt = Date.now();
+      if (this.statusBoardTickTimer) {
+        clearInterval(this.statusBoardTickTimer);
+        this.statusBoardTickTimer = null;
+      }
       this.stopTyping();
-      const since = this.runStartedAt ? ` (total: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
+      const durationMs = this.runStartedAt ? Math.round(performance.now() - this.runStartedAt) : null;
+      const since = durationMs != null ? ` (total: ${durationMs}ms)` : "";
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_settled${since}`);
       if (this.toolPanel && this.toolPanel.tools.length) {
         for (const tool of this.toolPanel.tools) {
@@ -2520,13 +2872,24 @@ class ChatSession {
       if (!this.repliedInRun && !this.abortedRun) {
         this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry.", errorActions(this, "no text reply")));
       }
+      if (!this.abortedRun && this.gateway.config.doneCard !== false) {
+        const snapPromise = this.runSnapshotPromise;
+        this.sendRunCard(snapPromise, durationMs).catch((err) => {
+          console.error(`[run-card] failed to send run card:`, err.message);
+        });
+      }
+      this.scheduleStatusBoardUpdate();
       this.abortedRun = false;
       this.settleActiveReactions();
       this.runStartedAt = null;
       this.runFirstTokenAt = null;
       this.runFirstUiAt = null;
+      this.runSnapshotPromise = null;
     }
-    if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
+    if (event.type === "queue_update") {
+      this.queue = { steering: event.steering, followUp: event.followUp };
+      this.scheduleStatusBoardUpdate();
+    }
     if (!this.gateway.chatReady) return;
 
     if (event.type === "auto_retry_start") {
@@ -2593,7 +2956,9 @@ class ChatSession {
         status: "running",
         startedAt: Date.now(),
       });
+      this.currentToolSummary = summary;
       this.scheduleToolPanelUpdate(false, false);
+      this.scheduleStatusBoardUpdate();
     }
     if (event.type === "tool_execution_end") {
       if (this.toolPanel) {
@@ -2603,6 +2968,9 @@ class ChatSession {
         console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
         this.scheduleToolPanelUpdate(false, false);
       }
+      const runningTool = this.toolPanel?.tools?.slice().reverse().find((item) => item.status === "running");
+      this.currentToolSummary = runningTool ? runningTool.summary : null;
+      this.scheduleStatusBoardUpdate();
       if ((event.toolName === "remote_attach" || event.toolName === "telegram_attach") && !event.isError) {
         const paths = event.result?.details?.paths || event.args?.paths || [];
         for (const path of paths) {
@@ -2761,7 +3129,252 @@ class ChatSession {
     }
   }
 
+  scheduleStatusBoardUpdate(immediate = false) {
+    if (this.gateway.config.statusBoard === false || !this.hasHadRun) return;
+    if (immediate) {
+      if (this.statusBoardTimer) {
+        clearTimeout(this.statusBoardTimer);
+        this.statusBoardTimer = null;
+      }
+      this.flushStatusBoard();
+      return;
+    }
+    const elapsed = Date.now() - this.statusBoardLastEditAt;
+    if (elapsed >= 3000) {
+      if (this.statusBoardTimer) {
+        clearTimeout(this.statusBoardTimer);
+        this.statusBoardTimer = null;
+      }
+      this.flushStatusBoard();
+    } else if (!this.statusBoardTimer) {
+      this.statusBoardTimer = setTimeout(() => {
+        this.statusBoardTimer = null;
+        this.flushStatusBoard();
+      }, 3000 - elapsed);
+      this.statusBoardTimer.unref?.();
+    }
+  }
+
+  renderCurrentStatusBoard() {
+    let status = "idle";
+    if (!this.pi?.proc) {
+      status = "stopped";
+    } else if (this.isStreaming) {
+      status = "working";
+    }
+
+    const model = this.lastModel || (this.pi?.proc ? "pi" : "");
+    const thinking = this.currentThinking;
+
+    return formatStatusBoard({
+      status,
+      elapsedMs: this.runStartedAt ? Math.max(0, performance.now() - this.runStartedAt) : 0,
+      lastRunEndedAt: this.lastRunEndedAt,
+      tool: this.currentToolSummary,
+      cwd: this.cwd,
+      model,
+      thinking,
+      ctxPercent: this.currentCtxPercent,
+      queuedFollowUps: (this.queue?.followUp || []).length,
+      lastRun: this.lastRunSummary,
+    });
+  }
+
+  async flushStatusBoard() {
+    if (this.gateway.config.statusBoard === false || !this.hasHadRun) return;
+    if (this.statusBoardUpdating) {
+      this.statusBoardPending = true;
+      return;
+    }
+    this.statusBoardUpdating = true;
+    try {
+      const text = this.renderCurrentStatusBoard();
+      if (text === this.statusBoardLastText) return;
+
+      this.statusBoardLastEditAt = Date.now();
+
+      if (this.statusBoardMessageId) {
+        try {
+          await this.gateway.telegram.call("editMessageText", {
+            chat_id: this.chatId,
+            message_id: this.statusBoardMessageId,
+            text: telegramHtml(text),
+            parse_mode: "HTML",
+          }, 10_000, 1);
+          this.statusBoardLastText = text;
+          return;
+        } catch (err) {
+          const msg = String(err.message || "");
+          if (msg.includes("message is not modified")) {
+            this.statusBoardLastText = text;
+            return;
+          }
+          if (msg.includes("message to edit not found") || msg.includes("MESSAGE_ID_INVALID")) {
+            console.warn(`[status-board:${this.key}] message not found, recreating: ${err.message}`);
+            this.statusBoardMessageId = null;
+            if (this.gateway.state.statusBoards) {
+              delete this.gateway.state.statusBoards[this.key];
+              await this.gateway.saveState({ statusBoards: this.gateway.state.statusBoards });
+            }
+          } else {
+            return;
+          }
+        }
+      }
+
+      const sent = await this.sendOne(text, { disable_notification: true });
+      this.statusBoardMessageId = sent.message_id;
+      this.statusBoardLastText = text;
+      if (!this.gateway.state.statusBoards) this.gateway.state.statusBoards = {};
+      this.gateway.state.statusBoards[this.key] = sent.message_id;
+      await this.gateway.saveState({ statusBoards: this.gateway.state.statusBoards });
+
+      await this.gateway.telegram.pinChatMessage(this.chatId, sent.message_id);
+    } catch (err) {
+      console.warn(`[status-board:${this.key}] update failed: ${err.message}`);
+    } finally {
+      this.statusBoardUpdating = false;
+      if (this.statusBoardPending) {
+        this.statusBoardPending = false;
+        this.scheduleStatusBoardUpdate();
+      }
+    }
+  }
+
+  async takeRunSnapshot() {
+    try {
+      const [statsRes, stateRes, gitRes] = await Promise.allSettled([
+        this.pi.request("get_session_stats", {}, 5000).catch(() => null),
+        this.pi.request("get_state", {}, 5000).catch(() => null),
+        (async () => {
+          try {
+            const isTree = (await runCommand("git", ["rev-parse", "--is-inside-work-tree"], { cwd: this.cwd, timeout: 5000 })).trim();
+            if (isTree !== "true") return null;
+
+            const toplevel = (await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd: this.cwd, timeout: 5000 })).trim();
+            if (!toplevel) return null;
+
+            let snap = (await runCommand("git", ["stash", "create"], { cwd: toplevel, timeout: 5000 })).trim();
+            if (!snap) {
+              snap = (await runCommand("git", ["rev-parse", "HEAD"], { cwd: toplevel, timeout: 5000 })).trim();
+            }
+            if (!snap) return null;
+
+            const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+            const untracked = new Set(untrackedRaw.trim().split("\n").filter(Boolean));
+            return { snap, toplevel, untracked };
+          } catch {
+            return null;
+          }
+        })(),
+      ]);
+
+      const stats = statsRes.status === "fulfilled" ? statsRes.value : null;
+      const state = stateRes.status === "fulfilled" ? stateRes.value : null;
+      const git = gitRes.status === "fulfilled" ? gitRes.value : null;
+
+      if (state?.model?.provider && state?.model?.id) {
+        this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+      }
+      if (state?.thinkingLevel) {
+        this.currentThinking = state.thinkingLevel;
+      }
+      if (stats?.contextUsage?.percent != null) {
+        this.currentCtxPercent = stats.contextUsage.percent;
+      }
+
+      return { stats, git, startedAt: Date.now() };
+    } catch {
+      return null;
+    }
+  }
+
+  async sendRunCard(snapshotPromise, durationMs) {
+    try {
+      const snapshot = snapshotPromise ? await snapshotPromise.catch(() => null) : null;
+      const statsAfter = await this.pi.request("get_session_stats", {}, 5000).catch(() => null);
+
+      const costBefore = snapshot?.stats?.cost;
+      const costAfter = statsAfter?.cost;
+      const costDelta = (typeof costAfter === "number" && typeof costBefore === "number")
+        ? Math.max(0, costAfter - costBefore)
+        : (typeof costAfter === "number" ? costAfter : null);
+
+      const tokensBefore = snapshot?.stats?.tokens?.total;
+      const tokensAfter = statsAfter?.tokens?.total;
+      const tokensDelta = (typeof tokensAfter === "number" && typeof tokensBefore === "number")
+        ? Math.max(0, tokensAfter - tokensBefore)
+        : null;
+
+      const ctxPercent = statsAfter?.contextUsage?.percent ?? this.currentCtxPercent;
+      if (typeof ctxPercent === "number") this.currentCtxPercent = ctxPercent;
+
+      let files = null;
+      let trackedFilesChanged = [];
+      let newUntrackedFiles = [];
+      const snap = snapshot?.git?.snap;
+      const toplevel = snapshot?.git?.toplevel;
+
+      if (snap && toplevel) {
+        try {
+          const numstatRaw = await runCommand("git", ["diff", "--numstat", snap], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+          const parsedTracked = parseNumstat(numstatRaw);
+          trackedFilesChanged = parsedTracked.map((f) => f.path);
+
+          const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: toplevel, timeout: 5000 }).catch(() => "");
+          const currentUntracked = untrackedRaw.trim().split("\n").filter(Boolean);
+          const startUntracked = snapshot.git.untracked || new Set();
+          newUntrackedFiles = currentUntracked.filter((f) => !startUntracked.has(f));
+
+          files = [
+            ...parsedTracked,
+            ...newUntrackedFiles.map((path) => ({ path, added: 0, deleted: 0, untracked: true })),
+          ];
+        } catch (err) {
+          console.warn(`[run-card] git diff failed: ${err.message}`);
+        }
+      }
+
+      const text = formatRunCard({ durationMs, costDelta, tokensDelta, ctxPercent, files });
+
+      let extra = {};
+      if (files && files.length > 0) {
+        const ttl24h = 24 * 60 * 60 * 1000;
+        extra = {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "📄 Diff", callback_data: this.action({ type: "run_diff", toplevel, snap, untrackedFiles: newUntrackedFiles }, ttl24h) },
+                { text: "✅ Commit", callback_data: this.action({ type: "run_commit" }, ttl24h) },
+                { text: "↩️ Undo run", callback_data: this.action({ type: "run_undo", toplevel, snap, trackedFiles: trackedFilesChanged, untrackedFiles: newUntrackedFiles }, ttl24h) },
+              ],
+            ],
+          },
+        };
+      }
+
+      await this.send(text, extra);
+
+      this.lastRunSummary = {
+        filesCount: files ? files.length : null,
+        costDelta,
+      };
+      this.lastRunEndedAt = Date.now();
+      this.scheduleStatusBoardUpdate();
+    } catch (error) {
+      console.error(`[run-card] failed to send run card:`, error.message);
+    }
+  }
+
   stop() {
+    if (this.statusBoardTimer) {
+      clearTimeout(this.statusBoardTimer);
+      this.statusBoardTimer = null;
+    }
+    if (this.statusBoardTickTimer) {
+      clearInterval(this.statusBoardTickTimer);
+      this.statusBoardTickTimer = null;
+    }
     this.resetSessionState();
     this.pi.stop();
   }
@@ -3352,7 +3965,10 @@ class Gateway {
             this.sessions.delete(sessionKey);
           }
           delete this.state.topics[threadId];
-          await this.saveState({ topics: this.state.topics });
+          if (this.state.statusBoards) {
+            delete this.state.statusBoards[sessionKey];
+          }
+          await this.saveState({ topics: this.state.topics, statusBoards: this.state.statusBoards });
           await this.telegram.call("deleteForumTopic", {
             chat_id: this.chatId,
             message_thread_id: threadId,
@@ -4703,6 +5319,246 @@ async function selfTest() {
     assert.ok(!redacted.includes("sk-123") && !redacted.includes("123:ABC"), "secrets removed");
     assert.ok(!redacted.includes("xyz") && !redacted.includes("Bearer b"), "token-style pairs removed");
     assert.ok(redacted.includes("plain line"), "non-secret lines kept");
+  }
+  // Phase 2: parseNumstat (handles binary, renames, and normal files)
+  {
+    assert.deepEqual(parseNumstat(""), []);
+    assert.deepEqual(parseNumstat(null), []);
+
+    const raw = [
+      "10\t5\tsrc/index.js",
+      "-\t-\tassets/logo.png",
+      "3\t1\tsrc/{old.js => new.js}",
+      "0\t0\t{oldDir => newDir}/file.txt",
+      "2\t0\tdir/{ => sub}/b.txt",
+      "1\t1\told.txt => new.txt",
+    ].join("\n");
+
+    const parsed = parseNumstat(raw);
+    assert.equal(parsed.length, 6);
+    assert.deepEqual(parsed[0], { path: "src/index.js", added: 10, deleted: 5, binary: false });
+    assert.deepEqual(parsed[1], { path: "assets/logo.png", added: 0, deleted: 0, binary: true });
+    assert.deepEqual(parsed[2], { path: "src/new.js", oldPath: "src/old.js", added: 3, deleted: 1, binary: false });
+    assert.deepEqual(parsed[3], { path: "newDir/file.txt", oldPath: "oldDir/file.txt", added: 0, deleted: 0, binary: false });
+    assert.deepEqual(parsed[4], { path: "dir/sub/b.txt", oldPath: "dir/b.txt", added: 2, deleted: 0, binary: false });
+    assert.deepEqual(parsed[5], { path: "new.txt", oldPath: "old.txt", added: 1, deleted: 1, binary: false });
+  }
+
+  // Phase 2: formatRunCard
+  {
+    const card = formatRunCard({
+      durationMs: 133_000,
+      costDelta: 0.04,
+      tokensDelta: 12_300,
+      ctxPercent: 31,
+      files: [
+        { path: "src/gateway.mjs", added: 10, deleted: 4 },
+        { path: "README.md", added: 5, deleted: 0 },
+        { path: "new-file.txt", untracked: true },
+      ],
+    });
+    assert.ok(card.includes("✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%"));
+    assert.ok(card.includes("📝 3 files changed this run (+15 \u22124)"));
+    assert.ok(card.includes("• src/gateway.mjs +10 \u22124"));
+    assert.ok(card.includes("• README.md +5 \u22120"));
+    assert.ok(card.includes("• new-file.txt new"));
+
+    // non-git / no files
+    const nonGitCard = formatRunCard({ durationMs: 45_000, costDelta: 0.01, tokensDelta: 500, ctxPercent: 12 });
+    assert.equal(nonGitCard, "✅ Done · 45s · +$0.01 · 500 tok · ctx 12%");
+
+    // single file
+    const singleFileCard = formatRunCard({
+      durationMs: 10_000,
+      files: [{ path: "fix.js", added: 2, deleted: 1 }],
+    });
+    assert.ok(singleFileCard.includes("📝 1 file changed this run (+2 \u22121)"));
+    assert.ok(singleFileCard.includes("• fix.js +2 \u22121"));
+
+    // binary and > 8 files
+    const tenFiles = [];
+    for (let i = 1; i <= 10; i++) {
+      tenFiles.push(i === 1 ? { path: "img.png", binary: true } : { path: `f${i}.js`, added: 1, deleted: 0 });
+    }
+    const cardTen = formatRunCard({ durationMs: 2000, files: tenFiles });
+    assert.ok(cardTen.includes("• img.png binary"));
+    assert.ok(cardTen.includes("…and 2 more"));
+  }
+
+  // Phase 2: formatStatusBoard
+  {
+    const workingBoard = formatStatusBoard({
+      status: "working",
+      elapsedMs: 83_000,
+      tool: "bash: npm test",
+      cwd: "/Users/dev/remote-pi",
+      model: "provider/model",
+      thinking: "thinking",
+      ctxPercent: 31,
+      queuedFollowUps: 2,
+      lastRun: { filesCount: 3, costDelta: 0.04 },
+    });
+    assert.equal(workingBoard, [
+      "⏳ Working · 1m23s",
+      "🔧 bash: npm test",
+      "📁 remote-pi  🧠 provider/model · thinking  📊 ctx 31%",
+      "↪ 2 queued follow-ups",
+      "Last: ✅ 3 files · +$0.04",
+    ].join("\n"));
+
+    const idleBoard = formatStatusBoard({
+      status: "idle",
+      lastRunAgoMs: 133_000,
+      cwd: "remote-pi",
+      model: { provider: "anthropic", id: "claude" },
+      thinking: "high",
+      ctxPercent: 25,
+      queuedFollowUps: 0,
+      lastRun: { filesCount: 1, costDelta: 0.02 },
+    });
+    assert.equal(idleBoard, [
+      "💤 Idle · last run 2m13s ago",
+      "📁 remote-pi  🧠 anthropic/claude · high  📊 ctx 25%",
+      "Last: ✅ 1 file · +$0.02",
+    ].join("\n"));
+
+    const stoppedBoard = formatStatusBoard({
+      status: "stopped",
+      cwd: "remote-pi",
+      model: "openai/gpt-4o",
+    });
+    assert.equal(stoppedBoard, [
+      "⚠️ Pi stopped",
+      "📁 remote-pi  🧠 openai/gpt-4o",
+    ].join("\n"));
+  }
+
+  // Phase 2: statusBoards persistence in state.json
+  {
+    const tmpStateDir = join(tmpdir(), `test-status-boards-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
+      cwd: tmpStateDir,
+      statusBoards: { main: 12345, "t:99": 67890 },
+    }), { mode: 0o600 });
+    const loaded = loadState(tmpStateDir);
+    assert.deepEqual(loaded.statusBoards, { main: 12345, "t:99": 67890 });
+  }
+
+  // Phase 2 review: card computation does not block other sessions' Telegram output
+  {
+    const gwOrder = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    gwOrder.chatReady = true;
+    const session1 = gwOrder.mainSession;
+    const session2 = new ChatSession(gwOrder, { threadId: 301, cwd: tmpdir(), sessionDir: join(tmpdir(), "s301") });
+    gwOrder.sessions.set("t:301", session2);
+
+    const deliveryLog = [];
+    session1.send = async (text) => {
+      return gwOrder.queueTelegram(async () => {
+        deliveryLog.push(`s1:${text}`);
+      });
+    };
+    session2.send = async (text) => {
+      return gwOrder.queueTelegram(async () => {
+        deliveryLog.push(`s2:${text}`);
+      });
+    };
+
+    let slowResolve;
+    const slowPromise = new Promise((resolve) => { slowResolve = resolve; });
+    session1.pi.request = async (cmd) => {
+      if (cmd === "get_session_stats") {
+        await slowPromise;
+        return { cost: 0.05, tokens: { total: 100 } };
+      }
+      return {};
+    };
+
+    gwOrder.queueTelegram(async () => {
+      deliveryLog.push("s1:final_reply");
+    });
+    const cardPromise = session1.sendRunCard(Promise.resolve(null), 1000);
+
+    await session2.send("fast_msg");
+
+    assert.deepEqual(deliveryLog, ["s1:final_reply", "s2:fast_msg"], "Session 2 output must not be blocked while Session 1 computes card");
+
+    slowResolve();
+    await cardPromise;
+
+    assert.equal(deliveryLog.length, 3);
+    assert.ok(deliveryLog[2].startsWith("s1:✅ Done"));
+  }
+
+  // Phase 2 review: git paths in subdirectory of repo (toplevel resolution, card diff, undo) & runCommand okCodes
+  {
+    let gitAvailable = true;
+    try {
+      await runCommand("git", ["--version"], { timeout: 2000 });
+    } catch {
+      gitAvailable = false;
+    }
+
+    if (gitAvailable) {
+      const testDiff = await runCommand("git", ["diff", "--no-index", "--", "/dev/null", "package.json"], { timeout: 5000, okCodes: [0, 1] });
+      assert.ok(testDiff.includes("package.json"), "runCommand with okCodes [0, 1] must resolve on exit code 1");
+
+      const repoDir = join(tmpdir(), `test-git-subrepo-${Date.now()}`);
+      await mkdir(repoDir, { recursive: true });
+      const subDir = join(repoDir, "packages", "sub");
+      await mkdir(subDir, { recursive: true });
+
+      await runCommand("git", ["init", "-q"], { cwd: repoDir, timeout: 5000 });
+      await runCommand("git", ["config", "user.name", "test"], { cwd: repoDir, timeout: 5000 });
+      await runCommand("git", ["config", "user.email", "test@test.com"], { cwd: repoDir, timeout: 5000 });
+
+      const trackedFile = join(subDir, "tracked.txt");
+      await writeFile(trackedFile, "initial content\n");
+      await runCommand("git", ["add", "."], { cwd: repoDir, timeout: 5000 });
+      await runCommand("git", ["commit", "-qm", "initial"], { cwd: repoDir, timeout: 5000 });
+
+      const gwSub = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: subDir });
+      gwSub.telegram.answer = async () => {};
+      gwSub.telegram.edit = async () => {};
+      const subSession = new ChatSession(gwSub, { threadId: 401, cwd: subDir, sessionDir: join(tmpdir(), "s401") });
+      subSession.pi.request = async () => ({});
+
+      const snapObj = await subSession.takeRunSnapshot();
+      assert.ok(snapObj?.git?.snap, "Snapshot must have snap commit");
+      const realRepoDir = await realpath(repoDir);
+      assert.equal(snapObj?.git?.toplevel, realRepoDir, "toplevel must resolve to repo root");
+
+      await writeFile(trackedFile, "modified content\n");
+      const newUntrackedFile = join(subDir, "new-sub.txt");
+      await writeFile(newUntrackedFile, "hello from subdir\n");
+
+      const diffNumstat = await runCommand("git", ["diff", "--numstat", snapObj.git.snap], { cwd: snapObj.git.toplevel, timeout: 5000 });
+      const parsedTracked = parseNumstat(diffNumstat);
+      assert.deepEqual(parsedTracked, [{ path: "packages/sub/tracked.txt", added: 1, deleted: 1, binary: false }]);
+
+      const untrackedRaw = await runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: snapObj.git.toplevel, timeout: 5000 });
+      const currentUntracked = untrackedRaw.trim().split("\n").filter(Boolean);
+      const newUntracked = currentUntracked.filter((f) => !snapObj.git.untracked.has(f));
+      assert.deepEqual(newUntracked, ["packages/sub/new-sub.txt"]);
+
+      let replySent = "";
+      subSession.send = async (t) => { replySent = t; };
+      const undoAction = {
+        type: "run_undo",
+        toplevel: snapObj.git.toplevel,
+        snap: snapObj.git.snap,
+        trackedFiles: ["packages/sub/tracked.txt"],
+        untrackedFiles: ["packages/sub/new-sub.txt"],
+        confirmed: true,
+      };
+      await subSession.handleCallbackAction(undoAction, { id: "cb-undo" });
+
+      const contentAfterUndo = await readFile(trackedFile, "utf8");
+      assert.equal(contentAfterUndo, "initial content\n", "tracked file must be restored");
+      assert.equal(existsSync(newUntrackedFile), false, "untracked file in subdir must be deleted");
+      assert.ok(replySent.includes("Restored 2 file(s)"));
+    }
   }
 
   assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");

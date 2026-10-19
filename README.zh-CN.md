@@ -46,6 +46,8 @@
 - 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
   - 收到消息时 Bot 立即在原消息标记“接收”表情（默认 `👀`），执行完成自动替换为“完成”表情（默认 `🫡`），彻底消除移动端等待焦虑。
+- 📊 **运行摘要卡片与快捷操作**：任务结束时自动发送包含提示音的完成卡片（`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`）并列出变更文件清单（`+a −d`）。提供内联快捷操作按钮：`📄 Diff`（内联查看或下载完整 unified diff）、`✅ Commit`（流式常规提交 Prompt）、`↩️ Undo run`（交互式回滚与清理新文件）。
+- 📌 **置顶状态看板**：每个会话首次运行自动创建并置顶一条状态看板（`⏳ Working / 💤 Idle / ⚠️ Pi stopped`），采用 3 秒节流原地更新，流式期间每 15 秒心跳跳动耗时。清晰展示当前工具、生效模型、Thinking 等级、上下文窗口百分比、排队追问数与上次运行摘要。
 - 🔒 **单实例互斥与严格白名单**：
   - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
   - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
@@ -199,6 +201,8 @@ pi-remote-gateway stop     # 停止后台服务
 | `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | 超过该长度的回复改为发送 HTML 文档（聊天中保留首段预览与提示）；设 `0` 关闭 |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
+| `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送带通知的运行摘要与变更卡片（含 Diff/Commit/Undo 按钮） |
+| `statusBoard` | `REMOTE_PI_STATUS_BOARD` | `true` | 是否为每个会话维护并置顶状态看板（节流更新状态、工具、模型、上下文与追问） |
 
 > **环境变量覆盖说明**：环境变量优先级高于配置文件。例如 `REMOTE_PI_EXTENSIONS` 可以传入 JSON 数组字符串（如 `'["~/ext.ts"]'`）或逗号分隔的路径列表。
 
