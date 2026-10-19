@@ -3,13 +3,12 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, truncate, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, truncate, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import MarkdownIt from "markdown-it";
@@ -38,9 +37,8 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /fork               Branch from a past user message
 /compact [focus]    Compact the context
 /export             Export as HTML
-/handoff            Hand off session to desktop Pi
 /abort              Stop current task (queue kept)
-/queue [clear]      View or clear the message queue
+/queue [clear]      View/reset queue display (native queue unavailable)
 /followup <text>    Queue a follow-up prompt
 
 Admin
@@ -58,9 +56,8 @@ const BOT_COMMANDS = [
   ["status", "Session status, tokens & cost"], ["agents", "Herdr agent status"],
   ["fork", "Branch from history"],
   ["compact", "Compact context"], ["export", "Export as HTML"],
-  ["handoff", "Hand off session to desktop"],
   ["abort", "Stop task (queue kept)"],
-  ["queue", "View or clear queue"],
+  ["queue", "View or reset queue display"],
   ["followup", "Queue a follow-up"],
 ].map(([command, description]) => ({ command, description }));
 
@@ -610,15 +607,7 @@ function formatStatusBoard(state = {}) {
   const lines = [];
 
   // 1. 运行状态与耗时
-  const handoff = state.handoff ?? (state.status === "handoff" ? (state.handoffAt ?? state.at ?? Date.now()) : null);
-  if (handoff) {
-    const at = typeof handoff === "object" && handoff !== null && handoff.at
-      ? handoff.at
-      : (typeof handoff === "number" || handoff instanceof Date ? handoff : Date.now());
-    const d = new Date(at);
-    const pad = (n) => String(n).padStart(2, "0");
-    lines.push(`🖥 On desktop since ${pad(d.getHours())}:${pad(d.getMinutes())}`);
-  } else if (state.status === "working") {
+  if (state.status === "working") {
     const durMs = state.elapsedMs ?? (state.runStartedAt ? Math.max(0, Date.now() - state.runStartedAt) : null);
     const dur = durMs != null ? formatDuration(durMs) : null;
     lines.push(dur ? `⏳ Working · ${dur}` : "⏳ Working");
@@ -746,7 +735,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {}, remoteBridges: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, statusBoards: {}, herdrPanes: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -754,18 +743,6 @@ function loadState(stateDir) {
       for (const [threadId, info] of Object.entries(raw.topics)) {
         if (typeof info?.cwd === "string" && existsSync(info.cwd)) {
           topics[threadId] = { cwd: info.cwd };
-        }
-      }
-    }
-    const handoffs = {};
-    if (typeof raw.handoffs === "object" && raw.handoffs !== null) {
-      for (const [key, info] of Object.entries(raw.handoffs)) {
-        if (typeof info?.sessionFile === "string" && existsSync(info.sessionFile)) {
-          handoffs[key] = {
-            sessionFile: info.sessionFile,
-            at: typeof info.at === "number" ? info.at : Date.now(),
-            ...(typeof info.paneId === "string" ? { paneId: info.paneId } : {}),
-          };
         }
       }
     }
@@ -793,51 +770,22 @@ function loadState(stateDir) {
         }
       }
     }
-    const remoteBridges = {};
-    if (typeof raw.remoteBridges === "object" && raw.remoteBridges !== null) {
-      for (const [paneId, info] of Object.entries(raw.remoteBridges)) {
-        if (typeof paneId === "string" && paneId && typeof info?.threadId === "number" && typeof info?.name === "string") {
-          remoteBridges[paneId] = {
-            threadId: info.threadId,
-            name: info.name,
-            ...(typeof info.sessionFile === "string" ? { sessionFile: info.sessionFile } : {}),
-          };
-        }
-      }
-    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
         ? raw.recentProjects.filter((p) => typeof p === "string" && existsSync(p))
         : [],
       topics,
-      handoffs,
       statusBoards,
       herdrPanes,
-      remoteBridges,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {}, remoteBridges: {} };
+    return { cwd: null, recentProjects: [], topics: {}, statusBoards: {}, herdrPanes: {} };
   }
 }
 
 function shellQuote(str) {
   return `'${String(str).replaceAll("'", "'\\''")}'`;
-}
-
-function formatRelativeTime(timestamp) {
-  const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
-  if (diffSec < 60) return "just now";
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  const diffDay = Math.floor(diffHr / 24);
-  return `${diffDay}d ago`;
-}
-
-function getDesktopSessionDir() {
-  return process.env.PI_CODING_AGENT_SESSION_DIR || join(homedir(), ".pi", "agent", "sessions");
 }
 
 async function readFirstLine(filePath) {
@@ -929,37 +877,6 @@ async function scanDesktopSessions(desktopDir, targetCwd, limit = 10) {
   }));
 }
 
-function resolveSessionDir(stateDir, cwd) {
-  const legacy = join(stateDir, "sessions", cwd.replace(/^\//, "").replaceAll("/", "-"));
-  if (existsSync(legacy)) {
-    return legacy;
-  }
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
-  const safeSlug = cwd.replace(/^[/\\]+/, "").replace(/[^a-zA-Z0-9_-]/g, "-");
-  return join(stateDir, "sessions", `${safeSlug}_${hash}`);
-}
-
-function resolveTopicSessionDir(stateDir, cwd, threadId) {
-  return `${resolveSessionDir(stateDir, cwd)}-t${threadId}`;
-}
-
-function resolvePiBin(configured) {
-  if (configured) return configured;
-  if (process.env.PI_BIN) return process.env.PI_BIN;
-  const candidates = [
-    "/opt/homebrew/bin/pi",
-    "/usr/local/bin/pi",
-    join(homedir(), ".npm-global", "bin", "pi"),
-    join(homedir(), ".local", "bin", "pi"),
-  ];
-  for (const candidate of candidates) {
-    try {
-      if (existsSync(candidate)) return candidate;
-    } catch {}
-  }
-  return "pi";
-}
-
 function parseNumberConfig(envVal, fileVal, defaultVal, { min, integer = false } = {}) {
   const raw = envVal !== undefined ? envVal : fileVal;
   if (raw === undefined || raw === null || raw === "") return defaultVal;
@@ -981,47 +898,6 @@ function loadConfig() {
       throw new Error(`Failed to parse config file ${path}: ${err.message}`);
     }
   }
-
-  let rawExtensions = [];
-  if (process.env.REMOTE_PI_EXTENSIONS !== undefined) {
-    const envExt = process.env.REMOTE_PI_EXTENSIONS.trim();
-    if (envExt.startsWith("[")) {
-      try {
-        rawExtensions = JSON.parse(envExt);
-      } catch (err) {
-        throw new Error(`Invalid JSON in REMOTE_PI_EXTENSIONS: ${err.message}`);
-      }
-    } else if (envExt) {
-      rawExtensions = envExt.split(",").map((s) => s.trim()).filter(Boolean);
-    }
-  } else if (file.extensions !== undefined) {
-    if (!Array.isArray(file.extensions)) {
-      throw new Error(`Invalid extensions configuration in ${path}: expected an array of strings`);
-    }
-    rawExtensions = file.extensions;
-  }
-
-  const extensions = [];
-  for (const item of rawExtensions) {
-    if (typeof item !== "string" || !item.trim()) {
-      throw new Error("Invalid extension path in configuration: expected non-empty string");
-    }
-    const resolvedExt = resolvePath(item.trim(), configDir);
-    if (!existsSync(resolvedExt)) {
-      throw new Error(`Configured extension not found: ${item} (resolved to ${resolvedExt})`);
-    }
-    if (!extensions.includes(resolvedExt)) {
-      extensions.push(resolvedExt);
-    }
-  }
-
-  const enableCompanionExtension = process.env.REMOTE_PI_COMPANION_EXTENSION !== undefined
-    ? process.env.REMOTE_PI_COMPANION_EXTENSION !== "false" && process.env.REMOTE_PI_COMPANION_EXTENSION !== "0"
-    : file.enableCompanionExtension !== false;
-
-  const herdr = process.env.REMOTE_PI_HERDR !== undefined
-    ? process.env.REMOTE_PI_HERDR !== "false" && process.env.REMOTE_PI_HERDR !== "0"
-    : file.herdr !== false;
 
   const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
   const savedState = loadState(stateDir);
@@ -1049,17 +925,10 @@ function loadConfig() {
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || telegram.allowedUserId || ""),
     cwd: targetCwd,
     configPath: path,
-    piBin: resolvePiBin(process.env.PI_BIN || file.piBin),
     stateDir,
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
-    approve: file.approve !== false,
-    enableCompanionExtension,
-    herdr,
-    extensions,
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
-    idleStopMinutes: parseNumberConfig(process.env.REMOTE_PI_IDLE_STOP_MINUTES, file.idleStopMinutes, 30, { min: 0 }),
-    maxSessions: parseNumberConfig(process.env.REMOTE_PI_MAX_SESSIONS, file.maxSessions, 4, { min: 1, integer: true }),
     downloadRetentionDays: parseNumberConfig(process.env.REMOTE_PI_DOWNLOAD_RETENTION_DAYS, file.downloadRetentionDays, 30, { min: 0 }),
     longReplyChars: parseNumberConfig(process.env.REMOTE_PI_LONG_REPLY_CHARS, file.longReplyChars, 8000, { min: 0 }),
     fallbackModels,
@@ -1070,7 +939,6 @@ function loadConfig() {
       ? process.env.REMOTE_PI_STATUS_BOARD !== "false" && process.env.REMOTE_PI_STATUS_BOARD !== "0"
       : file.statusBoard !== false,
   };
-  config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid telegram.botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid telegram.allowedUserId in ${path}`);
@@ -1446,8 +1314,8 @@ function runCommand(cmd, args = [], options = {}) {
 }
 
 // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, threadId, persistedPaneId, paneEnv = {}, runCmd = runCommand } = {}) {
-  if (disabled || piBin === "echo" || process.env.NODE_ENV === "test" || (HERDR_DISABLED_FOR_TEST && runCmd === runCommand)) return {};
+async function resolveHerdrEnvironment(cwd, { excludePaneIds, threadId, persistedPaneId, paneEnv = {}, runCmd = runCommand } = {}) {
+  if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand) return {};
 
   let herdrBin;
   try {
@@ -1541,365 +1409,13 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, t
   };
 }
 
-// ref: Herdr Socket API (https://herdr.dev/docs/integrations/ & ~/.pi/agent/extensions/herdr-agent-state.ts)
-class HerdrReporter {
-  constructor({ socketPath, paneId, source = "remote-pi", allowInTest = false } = {}) {
-    this.socketPath = socketPath;
-    this.paneId = paneId;
-    this.source = source;
-    this.allowInTest = allowInTest;
-    this.seq = Date.now() * 1000;
-    this.currentSessionPath = null;
-    this.sendInFlight = false;
-    this.queuedState = null;
-    this.lastState = null;
-    this.lastMessage = null;
-  }
-
-  nextSeq() {
-    return ++this.seq;
-  }
-
-  async sendRequestAttempt(request, timeoutMs = 500) {
-    if ((HERDR_DISABLED_FOR_TEST && !this.allowInTest) || !this.socketPath || !this.paneId) return true;
-    const socketEndpoint = process.platform === "win32" && this.socketPath ? `\\\\.\\pipe\\${this.socketPath}` : this.socketPath;
-    return new Promise((resolve) => {
-      let done = false;
-      let timer;
-      const finish = (ok) => {
-        if (done) return;
-        done = true;
-        if (timer) clearTimeout(timer);
-        try { socket.destroy(); } catch {}
-        resolve(ok);
-      };
-      const socket = net.createConnection(socketEndpoint);
-      socket.on("error", () => finish(false));
-      socket.on("connect", () => {
-        try { socket.write(`${JSON.stringify(request)}\n`); }
-        catch { finish(false); }
-      });
-      socket.on("data", () => finish(true));
-      socket.on("end", () => finish(false));
-      timer = setTimeout(() => finish(false), timeoutMs);
-      timer.unref?.();
-    });
-  }
-
-  async sendRequest(request) {
-    try {
-      if (await this.sendRequestAttempt(request, 500)) return;
-      await this.sendRequestAttempt(request, 1500);
-    } catch {}
-  }
-
-  async reportSession(sessionPath) {
-    if (!sessionPath) return;
-    this.currentSessionPath = sessionPath;
-    await this.sendRequest({
-      id: `${this.source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-      method: "pane.report_agent_session",
-      params: {
-        pane_id: this.paneId,
-        source: this.source,
-        agent: "pi",
-        seq: this.nextSeq(),
-        agent_session_path: sessionPath,
-      },
-    });
-  }
-
-  async reportMetadata(title, displayAgent = "pi · Telegram") {
-    await this.sendRequest({
-      id: `${this.source}:meta:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-      method: "pane.report_metadata",
-      params: {
-        pane_id: this.paneId,
-        source: this.source,
-        agent: "pi",
-        display_agent: displayAgent,
-        title,
-        seq: this.nextSeq(),
-      },
-    });
-  }
-
-  async sendState(state, message) {
-    const params = {
-      pane_id: this.paneId,
-      source: this.source,
-      agent: "pi",
-      state,
-      seq: this.nextSeq(),
-    };
-    if (message) params.message = message;
-    if (this.currentSessionPath) params.agent_session_path = this.currentSessionPath;
-    await this.sendRequest({
-      id: `${this.source}:state:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-      method: "pane.report_agent",
-      params,
-    });
-  }
-
-  reportState(state, message = undefined) {
-    if (state === this.lastState && message === this.lastMessage) return;
-    this.lastState = state;
-    this.lastMessage = message;
-    this.queuedState = { state, message };
-    if (!this.sendInFlight) {
-      void this.drainQueue();
-    }
-  }
-
-  async drainQueue() {
-    if (this.sendInFlight) return;
-    this.sendInFlight = true;
-    try {
-      while (this.queuedState) {
-        const next = this.queuedState;
-        this.queuedState = null;
-        await this.sendState(next.state, next.message);
-      }
-    } finally {
-      this.sendInFlight = false;
-      if (this.queuedState) void this.drainQueue();
-    }
-  }
-
-  async releaseAgent() {
-    this.lastState = null;
-    this.lastMessage = null;
-    this.queuedState = null;
-    await this.sendRequest({
-      id: `${this.source}:release:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-      method: "pane.release_agent",
-      params: {
-        pane_id: this.paneId,
-        source: this.source,
-        agent: "pi",
-        seq: this.nextSeq(),
-      },
-    });
-  }
-}
-
-// ref: Pi Session Format (docs/session-format.md)
-function renderSessionEntry(entry) {
-  if (!entry || typeof entry !== "object") return "";
-  switch (entry.type) {
-    case "message": {
-      const msg = entry.message;
-      if (!msg) return "";
-      if (msg.role === "user") {
-        let text = "";
-        if (typeof msg.content === "string") {
-          text = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          text = msg.content
-            .map((c) => (c.type === "text" ? c.text : c.type === "image" ? "[image]" : ""))
-            .filter(Boolean)
-            .join(" ");
-        }
-        return `\x1b[36m› ${text.trim()}\x1b[0m`;
-      }
-      if (msg.role === "assistant") {
-        const parts = [];
-        if (typeof msg.content === "string") {
-          if (msg.content.trim()) parts.push(msg.content);
-        } else if (Array.isArray(msg.content)) {
-          for (const block of msg.content) {
-            if (block.type === "text" && block.text?.trim()) {
-              parts.push(block.text);
-            } else if (block.type === "toolCall") {
-              parts.push(`\x1b[33m⚙️ ${toolSummary(block.name, block.args)}\x1b[0m`);
-            }
-          }
-        }
-        return parts.join("\n");
-      }
-      if (msg.role === "toolResult") {
-        if (msg.isError) {
-          let errText = "";
-          if (typeof msg.content === "string") errText = msg.content;
-          else if (Array.isArray(msg.content)) errText = msg.content.map((c) => c.text || "").join(" ");
-          return `\x1b[31m❌ ${msg.toolName || "tool"} error: ${errText.trim()}\x1b[0m`;
-        }
-        return "";
-      }
-      return "";
-    }
-    case "model_change": {
-      const name = entry.provider ? `${entry.provider}/${entry.modelId}` : (entry.modelId || "model");
-      return `\x1b[2m⚡ Model changed to ${name}\x1b[0m`;
-    }
-    case "thinking_level_change": {
-      return `\x1b[2m🧠 Thinking level: ${entry.thinkingLevel}\x1b[0m`;
-    }
-    case "compaction": {
-      const tokens = entry.tokensBefore ? ` (${entry.tokensBefore} tokens)` : "";
-      return `\x1b[2m📦 Context compacted${tokens}\x1b[0m`;
-    }
-    case "branch_summary": {
-      const summary = entry.summary ? ` ${(entry.summary || "").slice(0, 80)}` : "";
-      return `\x1b[2m🌿 Branch summary:${summary}\x1b[0m`;
-    }
-    case "custom_message": {
-      if (entry.display) {
-        const text = typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content);
-        return `\x1b[35m[extension] ${text}\x1b[0m`;
-      }
-      return "";
-    }
-    default:
-      return "";
-  }
-}
-
-class SessionTail {
-  constructor(filePath, { onEntries, onLines, interval = 500, startAtEnd = false } = {}) {
-    this.filePath = filePath;
-    this.onEntries = onEntries;
-    this.onLines = onLines;
-    this.interval = interval;
-    this.offset = 0;
-    this.leftover = "";
-    this.decoder = new StringDecoder("utf8");
-    this.timer = null;
-    this.stopped = false;
-    this.reading = false;
-    this.startAtEnd = startAtEnd;
-  }
-
-  start() {
-    this.stopped = false;
-    this.timer = setInterval(() => this.readNew(), this.interval);
-    this.timer.unref?.();
-    return this;
-  }
-
-  stop() {
-    this.stopped = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-  }
-
-  async readNew() {
-    if (this.reading || this.stopped) return [];
-    this.reading = true;
-    let fh;
-    const resultLines = [];
-    const resultEntries = [];
-    try {
-      let statInfo;
-      try {
-        statInfo = await stat(this.filePath);
-      } catch {
-        return [];
-      }
-      if (this.startAtEnd) {
-        this.offset = statInfo.size;
-        this.startAtEnd = false;
-        return [];
-      }
-      if (statInfo.size < this.offset) {
-        this.offset = 0;
-        this.leftover = "";
-        this.decoder = new StringDecoder("utf8");
-      }
-      if (statInfo.size === this.offset) return [];
-
-      fh = await open(this.filePath, "r");
-      const len = statInfo.size - this.offset;
-      const buf = Buffer.alloc(len);
-      const { bytesRead } = await fh.read(buf, 0, len, this.offset);
-      this.offset += bytesRead;
-      const text = this.leftover + this.decoder.write(buf.subarray(0, bytesRead));
-      const lines = text.split("\n");
-      this.leftover = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        resultLines.push(line);
-        if (this.onEntries) {
-          try {
-            resultEntries.push(JSON.parse(line));
-          } catch {}
-        }
-      }
-      if (resultLines.length && this.onLines) {
-        await this.onLines(resultLines);
-      }
-      if (resultEntries.length && this.onEntries) {
-        await this.onEntries(resultEntries);
-      }
-      return resultLines;
-    } catch {
-      return [];
-    } finally {
-      if (fh) await fh.close().catch(() => {});
-      this.reading = false;
-    }
-  }
-}
-
-async function watchSessionViewer(sessionFile) {
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => process.exit(0));
-  }
-  let cwd = process.cwd();
-  try {
-    const header = await parseSessionHeader(sessionFile);
-    if (header?.cwd) cwd = header.cwd;
-  } catch {}
-
-  console.log("\x1b[1m=== Telegram session — read only ===\x1b[0m");
-  console.log("\x1b[2mUse /handoff in Telegram to continue here\x1b[0m");
-  console.log(`\x1b[2mCwd:     ${cwd}\x1b[0m`);
-  console.log(`\x1b[2mSession: ${sessionFile}\x1b[0m`);
-  console.log("\x1b[2m---\x1b[0m");
-
-  const tail = new SessionTail(sessionFile, {
-    interval: 500,
-    onEntries: (entries) => {
-      for (const entry of entries) {
-        const rendered = renderSessionEntry(entry);
-        if (rendered) console.log(rendered);
-      }
-    },
-  });
-  await tail.readNew();
-  tail.start();
-  while (true) {
-    await sleep(60_000);
-  }
-}
-
 const HERDR_STATUS_ICON = { working: "⏳", blocked: "✋", done: "✅", idle: "💤", unknown: "❔" };
 
-// 审批/提问 UI 的编号选项（Claude Code「❯ 1. Yes」、Codex「› 1. Yes, proceed」等）；只取屏幕上最后一组连续编号
-function herdrChoices(screen) {
-  const choices = [];
-  for (const line of String(screen || "").split("\n").slice(-30)) {
-    const match = line.match(/^[\s│┃|]*(?:[❯›>▶➜]\s*)?(\d)[.)]\s+(\S.*?)\s*[│┃|]?\s*$/);
-    if (!match) continue;
-    if (match[1] === "1") choices.length = 0;
-    if (choices.length && Number(match[1]) !== Number(choices.at(-1).key) + 1) continue;
-    choices.push({ key: match[1], label: match[2].slice(0, 40) });
-  }
-  return choices.length >= 2 ? choices : [];
-}
-
-// /remote-control（herdr-extension.ts）通过 herdr 原生 pane metadata token 标记订阅
+// /remote-control（remote-pi.ts）通过 herdr 原生 pane metadata token 标记订阅
 const HERDR_OPT_IN_TOKEN = "remote_pi";
 
 function herdrOptedIn(agent) {
   return agent?.agent === "pi" && agent?.tokens?.[HERDR_OPT_IN_TOKEN] === "on";
-}
-
-function isTopicGoneError(error) {
-  const msg = String(error?.message || error || "").toLowerCase();
-  return msg.includes("message thread not found") || msg.includes("topic_deleted") || msg.includes("thread not found");
 }
 
 // ref: Herdr pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
@@ -1916,119 +1432,6 @@ function resolveAgentSessionFile(agent) {
   return agent?.tokens?.remote_pi_session || null;
 }
 
-async function getLastAssistantReply(sessionFile) {
-  let fh;
-  try {
-    const fileStat = await stat(sessionFile);
-    const totalSize = fileStat.size;
-    if (totalSize === 0) return null;
-
-    fh = await open(sessionFile, "r");
-    const CHUNK_SIZE = 256 * 1024;
-    const MAX_READ = 4 * 1024 * 1024;
-    let readSize = Math.min(CHUNK_SIZE, totalSize);
-
-    while (readSize <= totalSize) {
-      const position = totalSize - readSize;
-      const buf = Buffer.alloc(readSize);
-      const { bytesRead } = await fh.read(buf, 0, readSize, position);
-      let text = buf.toString("utf8", 0, bytesRead);
-      if (position > 0) {
-        const firstNewline = text.indexOf("\n");
-        if (firstNewline >= 0) text = text.slice(firstNewline + 1);
-      }
-      const lines = text.split("\n");
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        try {
-          const entry = JSON.parse(line);
-          if (entry?.type === "message" && entry.message?.role === "assistant") {
-            const msgContent = entry.message.content;
-            if (typeof msgContent === "string" && msgContent.trim()) {
-              return msgContent.trim();
-            }
-            if (Array.isArray(msgContent)) {
-              const textParts = msgContent.filter((b) => b.type === "text" && b.text?.trim()).map((b) => b.text.trim());
-              if (textParts.length) return textParts.join("\n");
-            }
-          }
-        } catch {}
-      }
-      if (position === 0 || readSize >= MAX_READ) break;
-      readSize = Math.min(readSize * 2, MAX_READ, totalSize);
-    }
-  } catch {} finally {
-    if (fh) await fh.close().catch(() => {});
-  }
-  return null;
-}
-
-function mapBridgeEntries(entries, { isEcho = () => false } = {}) {
-  const result = [];
-  let pendingTools = [];
-
-  function flushTools() {
-    if (!pendingTools.length) return;
-    result.push({
-      type: "tool_panel",
-      tools: [...pendingTools],
-      text: renderToolPanel(pendingTools, true),
-    });
-    pendingTools = [];
-  }
-
-  for (const entry of entries) {
-    if (!entry || typeof entry !== "object") continue;
-    if (entry.type === "compaction") {
-      flushTools();
-      result.push({ type: "compaction", text: "🗜 Compacted" });
-      continue;
-    }
-    if (entry.type !== "message" || !entry.message) continue;
-    const msg = entry.message;
-    if (msg.role === "user") {
-      flushTools();
-      const rawText = typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map((c) => (c.type === "text" ? c.text : "")).filter(Boolean).join(" ")
-          : "";
-      if (rawText && !isEcho(rawText)) {
-        result.push({ type: "user", text: `👤 ${rawText.trim().slice(0, 500)}` });
-      }
-      continue;
-    }
-    if (msg.role === "assistant") {
-      if (typeof msg.content === "string") {
-        if (msg.content.trim()) {
-          flushTools();
-          result.push({ type: "assistant", text: msg.content.trim() });
-        }
-      } else if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "toolCall") {
-            pendingTools.push({
-              name: block.name,
-              args: block.args,
-              summary: toolSummary(block.name, block.args),
-              status: "done",
-            });
-          } else if (block.type === "text" && block.text?.trim()) {
-            flushTools();
-            result.push({ type: "assistant", text: block.text.trim() });
-          }
-          // block.type === "thinking" is ignored
-        }
-      }
-      continue;
-    }
-    // msg.role === "toolResult" is ignored
-  }
-  flushTools();
-  return result;
-}
-
 function herdrTail(screen, maxLines = 30, maxChars = 2500) {
   const lines = String(screen || "").replace(/\s+$/, "").split("\n");
   return lines.slice(-maxLines).join("\n").slice(-maxChars).trim();
@@ -2037,16 +1440,14 @@ function herdrTail(screen, maxLines = 30, maxChars = 2500) {
 // ref: Herdr socket API events.subscribe（`herdr api schema --json`；订阅后连接变为单向事件流，订阅集合变化需重连）
 // 推送负责实时性，每 15 秒 agent list 全量对账兜底（漏事件、herdr 重启、合盖睡眠）
 class HerdrWatcher {
-  constructor({ bin, socketPath, isExcluded, onTransition, onOptInChange }) {
+  constructor({ bin, socketPath, isExcluded, onTransition }) {
     this.bin = bin;
     this.socketPath = socketPath;
     this.isExcluded = isExcluded;
     this.onTransition = onTransition;
-    this.onOptInChange = onOptInChange;
     this.statuses = new Map();
     this.agents = new Map();
     this.workspaces = new Map();
-    this.optedInPanes = new Map();
     this.socket = null;
     this.subscribedKey = null;
     this.syncChain = Promise.resolve();
@@ -2096,45 +1497,6 @@ class HerdrWatcher {
     return this.syncChain;
   }
 
-  computeOptInDiff(agents) {
-    const currentOptedIn = new Map();
-    for (const agent of agents) {
-      if (!this.isExcluded(agent.pane_id) && herdrOptedIn(agent)) {
-        currentOptedIn.set(agent.pane_id, agent);
-      }
-    }
-    const added = [];
-    const removed = [];
-    const updated = [];
-    for (const [paneId, agent] of currentOptedIn) {
-      const prev = this.optedInPanes.get(paneId);
-      const sessionFile = resolveAgentSessionFile(agent);
-      if (!prev) {
-        added.push(agent);
-      } else if (prev.sessionFile !== sessionFile) {
-        updated.push(agent);
-      }
-    }
-    for (const paneId of this.optedInPanes.keys()) {
-      if (!currentOptedIn.has(paneId)) {
-        removed.push(paneId);
-      }
-    }
-    for (const paneId of removed) this.optedInPanes.delete(paneId);
-    for (const agent of added) {
-      this.optedInPanes.set(agent.pane_id, { agent, sessionFile: resolveAgentSessionFile(agent) });
-    }
-    for (const agent of updated) {
-      this.optedInPanes.set(agent.pane_id, { agent, sessionFile: resolveAgentSessionFile(agent) });
-    }
-    for (const [paneId, agent] of currentOptedIn) {
-      if (this.optedInPanes.has(paneId)) {
-        this.optedInPanes.get(paneId).agent = agent;
-      }
-    }
-    return { added, removed, updated };
-  }
-
   async doSync() {
     if (this.stopped) return;
     const [agentList, workspaceList] = await Promise.all([this.cliJson(["agent", "list"]), this.cliJson(["workspace", "list"])]);
@@ -2143,26 +1505,16 @@ class HerdrWatcher {
     this.agents = new Map(agents.map((a) => [a.pane_id, a]));
     for (const agent of agents) this.observe(agent.pane_id, agent.agent_status);
     for (const paneId of this.statuses.keys()) if (!this.agents.has(paneId)) this.statuses.delete(paneId);
-    const diff = this.computeOptInDiff(agents);
-    if (diff.added.length || diff.removed.length || diff.updated.length) {
-      const failed = await this.onOptInChange?.(diff);
-      if (Array.isArray(failed)) {
-        for (const paneId of failed) {
-          this.optedInPanes.delete(paneId);
-        }
-      }
-    }
     const paneIds = [...this.agents.keys()].sort();
     if (paneIds.join(",") !== this.subscribedKey || !this.socket) this.subscribe(paneIds);
   }
 
-  // 首次见到某 pane 只记录不通知；聚焦 pane 完成后直接是 idle 而非 done，因此 working→idle 也算完成
+  // 首见和重复状态不通知；完成由原生 Pi 事件处理，这里只补充 TUI 待确认提醒。
   observe(paneId, status) {
     const prev = this.statuses.get(paneId);
     this.statuses.set(paneId, status);
     if (prev === undefined || prev === status || this.isExcluded(paneId)) return;
-    const finished = (status === "done" || status === "idle") && (prev === "working" || prev === "blocked");
-    if (status === "blocked" || finished) this.notify(paneId, status === "blocked" ? "blocked" : "done");
+    if (status === "blocked") this.notify(paneId, status);
   }
 
   // 只推送在 Pi 里开启 /remote-control 的 pane：现取 agent get，以 pane 上的 remote_pi token 为准（默认不推送）
@@ -2234,197 +1586,6 @@ class HerdrWatcher {
     const name = agent?.name || agent?.agent || "agent";
     const where = this.workspaces.get(agent?.workspace_id) || (agent?.cwd ? basename(agent.cwd) : "");
     return `${name}${where ? ` · ${where}` : ""} (${paneId})`;
-  }
-}
-
-class PiRpc {
-  constructor(config, onEvent, onClose) {
-    this.config = config;
-    this.onEvent = onEvent;
-    this.onClose = onClose;
-    this.pending = new Map();
-    this.sequence = 0;
-    this.proc = null;
-    this.starting = null;
-    this.pingTimer = null;
-    this.missedPings = 0;
-    this.stopping = false;
-  }
-
-  async ensureStarted() {
-    if (this.proc) return;
-    this.starting ??= this.start().finally(() => { this.starting = null; });
-    await this.starting;
-  }
-
-  async start() {
-    this.stopping = false;
-    this.missedPings = 0; // 新进程从零计失联，避免上个进程被杀后的余数误杀新进程
-    if (typeof this.config.beforeStart === "function") await this.config.beforeStart();
-    const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
-    if (this.config.approve) args.push("--approve");
-    const companionPath = join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs");
-    const extensionsToLoad = [];
-    if (this.config.enableCompanionExtension && existsSync(companionPath)) {
-      extensionsToLoad.push(companionPath);
-    }
-    if (Array.isArray(this.config.extensions)) {
-      for (const ext of this.config.extensions) {
-        if (!extensionsToLoad.includes(ext)) {
-          extensionsToLoad.push(ext);
-        }
-      }
-    }
-    for (const ext of extensionsToLoad) {
-      args.push("-e", ext);
-    }
-    let herdrEnv = {};
-    if (this.config.herdr !== false) {
-      try {
-        const excludePaneIds = typeof this.config.getExcludePaneIds === "function"
-          ? this.config.getExcludePaneIds()
-          : [];
-        herdrEnv = await resolveHerdrEnvironment(this.config.cwd, {
-          piBin: this.config.piBin,
-          excludePaneIds,
-          threadId: this.config.threadId,
-          persistedPaneId: this.config.persistedPaneId,
-        });
-        if (herdrEnv.HERDR_PANE_ID) {
-          console.log(`${new Date().toISOString()} [herdr] attached to pane ${herdrEnv.HERDR_PANE_ID} (workspace ${herdrEnv.HERDR_WORKSPACE_ID})`);
-        }
-      } catch (err) {
-        console.warn(`${new Date().toISOString()} [herdr] resolveHerdrEnvironment failed: ${err.message}`);
-      }
-    }
-    this.herdrEnv = herdrEnv;
-    const env = {
-      ...process.env,
-      REMOTE_PI_GATEWAY: "1",
-      PATH: buildDevPath(process.env.PATH),
-      ...herdrEnv,
-    };
-    this.proc = spawn(this.config.piBin, args, { cwd: this.config.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
-    this.proc.stderr.pipe(process.stderr);
-    await new Promise((resolveSpawn, reject) => {
-      this.proc.once("spawn", resolveSpawn);
-      this.proc.once("error", reject);
-    });
-    if (typeof this.config.onStarted === "function") {
-      this.config.onStarted(this.herdrEnv);
-    }
-    this.proc.stdin.on("error", () => {}); // EPIPE 竞态（kill 时在途写入）；pending 由 close 路径 reject
-
-    let buffer = "";
-    this.proc.stdout.setEncoding("utf8");
-    this.proc.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      let idx;
-      while ((idx = buffer.indexOf("\n")) !== -1) {
-        let line = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (line) this.handleLine(line);
-      }
-    });
-    this.proc.on("close", (code, signal) => {
-      const wasStopping = this.stopping;
-      if (this.pingTimer) clearInterval(this.pingTimer);
-      this.pingTimer = null;
-      for (const { reject, timer } of this.pending.values()) {
-        clearTimeout(timer);
-        reject(new Error(`Pi exited (${code ?? signal})`));
-      }
-      this.pending.clear();
-      this.proc = null;
-      // ref: Node.js child_process close lifecycle (https://nodejs.org/api/child_process.html#event-close)
-      if (this.onClose) this.onClose({ code, signal, expected: wasStopping });
-    });
-
-    // MCP 式 ping（spec: utilities/ping）：挂而不死的 Pi 连续 2 次失联后强杀，走 close→respawn 路径
-    const pingMs = this.config.pingIntervalMs ?? 30_000;
-    const pongMs = this.config.pingTimeoutMs ?? 10_000;
-    this.pingTimer = setInterval(() => {
-      this.request("get_state", {}, pongMs, true)
-        .then(() => { this.missedPings = 0; })
-        .catch(() => {
-          if (++this.missedPings >= 2) {
-            console.error(`${new Date().toISOString()} [pi:ping] 2 consecutive pings lost, killing Pi`);
-            this.proc?.kill("SIGKILL");
-          }
-        });
-    }, pingMs);
-    this.pingTimer.unref();
-  }
-
-  handleLine(line) {
-    let value;
-    try { value = JSON.parse(line); }
-    catch { console.error("Invalid Pi RPC line:", line.slice(0, 500)); return; }
-    if (value.type === "response" && value.id && this.pending.has(value.id)) {
-      const pending = this.pending.get(value.id);
-      this.pending.delete(value.id);
-      clearTimeout(pending.timer);
-      value.success ? pending.resolve(value.data) : pending.reject(new Error(value.error || `${value.command} failed`));
-    } else {
-      this.onEvent(value);
-    }
-  }
-
-  async request(type, fields = {}, timeout = 600_000, quiet = false) {
-    await this.ensureStarted();
-    const id = `rpc-${++this.sequence}`;
-    const t0 = performance.now();
-    return new Promise((resolveRequest, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        const ms = Math.round(performance.now() - t0);
-        if (!quiet) console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} timed out after ${ms}ms`);
-        reject(new Error(`Pi RPC ${type} timed out`));
-      }, timeout);
-      this.pending.set(id, {
-        resolve: (data) => {
-          const ms = Math.round(performance.now() - t0);
-          if (!quiet) console.log(`${new Date().toISOString()} [pi:rpc] ${type} #${id} ok in ${ms}ms`);
-          resolveRequest(data);
-        },
-        reject: (err) => {
-          const ms = Math.round(performance.now() - t0);
-          console.error(`${new Date().toISOString()} [pi:rpc] ${type} #${id} failed in ${ms}ms: ${err.message}`);
-          reject(err);
-        },
-        timer,
-      });
-      try {
-        this.write({ id, type, ...fields });
-      } catch (err) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(err);
-      }
-    });
-  }
-
-  write(value) {
-    if (!this.proc?.stdin?.writable) throw new Error("Pi RPC is not running");
-    this.proc.stdin.write(`${JSON.stringify(value)}\n`);
-  }
-
-  stop() {
-    this.stopping = true;
-    if (this.pingTimer) clearInterval(this.pingTimer);
-    if (this.proc) {
-      const proc = this.proc;
-      this.proc = null;
-      proc.kill("SIGTERM");
-      const killTimer = setTimeout(() => {
-        if (proc.exitCode === null && proc.signalCode === null) {
-          try { proc.kill("SIGKILL"); } catch {}
-        }
-      }, 5000);
-      killTimer.unref?.();
-      proc.once("exit", () => clearTimeout(killTimer));
-    }
   }
 }
 
@@ -2540,7 +1701,7 @@ class PaneServer {
   }
 }
 
-// Same request/write/event shape as PiRpc; stopping the gateway never stops an interactive Pi.
+// Stopping this view or the gateway never stops the interactive Pi.
 class PaneRpc {
   constructor(session, onEvent, onClose) {
     this.session = session;
@@ -2643,16 +1804,13 @@ class PaneRpc {
 
 // A Telegram view of a native interactive Pi; multiple views may share the same PaneRpc connection.
 class ChatSession {
-  constructor(gateway, { threadId = null, cwd, sessionDir }) {
+  constructor(gateway, { threadId = null, cwd }) {
     this.gateway = gateway;
     this.threadId = threadId;
     this.key = threadId ? `t:${threadId}` : "main";
     this.cwd = cwd;
-    this.sessionDir = sessionDir;
     const stored = gateway.state.herdrPanes?.[this.key];
     this.binding = typeof stored === "string" ? { paneId: stored, cwd, owned: true } : { cwd, ...stored };
-    const legacyHandoff = gateway.state.handoffs?.[this.key];
-    if (legacyHandoff) this.binding = { cwd, paneId: legacyHandoff.paneId, sessionFile: legacyHandoff.sessionFile, owned: false };
     this.piNotRunning = false;
     this.chatId = gateway.chatId;
 
@@ -2673,8 +1831,6 @@ class ChatSession {
     this.mediaGroups = new Map();
     this.eventChain = Promise.resolve();
     this.updateChain = Promise.resolve();
-    this.lastActiveAt = Date.now();
-
     this.statusBoardMessageId = gateway.state.statusBoards?.[this.key] || null;
     this.statusBoardLastText = null;
     this.statusBoardLastEditAt = 0;
@@ -2690,7 +1846,6 @@ class ChatSession {
     this.currentThinking = null;
     this.runSnapshotPromise = null;
 
-    this.herdrReporter = null;
     this.pi = this.createPi();
   }
 
@@ -2698,14 +1853,6 @@ class ChatSession {
     return new PaneRpc(this, (event) => this.queueEvent(event), (exit) => {
       this.handlePiExit(exit).catch((error) => console.warn(`[bridge] disconnect: ${error.message}`));
     });
-  }
-
-  get handoff() {
-    return this.gateway.state.handoffs?.[this.key] ?? null;
-  }
-
-  touchActivity() {
-    this.lastActiveAt = Date.now();
   }
 
   threadExtra(extra = {}) {
@@ -2752,143 +1899,10 @@ class ChatSession {
     }
   }
 
-  initHerdrReporter(herdrEnv) {
-    if (herdrEnv?.HERDR_SOCKET_PATH && herdrEnv?.HERDR_PANE_ID) {
-      this.herdrReporter = new HerdrReporter({
-        socketPath: herdrEnv.HERDR_SOCKET_PATH,
-        paneId: herdrEnv.HERDR_PANE_ID,
-      });
-    }
-  }
-
-  async onPiStarted() {
-    if (!this.herdrReporter) return;
-    try {
-      const stats = await this.pi.request("get_session_stats").catch(() => null);
-      if (stats?.sessionFile) {
-        // 先报一次当前状态：Herdr 只有收到 report_agent 才把该 pane 视为 agent，session/metadata 才会生效
-        this.herdrReporter.currentSessionPath = stats.sessionFile;
-        this.herdrReporter.reportState(this.isStreaming ? "working" : "idle");
-        await this.herdrReporter.reportSession(stats.sessionFile);
-        const title = this.threadId ? (basename(this.cwd) || `Topic #${this.threadId}`) : "Telegram";
-        await this.herdrReporter.reportMetadata(title);
-        await this.startViewer(stats.sessionFile);
-      }
-    } catch (err) {
-      console.warn(`[herdr] onPiStarted failed: ${err.message}`);
-    }
-  }
-
   async onSessionSwitched(sessionPath = null) {
     const state = await this.pi.request("get_state");
     this.binding = { ...this.binding, sessionFile: sessionPath || state.sessionFile };
     await this.gateway.persistPaneSession(this);
-  }
-
-  async isPaneAtShell(paneId, herdrBin) {
-    if (HERDR_DISABLED_FOR_TEST) return true;
-    try {
-      const raw = await runCommand(herdrBin, ["pane", "process-info", "--pane", paneId], { timeout: 3000 });
-      const parsed = JSON.parse(raw);
-      const info = parsed.result?.process_info;
-      if (!info) return false;
-      return info.foreground_process_group_id === info.shell_pid;
-    } catch {
-      return false;
-    }
-  }
-
-  async getPaneForegroundCmdline(paneId, herdrBin) {
-    if (HERDR_DISABLED_FOR_TEST) return "";
-    try {
-      const raw = await runCommand(herdrBin, ["pane", "process-info", "--pane", paneId], { timeout: 3000 });
-      const parsed = JSON.parse(raw);
-      const info = parsed.result?.process_info;
-      if (!info?.foreground_processes) return "";
-      return info.foreground_processes.map((p) => p.cmdline || "").join(" ");
-    } catch {
-      return "";
-    }
-  }
-
-  async stopViewer(paneId = null) {
-    if (HERDR_DISABLED_FOR_TEST) return;
-    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH || process.env.HERDR_BIN_PATH || "herdr";
-    const targetPane = paneId || this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
-    if (!targetPane) return;
-    try {
-      if (await this.isPaneAtShell(targetPane, herdrBin)) return;
-      await runCommand(herdrBin, ["pane", "send-keys", targetPane, "ctrl+c"], { timeout: 2000 }).catch(() => {});
-      const start = Date.now();
-      while (Date.now() - start < 3000) {
-        await sleep(150);
-        if (await this.isPaneAtShell(targetPane, herdrBin)) return;
-      }
-    } catch (err) {
-      console.warn(`[herdr] stopViewer failed: ${err.message}`);
-    }
-  }
-
-  async startViewer(sessionFile) {
-    if (HERDR_DISABLED_FOR_TEST) return;
-    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH;
-    const paneId = this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
-    if (!herdrBin || !paneId || !sessionFile) return;
-
-    try {
-      const fgCmd = await this.getPaneForegroundCmdline(paneId, herdrBin);
-      if (fgCmd.includes("--watch-session") && fgCmd.includes(sessionFile)) {
-        return;
-      }
-      if (!(await this.isPaneAtShell(paneId, herdrBin))) {
-        await this.stopViewer(paneId);
-      }
-      const gatewayPath = fileURLToPath(import.meta.url);
-      const cmd = `${shellQuote(process.execPath)} ${shellQuote(gatewayPath)} --watch-session ${shellQuote(sessionFile)}`;
-      await runCommand(herdrBin, ["pane", "run", paneId, cmd], { timeout: 5000 });
-    } catch (err) {
-      console.warn(`[herdr] startViewer failed on pane ${paneId}: ${err.message}`);
-    }
-  }
-
-  async paneExists(paneId, herdrBin) {
-    if (!herdrBin || !paneId) return false;
-    if (HERDR_DISABLED_FOR_TEST) return true;
-    try {
-      const out = await runCommand(herdrBin, ["pane", "get", paneId], { timeout: 3000 });
-      const parsed = JSON.parse(out);
-      return Boolean(parsed.result?.pane);
-    } catch {
-      return false;
-    }
-  }
-
-  async getPaneAgentStatus(paneId, herdrBin) {
-    if (HERDR_DISABLED_FOR_TEST) return null;
-    try {
-      const out = await runCommand(herdrBin, ["pane", "get", paneId], { timeout: 3000 });
-      const parsed = JSON.parse(out);
-      return parsed.result?.pane?.agent_status ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  async quitPaneAgent(paneId, herdrBin) {
-    if (HERDR_DISABLED_FOR_TEST) return true;
-    try {
-      await runCommand(herdrBin, ["pane", "send-text", paneId, "/quit"], { timeout: 3000 });
-      await runCommand(herdrBin, ["pane", "send-keys", paneId, "enter"], { timeout: 3000 });
-    } catch (err) {
-      console.warn(`[herdr] failed to send /quit to ${paneId}: ${err.message}`);
-    }
-    const startWait = Date.now();
-    let isShell = await this.isPaneAtShell(paneId, herdrBin);
-    while (!isShell && Date.now() - startWait < 10000) {
-      await sleep(150);
-      isShell = await this.isPaneAtShell(paneId, herdrBin);
-    }
-    return isShell;
   }
 
   async handlePiExit({ expected }) {
@@ -3030,7 +2044,6 @@ class ChatSession {
         return this.send(`✅ Session name: ${argument}`);
       }
       case "status": return this.showSession();
-      case "handoff": return this.send("The terminal and Telegram already share this session. Use /help.");
       case "agents": return this.gateway.showHerdrAgents();
       case "fork": return this.showForks();
       case "compact": {
@@ -3340,208 +2353,15 @@ class ChatSession {
     }))));
   }
 
-  async showDesktopSessions() {
-    const sessions = await scanDesktopSessions(getDesktopSessionDir(), this.cwd, 10);
-    if (!sessions.length) return this.send("No desktop sessions found for this directory.");
-    return this.send("Pick a desktop session:", this.keyboard(sessions.map((session) => ({
-      label: `${formatRelativeTime(session.mtime)} · ${session.title}`,
-      action: { type: "pick_desktop_session", path: session.path },
-    }))));
-  }
-
-  async confirmDesktopSession(sessionPath) {
-    const keyboard = {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Confirm", callback_data: this.action({ type: "confirm_desktop_resume", path: sessionPath, confirmed: true }) },
-            { text: "Cancel", callback_data: this.action({ type: "confirm_desktop_resume", path: sessionPath, confirmed: false }) },
-          ],
-        ],
-      },
-    };
-    return this.send("Quit the desktop Pi on this session first", keyboard);
-  }
-
-  async handleConfirmDesktopResume(sessionPath, confirmed) {
-    if (!confirmed) {
-      return this.send("Resume cancelled");
-    }
-    if (this.gateway.state.handoffs?.[this.key]) {
-      delete this.gateway.state.handoffs[this.key];
-      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
-    }
-    if (this.isStreaming) await this.pi.request("abort").catch(() => {});
-    this.resetSessionState();
-    const result = await this.pi.request("switch_session", { sessionPath });
-    if (!result.cancelled) {
-      const state = await this.pi.request("get_state").catch(() => null);
-      if (state?.model?.provider && state?.model?.id) {
-        this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-      }
-      if (state?.thinkingLevel) {
-        this.currentThinking = state.thinkingLevel;
-      }
-      await this.onSessionSwitched(sessionPath);
-      this.scheduleStatusBoardUpdate();
-    }
-    return this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
-  }
-
-  async handleHandoff() {
-    if (this.isStreaming) {
-      return this.send("Cannot hand off while Pi is working. Send /abort first.");
-    }
-    if (this.handoff) {
-      return this.sendHandoffPrompt();
-    }
-    const stats = await this.pi.request("get_session_stats").catch(() => null);
-    const sessionFile = stats?.sessionFile;
-    if (!sessionFile) return this.send("No active session file to hand off.");
-
-    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH;
-    const paneId = this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
-    const wsLabel = this.threadId ? `📱 ${basename(this.cwd)}#${this.threadId}` : `📱 ${basename(this.cwd)}`;
-
-    this.stop();
-    const at = Date.now();
-    this.gateway.state.handoffs = {
-      ...this.gateway.state.handoffs,
-      [this.key]: { sessionFile, at, paneId },
-    };
-    await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
-    this.scheduleStatusBoardUpdate();
-    const cmd = `cd ${shellQuote(this.cwd)} && pi --session ${shellQuote(sessionFile)}`;
-
-    let startedInHerdr = false;
-    if (!HERDR_DISABLED_FOR_TEST && herdrBin && paneId) {
-      try {
-        await this.stopViewer(paneId);
-        const rawName = `tg-${basename(this.cwd).toLowerCase().replace(/[^a-z0-9_-]/g, "-")}`;
-        const agentName = rawName.slice(0, 32);
-        await runCommand(herdrBin, [
-          "agent", "start", agentName, "--kind", "pi", "--pane", paneId, "--", "--session", sessionFile,
-        ], { timeout: 15000 });
-        startedInHerdr = true;
-      } catch (err) {
-        console.warn(`[herdr] failed to start agent in pane ${paneId}: ${err.message}`);
-      }
-    }
-
-    if (startedInHerdr) {
-      return this.send(
-        `🖥 Continued in Herdr: workspace ${wsLabel} (pane ${paneId})\n\nFallback:\n\`\`\`\n${cmd}\n\`\`\``,
-        this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
-      );
-    }
-
-    return this.send(`🖥 Continue on desktop:\n\`\`\`\n${cmd}\n\`\`\``, this.keyboard([
-      { label: "⬅️ Take back", action: { type: "take_back" } },
-    ]));
-  }
-
-  async sendHandoffPrompt() {
-    return this.send("This session is on the desktop. Quit the desktop Pi, then tap Take back.", this.keyboard([
-      { label: "⬅️ Take back", action: { type: "take_back" } },
-      { label: "✨ New session here", action: { type: "new_session_here" } },
-    ]));
-  }
-
-  async handleTakeBack() {
-    const handoffInfo = this.handoff;
-    if (!handoffInfo?.sessionFile) {
-      return this.send("No handoff session file found.");
-    }
-    const sessionFile = handoffInfo.sessionFile;
-    const herdrBin = this.gateway.mainSession.pi?.herdrEnv?.HERDR_BIN_PATH || process.env.HERDR_BIN_PATH || "herdr";
-    const paneId = handoffInfo.paneId || this.gateway.state.herdrPanes?.[this.key];
-
-    if (paneId && (await this.paneExists(paneId, herdrBin))) {
-      const paneAgentStatus = await this.getPaneAgentStatus(paneId, herdrBin);
-      if (paneAgentStatus === "working" || paneAgentStatus === "blocked") {
-        return this.send(
-          `⚠️ Desktop Pi is currently ${paneAgentStatus}. Please wait until it is idle or stop it, then tap Take back again.`,
-          this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
-        );
-      }
-
-      if (paneAgentStatus === "idle" || paneAgentStatus === "done") {
-        await this.quitPaneAgent(paneId, herdrBin);
-      }
-
-      const atShell = await this.isPaneAtShell(paneId, herdrBin);
-      if (!atShell) {
-        const runningCmd = (await this.getPaneForegroundCmdline(paneId, herdrBin)).slice(0, 80).trim();
-        const what = runningCmd ? ` (\`${runningCmd}\`)` : "";
-        return this.send(
-          `⚠️ Desktop pane is still running a process${what}. Quit it before taking back.`,
-          this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
-        );
-      }
-    }
-
-    const hadHandoff = Boolean(this.gateway.state.handoffs?.[this.key]);
-    if (this.gateway.state.handoffs) {
-      delete this.gateway.state.handoffs[this.key];
-      if (hadHandoff) await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
-    }
-
-    this.resetSessionState();
-    this.pi = this.createPi();
-    await this.pi.start();
-    const result = await this.pi.request("switch_session", { sessionPath: sessionFile });
-    if (!result?.cancelled) {
-      const state = await this.pi.request("get_state").catch(() => null);
-      if (state?.model?.provider && state?.model?.id) {
-        this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-      }
-      if (state?.thinkingLevel) {
-        this.currentThinking = state.thinkingLevel;
-      }
-    }
-    await this.onSessionSwitched(sessionFile);
-    this.scheduleStatusBoardUpdate();
-    const last = await this.pi.request("get_last_assistant_text").catch(() => null);
-    const rawText = (last?.text || "").trim();
-    const preview = rawText ? rawText.split("\n").filter(Boolean)[0] || "" : "";
-    return this.send(preview ? `✅ Back on Telegram\n\n${preview}` : "✅ Back on Telegram");
-  }
-
-  async handleNewSessionHere() {
-    if (this.gateway.state.handoffs) {
-      delete this.gateway.state.handoffs[this.key];
-      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
-    }
-    this.resetSessionState();
-    this.pi = this.createPi();
-    await this.pi.start();
-    await this.pi.request("new_session");
-    const state = await this.pi.request("get_state").catch(() => null);
-    if (state?.model?.provider && state?.model?.id) {
-      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-    }
-    if (state?.thinkingLevel) {
-      this.currentThinking = state.thinkingLevel;
-    }
-    await this.onSessionSwitched();
-    this.scheduleStatusBoardUpdate();
-    const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
-    return this.send(text);
-  }
-
   topicSummaryLines() {
     if (this.threadId !== null) return [];
     const topicSessions = [...this.gateway.sessions.values()].filter((s) => s.threadId !== null);
-    const bridges = [];
-    if (!topicSessions.length && !bridges.length) return ["", "Topics: (none)"];
+    if (!topicSessions.length) return ["", "Topics: (none)"];
     const lines = ["", "Topics:"];
     for (const ts of topicSessions) {
       const status = ts.isStreaming ? "running" : ts.pi?.proc ? "idle" : "stopped";
       const name = basename(ts.cwd) || `topic-${ts.threadId}`;
       lines.push(`• ${name} (${status}) — ${ts.cwd}`);
-    }
-    for (const [paneId, bridge] of bridges) {
-      lines.push(`• 📡 ${bridge.name || paneId} (remote-control) — ${paneId}`);
     }
     return lines;
   }
@@ -3570,9 +2390,6 @@ class ChatSession {
   }
 
   async handleCallbackAction(action, callback) {
-    if (["take_back", "take_back_cancel", "new_session_here", "desktop_sessions", "pick_desktop_session", "confirm_desktop_resume"].includes(action.type)) {
-      return this.send("This control belonged to the old gateway. Use /resume or /new.");
-    }
     if (action.type === "jump_pane") {
       const connection = this.gateway.bridge.connections.get(action.paneId);
       if (!connection) return this.send("That Pi is not connected. Enable /remote-control in its pane first.");
@@ -3613,18 +2430,6 @@ class ChatSession {
       this.currentThinking = action.level;
       this.scheduleStatusBoardUpdate();
       await this.send(`✅ thinking: ${action.level}`);
-    } else if (action.type === "take_back") {
-      await this.handleTakeBack();
-    } else if (action.type === "take_back_cancel") {
-      await this.send("Take back cancelled");
-    } else if (action.type === "new_session_here") {
-      await this.handleNewSessionHere();
-    } else if (action.type === "desktop_sessions") {
-      await this.showDesktopSessions();
-    } else if (action.type === "pick_desktop_session") {
-      await this.confirmDesktopSession(action.path);
-    } else if (action.type === "confirm_desktop_resume") {
-      await this.handleConfirmDesktopResume(action.path, action.confirmed);
     } else if (action.type === "resume") {
       const paneId = await this.gateway.liveSessionPane(action.path);
       if (paneId && paneId !== this.binding.paneId) {
@@ -3748,7 +2553,6 @@ class ChatSession {
       for (const [k, v] of this.gateway.actions) {
         if (v.type === "ui" && v.requestId === action.requestId) this.gateway.actions.delete(k);
       }
-      this.herdrReporter?.reportState("working");
       this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
       if (callback.message) {
         const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
@@ -3758,7 +2562,6 @@ class ChatSession {
   }
 
   async handleEvent(event) {
-    this.touchActivity();
     if (event.type === "remote_user_input") {
       await this.send(`🖥 ${event.text}`, { disable_notification: true });
       return;
@@ -3774,7 +2577,6 @@ class ChatSession {
       return;
     }
     if (event.type === "agent_start") {
-      this.herdrReporter?.reportState("working");
       const isInitialStart = !this.isStreaming;
       this.isStreaming = true;
       this.pendingUi = null;
@@ -3799,7 +2601,6 @@ class ChatSession {
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
-      this.herdrReporter?.reportState("idle");
       this.isStreaming = false;
       this.pendingUi = null;
       this.currentToolSummary = null;
@@ -4072,10 +2873,6 @@ class ChatSession {
   }
 
   async handleUiRequest(request) {
-    // 只有需要用户作答的对话框才算 blocked；setStatus/setWidget/setTitle 等是无需应答的单向 UI 更新
-    if (["select", "confirm", "input", "editor"].includes(request.method)) {
-      this.herdrReporter?.reportState("blocked", request.title || request.message || "Waiting for input");
-    }
     if (["select", "confirm"].includes(request.method)) {
       const options = request.method === "confirm" ? [
         { label: "Confirm", response: { confirmed: true } }, { label: "Cancel", response: { confirmed: false } },
@@ -4343,10 +3140,6 @@ class ChatSession {
       this.statusBoardTickTimer = null;
     }
     this.resetSessionState();
-    if (this.herdrReporter) {
-      this.herdrReporter.releaseAgent();
-      this.herdrReporter = null;
-    }
     this.pi?.stop?.();
   }
 }
@@ -4367,14 +3160,9 @@ class Gateway {
     this.telegramChain = Promise.resolve();
     this.uploadChain = Promise.resolve();
     this.stateWriteChain = Promise.resolve();
-    this.bridgeChains = new Map();
     this.downloadCleanupTimer = null;
     this.herdrWatcher = null;
     this.herdrMessages = new Map();
-    this.activeBridges = new Map();
-    this.bridgeOutbound = new Map();
-    this.state.remoteBridges = this.state.remoteBridges || {};
-    this.idleTimer = null;
     this.bridge = new PaneServer(join(config.stateDir, "bridge.sock"), (connection) => this.onPaneHello(connection));
     this.paneStartChain = Promise.resolve();
     this.herdrEnvironment = null;
@@ -4392,15 +3180,14 @@ class Gateway {
       this.queueTelegram(() => origEdit(chatId, messageId, text, ephemeral));
 
     this.sessions = new Map();
-    this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd, sessionDir: config.sessionDir });
+    this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd });
     this.sessions.set("main", this.mainSession);
 
     // 延迟初始化 state.json 中持久化的有效 topic 会话
     for (const [threadId, info] of Object.entries(this.state.topics || {})) {
       if (info?.cwd && existsSync(info.cwd)) {
         const tid = Number(threadId);
-        const sDir = resolveTopicSessionDir(config.stateDir, info.cwd, tid);
-        this.sessions.set(`t:${tid}`, new ChatSession(this, { threadId: tid, cwd: info.cwd, sessionDir: sDir }));
+        this.sessions.set(`t:${tid}`, new ChatSession(this, { threadId: tid, cwd: info.cwd }));
       }
     }
   }
@@ -4421,8 +3208,7 @@ class Gateway {
         console.warn(`[bridge] Topics must be enabled to attach desktop pane ${hello.paneId}`);
         return;
       }
-      const migrated = this.state.remoteBridges?.[hello.paneId];
-      const created = migrated ? { message_thread_id: migrated.threadId } : await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: `📡 ${basename(hello.cwd) || "Pi"}`.slice(0, 128) });
+      const created = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: `📡 ${basename(hello.cwd) || "Pi"}`.slice(0, 128) });
       const threadId = created.message_thread_id;
       const session = new ChatSession(this, { threadId, cwd: hello.cwd });
       session.binding = { paneId: hello.paneId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false };
@@ -4564,8 +3350,7 @@ class Gateway {
       if (key.startsWith("t:")) {
         const threadId = Number(key.slice(2));
         const mainCwd = this.mainSession.cwd;
-        const sessionDir = resolveTopicSessionDir(this.config.stateDir, mainCwd, threadId);
-        session = new ChatSession(this, { threadId, cwd: mainCwd, sessionDir });
+        session = new ChatSession(this, { threadId, cwd: mainCwd });
         this.sessions.set(key, session);
         this.state.topics[threadId] = { cwd: mainCwd };
         this.saveState({ topics: this.state.topics }).catch((err) => {
@@ -4588,42 +3373,6 @@ class Gateway {
       }
     }
     return [...panes];
-  }
-
-  // ref: 资源管控 — 限制全局最大并发 Pi 进程数，并在超限时挂起最久未活动的非流式 Topic
-  async acquireSessionSlot(requestingSession) {
-    if (requestingSession.pi?.proc) return;
-    const running = [...this.sessions.values()].filter((s) => Boolean(s.pi?.proc));
-    if (running.length >= this.config.maxSessions) {
-      const candidates = running.filter((s) => s.threadId !== null && !s.isStreaming && s !== requestingSession);
-      if (!candidates.length) {
-        throw new Error(`Maximum concurrent sessions (${this.config.maxSessions}) reached and all are busy.`);
-      }
-      candidates.sort((a, b) => a.lastActiveAt - b.lastActiveAt);
-      console.log(`${new Date().toISOString()} [session] stopping least recently active topic t:${candidates[0].threadId} to free a session slot`);
-      candidates[0].stop();
-    }
-  }
-
-  checkIdleSessions() {
-    const maxIdleMs = this.config.idleStopMinutes * 60_000;
-    if (maxIdleMs <= 0) return; // 0 = 永不空闲停止
-    const now = Date.now();
-    for (const session of this.sessions.values()) {
-      if (session.threadId === null) continue; // 主会话永不空闲停止
-      if (session.pi?.proc && !session.isStreaming && !session.pendingUi) {
-        if (now - session.lastActiveAt >= maxIdleMs) {
-          console.log(`${new Date().toISOString()} [session] idle stopping topic session t:${session.threadId} (idle for ${Math.round((now - session.lastActiveAt) / 60000)}m)`);
-          session.stop();
-        }
-      }
-    }
-  }
-
-  startIdleStopTimer() {
-    if (this.idleTimer) return;
-    this.idleTimer = setInterval(() => this.checkIdleSessions(), 30_000);
-    this.idleTimer.unref?.();
   }
 
   async start() {
@@ -4821,7 +3570,6 @@ class Gateway {
       this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
       console.log(`${new Date().toISOString()} [${priority}] handling /${cmd.name}`);
       const session = this.getOrCreateSession(m);
-      session.touchActivity();
       await session.handleCommand(cmd, m.text, update.update_id);
     } catch (error) {
       console.error(`[${priority}] error:`, error);
@@ -4874,12 +3622,9 @@ class Gateway {
   }
 
   async handleMessage(message, session = this.getOrCreateSession(message)) {
-    session.touchActivity();
-
     if (session.pendingUi && !message.text?.startsWith("/")) {
       const pending = session.pendingUi;
       session.pendingUi = null;
-      session.herdrReporter?.reportState("working");
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       session.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await session.send("Submitted.");
@@ -5035,329 +3780,8 @@ class Gateway {
     }
   }
 
-  recordBridgeOutbound(paneId, text) {
-    if (!this.bridgeOutbound.has(paneId)) this.bridgeOutbound.set(paneId, []);
-    const list = this.bridgeOutbound.get(paneId);
-    list.push(text.trim());
-    if (list.length > 50) list.shift();
-  }
-
-  bridgePaneIdForMessage(message) {
-    const key = sessionKeyOf(message);
-    if (!key.startsWith("t:")) return null;
-    const threadId = Number(key.slice(2));
-    for (const [paneId, bridge] of Object.entries(this.state.remoteBridges || {})) {
-      if (bridge?.threadId === threadId) return paneId;
-    }
-    return null;
-  }
-
-  async sendBridgeText(chatId, threadId, text, extra = {}) {
-    const limit = this.config.longReplyChars ?? 8000;
-    if (limit > 0 && text.length > limit) {
-      try {
-        const name = `reply-${formatStamp()}.html`;
-        const path = join(this.config.downloadsDir, name);
-        await writeFile(path, renderReplyHtml(text));
-        const note = `\n\n… (full reply attached, ${text.length} chars)`;
-        const first = chunks(text)[0];
-        const head = (first.length + note.length > MAX_MESSAGE ? first.slice(0, MAX_MESSAGE - note.length) : first) + note;
-        await this.telegram.sendOne(chatId, head, { message_thread_id: threadId, ...extra });
-        await this.telegram.sendDocument(chatId, path, { message_thread_id: threadId });
-        return;
-      } catch (error) {
-        console.error(`[bridge] long reply HTML failed: ${error.message}; falling back to chunks`);
-      }
-    }
-    await this.telegram.send(chatId, text, { message_thread_id: threadId, ...extra });
-  }
-
-  processBridgeEntries(bridge, entries) {
-    bridge.promiseChain = bridge.promiseChain.then(async () => {
-      const items = mapBridgeEntries(entries, {
-        isEcho: (text) => {
-          const list = this.bridgeOutbound.get(bridge.paneId) || [];
-          const idx = list.indexOf(text.trim());
-          if (idx >= 0) {
-            list.splice(idx, 1);
-            return true;
-          }
-          return false;
-        },
-      });
-      for (const item of items) {
-        if (item.type === "tool_panel") {
-          if (bridge.toolPanelMessageId) {
-            bridge.toolPanelTools.push(...item.tools);
-            await this.telegram.edit(this.chatId, bridge.toolPanelMessageId, renderToolPanel(bridge.toolPanelTools, true));
-          } else {
-            bridge.toolPanelTools = [...item.tools];
-            const sent = await this.telegram.sendOne(this.chatId, renderToolPanel(bridge.toolPanelTools, true), {
-              message_thread_id: bridge.threadId,
-              disable_notification: true,
-            });
-            bridge.toolPanelMessageId = sent?.message_id || null;
-          }
-        } else if (item.type === "assistant") {
-          bridge.toolPanelMessageId = null;
-          bridge.toolPanelTools = [];
-          await this.sendBridgeText(this.chatId, bridge.threadId, item.text, { disable_notification: true });
-        } else if (item.type === "user" || item.type === "compaction") {
-          bridge.toolPanelMessageId = null;
-          bridge.toolPanelTools = [];
-          await this.telegram.sendOne(this.chatId, item.text, {
-            message_thread_id: bridge.threadId,
-            disable_notification: true,
-          });
-        }
-      }
-    }).catch((err) => {
-      console.error(`[bridge:${bridge.paneId}] processEntries error:`, err);
-    });
-    return bridge.promiseChain;
-  }
-
-  async handleOptInChange({ added = [], removed = [], updated = [] }) {
-    const failed = [];
-    for (const agent of added) {
-      try {
-        await this.handleBridgeAdded(agent);
-      } catch (err) {
-        console.error(`[bridge] added ${agent.pane_id} failed:`, err);
-        failed.push(agent.pane_id);
-      }
-    }
-    for (const paneId of removed) {
-      try {
-        await this.handleBridgeRemoved(paneId);
-      } catch (err) {
-        console.error(`[bridge] removed ${paneId} failed:`, err);
-      }
-    }
-    for (const agent of updated) {
-      try {
-        await this.handleBridgeUpdated(agent);
-      } catch (err) {
-        console.error(`[bridge] updated ${agent.pane_id} failed:`, err);
-        const b = this.activeBridges.get(agent.pane_id);
-        if (b) {
-          b.tail?.stop();
-          b.tail = null;
-          this.activeBridges.delete(agent.pane_id);
-        }
-        failed.push(agent.pane_id);
-      }
-    }
-    return failed;
-  }
-
-  async handleBridgeAdded(agent) {
-    const paneId = agent.pane_id;
-    if (this.activeBridges.has(paneId)) return;
-    const sessionFile = resolveAgentSessionFile(agent);
-    let storedBridge = this.state.remoteBridges?.[paneId];
-    let threadId = storedBridge?.threadId;
-    let isReused = Boolean(threadId);
-    const prevStoredSession = storedBridge?.sessionFile;
-
-    const agentName = agent.name || agent.agent || "pi";
-    const where = this.herdrWatcher?.workspaces?.get(agent.workspace_id) || (agent.cwd ? basename(agent.cwd) : "");
-    const topicName = `📡 ${agentName}${where ? ` · ${where}` : ""}`.slice(0, 128);
-
-    if (!threadId) {
-      const me = await this.telegram.call("getMe").catch(() => null);
-      if (!me?.has_topics_enabled) {
-        console.warn(`[herdr] Topics not enabled, cannot create bridge topic for ${paneId}; notifications stay in main chat`);
-        return;
-      }
-      const created = await this.telegram.call("createForumTopic", {
-        chat_id: this.chatId,
-        name: topicName,
-      });
-      threadId = created.message_thread_id;
-      this.state.remoteBridges[paneId] = {
-        threadId,
-        name: topicName,
-        ...(sessionFile ? { sessionFile } : {}),
-      };
-      await this.saveState({ remoteBridges: this.state.remoteBridges });
-    } else if (sessionFile && sessionFile !== prevStoredSession) {
-      this.state.remoteBridges[paneId] = {
-        ...this.state.remoteBridges[paneId],
-        sessionFile,
-      };
-      await this.saveState({ remoteBridges: this.state.remoteBridges });
-    }
-
-    const label = this.herdrWatcher?.label(paneId) || paneId;
-    const cwd = agent.cwd || "";
-    const onMessage = `📡 Remote control on — ${label}\n${cwd}\nMessages you send here go to this agent.`;
-
-    try {
-      await this.telegram.sendOne(this.chatId, onMessage, {
-        message_thread_id: threadId,
-        ...(isReused ? { disable_notification: true } : {}),
-      });
-    } catch (err) {
-      if (isReused && isTopicGoneError(err)) {
-        console.warn(`[bridge] Topic #${threadId} for ${paneId} was deleted; recreating fresh topic`);
-        delete this.state.remoteBridges[paneId];
-        await this.saveState({ remoteBridges: this.state.remoteBridges });
-        const created = await this.telegram.call("createForumTopic", {
-          chat_id: this.chatId,
-          name: topicName,
-        });
-        threadId = created.message_thread_id;
-        isReused = false;
-        this.state.remoteBridges[paneId] = {
-          threadId,
-          name: topicName,
-          ...(sessionFile ? { sessionFile } : {}),
-        };
-        await this.saveState({ remoteBridges: this.state.remoteBridges });
-        await this.telegram.sendOne(this.chatId, onMessage, {
-          message_thread_id: threadId,
-        });
-      } else {
-        throw err;
-      }
-    }
-
-    if (!sessionFile) {
-      await this.telegram.sendOne(this.chatId, "⚠️ Can't find this agent's session file; only done/needs-confirmation notices will be sent.", {
-        message_thread_id: threadId,
-      });
-    }
-
-    const bridge = {
-      paneId,
-      threadId,
-      sessionFile,
-      toolPanelMessageId: null,
-      toolPanelTools: [],
-      promiseChain: Promise.resolve(),
-      tail: null,
-    };
-    this.activeBridges.set(paneId, bridge);
-
-    if (sessionFile) {
-      const shouldSkipLastReply = isReused && sessionFile === prevStoredSession;
-      if (!shouldSkipLastReply) {
-        const lastReply = await getLastAssistantReply(sessionFile);
-        if (lastReply) {
-          await this.sendBridgeText(this.chatId, threadId, `Last reply:\n${lastReply}`, { disable_notification: true });
-        }
-      }
-      const tail = new SessionTail(sessionFile, {
-        startAtEnd: true,
-        interval: 500,
-        onEntries: (entries) => this.processBridgeEntries(bridge, entries),
-      });
-      bridge.tail = tail;
-      tail.start();
-    }
-  }
-
-  async handleBridgeRemoved(paneId) {
-    const bridge = this.activeBridges.get(paneId);
-    const threadId = this.state.remoteBridges?.[paneId]?.threadId;
-    if (bridge) {
-      bridge.tail?.stop();
-      bridge.tail = null;
-      this.activeBridges.delete(paneId);
-    }
-    if (threadId) {
-      await this.telegram.sendOne(this.chatId, "⏸ Remote control off.", {
-        message_thread_id: threadId,
-      });
-    }
-  }
-
-  async handleBridgeUpdated(agent) {
-    const paneId = agent.pane_id;
-    const threadId = this.state.remoteBridges?.[paneId]?.threadId;
-    const bridge = this.activeBridges.get(paneId);
-    if (!bridge || !threadId) return;
-
-    bridge.tail?.stop();
-    bridge.tail = null;
-    bridge.toolPanelMessageId = null;
-    bridge.toolPanelTools = [];
-
-    const newSession = resolveAgentSessionFile(agent);
-    bridge.sessionFile = newSession;
-    if (this.state.remoteBridges[paneId]) {
-      this.state.remoteBridges[paneId] = {
-        ...this.state.remoteBridges[paneId],
-        ...(newSession ? { sessionFile: newSession } : {}),
-      };
-      await this.saveState({ remoteBridges: this.state.remoteBridges });
-    }
-    if (!newSession) return;
-
-    await this.telegram.sendOne(this.chatId, `🔄 Switched session: ${basename(newSession)}`, {
-      message_thread_id: threadId,
-    });
-    const lastReply = await getLastAssistantReply(newSession);
-    if (lastReply) {
-      await this.sendBridgeText(this.chatId, threadId, `Last reply:\n${lastReply}`, { disable_notification: true });
-    }
-    const tail = new SessionTail(newSession, {
-      startAtEnd: true,
-      interval: 500,
-      onEntries: (entries) => this.processBridgeEntries(bridge, entries),
-    });
-    bridge.tail = tail;
-    tail.start();
-  }
-
-  async handleBridgeMessage(paneId, message) {
-    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
-    const watcher = this.herdrWatcher;
-    const threadId = message.message_thread_id;
-    if (!watcher) {
-      return this.telegram.sendOne(this.chatId, "❌ Herdr is not available.", { message_thread_id: threadId });
-    }
-    const agent = (await watcher.cliJson(["agent", "get", paneId]).catch(() => null))?.agent;
-    if (!agent || !herdrOptedIn(agent)) {
-      return this.telegram.sendOne(this.chatId, "❌ This agent is no longer remote-controlled.", { message_thread_id: threadId });
-    }
-
-    const text = (message.text || "").trim();
-    const cmd = parseCommand(text);
-    if (cmd?.name === "status") {
-      return this.sendHerdrAgent(paneId, agent.agent_status, agent);
-    }
-    if (cmd?.name === "abort") {
-      await watcher.cli(["agent", "send-keys", paneId, "esc"]);
-      return this.telegram.sendOne(this.chatId, "⎋ Sent Esc", { message_thread_id: threadId });
-    }
-    if (cmd?.name === "close") {
-      return this.telegram.sendOne(this.chatId, "This topic is bridged to a desktop agent. Turn it off from the desktop agent with /remote-control off.", { message_thread_id: threadId });
-    }
-    if (cmd || text.startsWith("/") || message.photo || message.voice || message.document || !text) {
-      return this.telegram.sendOne(this.chatId, "This topic is bridged to a desktop agent; only text, /status and /abort work here.", { message_thread_id: threadId });
-    }
-
-    this.recordBridgeOutbound(paneId, text);
-    try {
-      if (agent.agent_status === "blocked") {
-        await watcher.cli(["pane", "send-text", paneId, text]);
-        await watcher.cli(["agent", "send-keys", paneId, "enter"]);
-      } else {
-        await watcher.cli(["agent", "prompt", paneId, text]);
-      }
-      return this.telegram.sendOne(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, {
-        message_thread_id: threadId,
-        disable_notification: true,
-      });
-    } catch (error) {
-      return this.telegram.sendOne(this.chatId, `❌ ${error.message}`, { message_thread_id: threadId });
-    }
-  }
-
   async showHerdrAgents() {
-    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available (disabled in config, or its server is not running).");
+    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available; ensure its server is running.");
     await this.herdrWatcher.sync();
     const ownPanes = new Set(this.getOwnedPaneIds());
     const agents = [...this.herdrWatcher.agents.values()];
@@ -5463,7 +3887,6 @@ class Gateway {
       } else {
         const sessionKey = action.sessionKey || sessionKeyOf(callback);
         const targetSession = sessionKey ? (this.sessions.get(sessionKey) || this.mainSession) : (session || this.mainSession);
-        targetSession.touchActivity();
         await targetSession.handleCallbackAction(action, callback);
       }
     } catch (error) {
@@ -5559,10 +3982,6 @@ class Gateway {
   }
 
   stop() {
-    if (this.idleTimer) {
-      clearInterval(this.idleTimer);
-      this.idleTimer = null;
-    }
     if (this.downloadCleanupTimer) {
       clearInterval(this.downloadCleanupTimer);
       this.downloadCleanupTimer = null;
@@ -5871,8 +4290,7 @@ async function selfTest() {
   assert.ok(buildDevPath("/usr/bin:/bin").includes("/opt/homebrew/bin"));
   assert.ok(buildDevPath("/usr/bin:/bin").includes(join(homedir(), ".local", "bin")));
   assert.equal(await runCommand("echo", ["ok"]), "ok");
-  assert.deepEqual(await resolveHerdrEnvironment(tmpdir(), { piBin: "echo" }), {});
-  assert.deepEqual(await resolveHerdrEnvironment(tmpdir(), { disabled: true }), {});
+  assert.deepEqual(await resolveHerdrEnvironment(tmpdir()), {});
   assert.equal(telegramCommandName({ name: "skill:grill-me", source: "skill" }), "skill_grill_me");
   assert.equal(telegramCommandName({ name: `skill:${"a".repeat(40)}`, source: "skill" }).length, 32);
   assert.equal(telegramCommandName({ name: "git-commit-push", source: "extension" }), "git_commit_push");
@@ -6136,14 +4554,6 @@ async function selfTest() {
     });
     assert.deepEqual(sendOrder, ["outer-start", "nested", "outer-end"]);
 
-    // 回归（审计修复 M1）：missedPings 随 Pi 重启复位，余数不误杀新进程
-    {
-      const rpc = new PiRpc({ piBin: "echo", sessionDir: tmpdir() }, () => {});
-      rpc.missedPings = 2;
-      await rpc.start();
-      assert.equal(rpc.missedPings, 0);
-    }
-
     // 回归（审计修复 M2）：预览更新失败不再静默，必须留错误日志
     {
       const errs = [];
@@ -6225,8 +4635,6 @@ async function selfTest() {
     // loadConfig with test configs
     const tmpCfgDir = join(tmpdir(), `test-cfg-${Date.now()}`);
     await mkdir(tmpCfgDir, { recursive: true });
-    const dummyExt = join(tmpCfgDir, "my-ext.js");
-    writeFileSync(dummyExt, "// dummy extension");
 
     const validCfgPath = join(tmpCfgDir, "config.json");
     writeFileSync(
@@ -6235,8 +4643,6 @@ async function selfTest() {
         telegram: { botToken: "123456:abcdef", allowedUserId: "999" },
         cwd: tmpCfgDir,
         stateDir: tmpCfgDir,
-        extensions: ["./my-ext.js"],
-        enableCompanionExtension: false,
       })
     );
 
@@ -6247,26 +4653,6 @@ async function selfTest() {
       assert.equal(cfg.botToken, "123456:abcdef");
       assert.equal(cfg.allowedUserId, "999");
       assert.equal(cfg.cwd, tmpCfgDir);
-      assert.deepEqual(cfg.extensions, [dummyExt]);
-      assert.equal(cfg.enableCompanionExtension, false);
-    } finally {
-      if (prevEnvCfg) process.env.REMOTE_PI_CONFIG = prevEnvCfg;
-      else delete process.env.REMOTE_PI_CONFIG;
-    }
-
-    // verify loadConfig throws when configured extension is missing
-    const invalidExtCfgPath = join(tmpCfgDir, "invalid-ext.json");
-    writeFileSync(
-      invalidExtCfgPath,
-      JSON.stringify({
-        telegram: { botToken: "123456:abcdef", allowedUserId: "999" },
-        cwd: tmpCfgDir,
-        extensions: ["./non-existent-ext.js"],
-      })
-    );
-    process.env.REMOTE_PI_CONFIG = invalidExtCfgPath;
-    try {
-      assert.throws(() => loadConfig(), /Configured extension not found/);
     } finally {
       if (prevEnvCfg) process.env.REMOTE_PI_CONFIG = prevEnvCfg;
       else delete process.env.REMOTE_PI_CONFIG;
@@ -6305,15 +4691,6 @@ async function selfTest() {
     await gwSwitch.mainSession.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
     assert.ok(switchMsg.includes("Directory missing"), "switchCwd should report error for missing dir");
     assert.equal(gwSwitch.config.cwd, tmpCfgDir);
-
-    // verify resolveSessionDir collision resistance and legacy fallback
-    const dirA = resolveSessionDir(tmpCfgDir, "/a/b-c");
-    const dirB = resolveSessionDir(tmpCfgDir, "/a-b/c");
-    assert.notEqual(dirA, dirB, "resolveSessionDir must not collide on /a/b-c and /a-b/c");
-
-    const legacyDir = join(tmpCfgDir, "sessions", "legacy-project");
-    await mkdir(legacyDir, { recursive: true });
-    assert.equal(resolveSessionDir(tmpCfgDir, "/legacy/project"), legacyDir, "resolveSessionDir should preserve legacy dir if it exists");
 
     // verify state persistence without modifying config.json
     const originalCfgContent = readFileSync(validCfgPath, "utf8");
@@ -6461,16 +4838,8 @@ async function selfTest() {
       process.exit = origExit;
     }
 
-    // 回归（架构审查 Issue 2）：PiRpc 进程异常退出通知 Gateway 并重置就绪
+    // A bridge disconnect is not proof of process exit.
     {
-      let exitedInfo = null;
-      const rpc = new PiRpc({ piBin: "echo", sessionDir: tmpdir() }, () => {}, (info) => { exitedInfo = info; });
-      await rpc.start();
-      rpc.proc.kill("SIGTERM");
-      await sleep(100);
-      assert.ok(exitedInfo !== null, "Pi 退出应触发 onClose 回调");
-      assert.equal(exitedInfo.expected, false);
-
       const gwExit = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
       gwExit.mainSession.isStreaming = true;
       let exitNotice = "";
@@ -6642,14 +5011,39 @@ async function selfTest() {
     const r = spawnSync("bash", ["-n", join(dirname(fileURLToPath(import.meta.url)), "install.sh")]);
     assert.equal(r.status, 0, "install.sh bash syntax check");
   }
-  // Herdr agent 推送：选项解析、opt-in 判定、状态迁移去重
-  assert.deepEqual(
-    herdrChoices("Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No, tell Claude what to do"),
-    [{ key: "1", label: "Yes" }, { key: "2", label: "Yes, and don't ask again" }, { key: "3", label: "No, tell Claude what to do" }],
-  );
-  assert.deepEqual(herdrChoices("│ › 1. Yes, proceed │\n│   2. No │").map((c) => c.key), ["1", "2"]);
-  assert.deepEqual(herdrChoices("1. only one option"), []);
-  assert.deepEqual(herdrChoices("1. old\n2. old\nfoo\n1. new\n2. new\n3. new").map((c) => c.label), ["new", "new", "new"]);
+  // Exercise only link installation in a temp directory, never the installer's service entry point.
+  {
+    const installer = await readFile(join(dirname(fileURLToPath(import.meta.url)), "install.sh"), "utf8");
+    const definition = installer.match(/^install_command\(\) \{[\s\S]*?^\}/m)?.[0];
+    assert.ok(definition, "installer link function exists");
+    const dir = join(tmpdir(), `test-install-link-${randomBytes(4).toString("hex")}`);
+    const root = join(dir, "checkout with spaces");
+    const extensionDir = join(dir, "extensions");
+    const extension = join(extensionDir, "remote-pi.ts");
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "remote-pi.ts"), "// fake extension\n");
+    await mkdir(extensionDir);
+    const installLink = () => spawnSync("bash", ["-c", `set -euo pipefail\n${definition}\ninstall_command`], {
+      env: { ...process.env, ROOT: root, COMMAND: join(dir, "bin", "pi-remote-gateway"), PI_EXTENSION_DIR: extensionDir, PI_EXTENSION: extension },
+    });
+    try {
+      await symlink(join(root, "retired.ts"), extension);
+      for (let i = 0; i < 2; i++) {
+        const result = installLink();
+        assert.equal(result.status, 0, `replace dangling link and repeat safely: ${result.stderr}`);
+        assert.equal(await readlink(extension), join(root, "remote-pi.ts"));
+      }
+      assert.equal(await readlink(join(dir, "bin", "pi-remote-gateway")), join(root, "install.sh"));
+      await unlink(extension);
+      await writeFile(extension, "user-owned extension\n");
+      assert.equal(installLink().status, 1, "refuse to replace an unrelated regular file");
+      assert.equal(await readFile(extension, "utf8"), "user-owned extension\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Herdr notifications: opt-in, blocked-only delivery and duplicate suppression.
   assert.equal(herdrTail("a\nb\nc\n\n\n", 2), "b\nc");
   assert.equal(herdrOptedIn({ agent: "pi", tokens: { remote_pi: "on" } }), true);
   assert.equal(herdrOptedIn({ agent: "pi" }), false);
@@ -6662,12 +5056,12 @@ async function selfTest() {
       ["w1:p1", "idle"], ["w1:p1", "done"], ["w1:p2", "idle"], ["w1:p2", "idle"], ["w1:p9", "working"], ["w1:p9", "done"]]) {
       watcher.observe(pane, status);
     }
-    assert.deepEqual(notified, ["w1:p1:blocked", "w1:p1:done"], "首见不推、重复不推、idle→done 不重复、排除网关自身 pane");
+    assert.deepEqual(notified, ["w1:p1:blocked"], "Only blocked transitions notify; initial, repeated, completed and excluded states do not");
   }
   assert.ok(HELP.includes("/agents") && BOT_COMMANDS.some((c) => c.command === "agents"), "/agents registered");
   {
-    const r = spawnSync("node", ["--check", "--experimental-strip-types", join(dirname(fileURLToPath(import.meta.url)), "herdr-extension.ts")]);
-    assert.equal(r.status, 0, `herdr-extension.ts syntax check: ${r.stderr}`);
+    const r = spawnSync("node", ["--check", "--experimental-strip-types", join(dirname(fileURLToPath(import.meta.url)), "remote-pi.ts")]);
+    assert.equal(r.status, 0, `remote-pi.ts syntax check: ${r.stderr}`);
   }
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
   assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "status"), { command: "status", description: "Session status, tokens & cost" });
@@ -6923,23 +5317,24 @@ async function selfTest() {
     globalThis.fetch = origFetch;
   }
 
-  // 5. PiRpc start race + pending leak
+  // PaneRpc startup coalescing and failed-write cleanup
   {
     let startCalls = 0;
-    const rpc = new PiRpc({ cwd: process.cwd(), sessionDir: "/tmp" }, () => {}, () => {});
+    const gwRace = new Gateway({ allowedUserId: "1", botToken: "1:x", cwd: tmpdir(), stateDir: tmpdir() });
+    const rpc = gwRace.mainSession.pi;
     rpc.start = async () => {
       startCalls++;
       await sleep(20);
-      rpc.proc = { stdin: { writable: false, write: () => {} } };
+      rpc.proc = { destroyed: false };
     };
 
     await Promise.all([rpc.ensureStarted(), rpc.ensureStarted(), rpc.ensureStarted()]);
     assert.equal(startCalls, 1, "ensureStarted 并发调用时 start 仅应执行一次");
 
-    rpc.write = () => { throw new Error("pipe broke"); };
+    rpc.write = () => { throw new Error("socket broke"); };
     await assert.rejects(
       () => rpc.request("test_cmd", {}, 1000),
-      /pipe broke/,
+      /socket broke/,
       "write 抛出异常时 request 应立即 reject",
     );
     assert.equal(rpc.pending.size, 0, "write 异常后 pending 不应泄露");
@@ -6952,11 +5347,6 @@ async function selfTest() {
   assert.equal(sessionKeyOf({ id: "cb1", message: { message_id: 3, message_thread_id: 99, is_topic_message: true, chat: { type: "private" } } }), "t:99");
   assert.equal(sessionKeyOf({ id: "cb2", message: { message_id: 4, chat: { type: "private" } } }), "main");
   assert.equal(sessionKeyOf(null), "main");
-
-  const testMainSessionDir = resolveSessionDir(tmpdir(), "/test/multi-project");
-  const testTopicSessionDir = resolveTopicSessionDir(tmpdir(), "/test/multi-project", 77);
-  assert.equal(testTopicSessionDir, `${testMainSessionDir}-t77`);
-  assert.notEqual(testMainSessionDir, testTopicSessionDir);
 
   // loadState keeps valid topics and drops ones whose cwd is missing
   {
@@ -6978,36 +5368,12 @@ async function selfTest() {
     assert.equal(stateWithTopics.topics["20"], undefined);
   }
 
-  // maxSessions & resource management
-  {
-    const tmpCfg = { allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: tmpdir(), maxSessions: 2, idleStopMinutes: 10 };
-    const gwLim = new Gateway(tmpCfg);
-    gwLim.mainSession.pi.proc = { kill: () => {} };
-    const t1 = new ChatSession(gwLim, { threadId: 101, cwd: tmpdir(), sessionDir: join(tmpdir(), "t1") });
-    t1.pi.proc = { kill: () => {} };
-    t1.lastActiveAt = Date.now() - 5000;
-    gwLim.sessions.set("t:101", t1);
-
-    let stoppedT1 = false;
-    t1.stop = () => { stoppedT1 = true; t1.pi.proc = null; };
-    const t2 = new ChatSession(gwLim, { threadId: 102, cwd: tmpdir(), sessionDir: join(tmpdir(), "t2") });
-    await gwLim.acquireSessionSlot(t2);
-    assert.equal(stoppedT1, true, "maxSessions 超限时应 idle-stop 最久未活动的非流式 Topic");
-
-    gwLim.mainSession.isStreaming = true;
-    gwLim.sessions.set("t:102", t2);
-    t2.pi.proc = { kill: () => {} };
-    t2.isStreaming = true;
-    const t3 = new ChatSession(gwLim, { threadId: 103, cwd: tmpdir(), sessionDir: join(tmpdir(), "t3") });
-    await assert.rejects(() => gwLim.acquireSessionSlot(t3), /Maximum concurrent sessions \(2\) reached/);
-  }
-
   // Session updateChain concurrency & ordering (ref: review issue 3 & 6)
   {
     const gwChains = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
     gwChains.chatReady = true;
     const sessionA = gwChains.mainSession;
-    const sessionB = new ChatSession(gwChains, { threadId: 200, cwd: tmpdir(), sessionDir: join(tmpdir(), "sB") });
+    const sessionB = new ChatSession(gwChains, { threadId: 200, cwd: tmpdir() });
     gwChains.sessions.set("t:200", sessionB);
 
     const log = [];
@@ -7045,7 +5411,7 @@ async function selfTest() {
     gwClose.telegram.call = async () => ({});
     const tid = 789;
     gwClose.state.topics[tid] = { cwd: tmpdir() };
-    const closeSession = new ChatSession(gwClose, { threadId: tid, cwd: tmpdir(), sessionDir: join(tmpdir(), "sClose") });
+    const closeSession = new ChatSession(gwClose, { threadId: tid, cwd: tmpdir() });
     gwClose.sessions.set(`t:${tid}`, closeSession);
 
     const token = gwClose.action({ type: "close_topic", threadId: tid, confirmed: true });
@@ -7064,7 +5430,7 @@ async function selfTest() {
     await mkdir(p2, { recursive: true });
     const gwTopCwd = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: p1 });
     gwTopCwd.telegram.call = async () => ({});
-    const topSession = new ChatSession(gwTopCwd, { threadId: 55, cwd: p1, sessionDir: join(tmpDir, "s55") });
+    const topSession = new ChatSession(gwTopCwd, { threadId: 55, cwd: p1 });
     gwTopCwd.sessions.set("t:55", topSession);
     topSession.send = async () => {};
     topSession.createPi = () => ({
@@ -7212,18 +5578,6 @@ async function selfTest() {
       "📁 remote-pi  🧠 openai/gpt-4o",
     ].join("\n"));
 
-    const handoffDate = new Date(2026, 9, 19, 14, 30);
-    const pad = (n) => String(n).padStart(2, "0");
-    const expectedTime = `${pad(handoffDate.getHours())}:${pad(handoffDate.getMinutes())}`;
-    const handoffBoard = formatStatusBoard({
-      handoff: { sessionFile: "/tmp/fake.jsonl", at: handoffDate.getTime() },
-      cwd: "remote-pi",
-      model: "provider/model",
-    });
-    assert.equal(handoffBoard, [
-      `🖥 On desktop since ${expectedTime}`,
-      "📁 remote-pi  🧠 provider/model",
-    ].join("\n"));
   }
 
   // Phase 2: statusBoards persistence in state.json
@@ -7243,7 +5597,7 @@ async function selfTest() {
     const gwOrder = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
     gwOrder.chatReady = true;
     const session1 = gwOrder.mainSession;
-    const session2 = new ChatSession(gwOrder, { threadId: 301, cwd: tmpdir(), sessionDir: join(tmpdir(), "s301") });
+    const session2 = new ChatSession(gwOrder, { threadId: 301, cwd: tmpdir() });
     gwOrder.sessions.set("t:301", session2);
 
     const deliveryLog = [];
@@ -7314,7 +5668,7 @@ async function selfTest() {
       const gwSub = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: subDir });
       gwSub.telegram.answer = async () => {};
       gwSub.telegram.edit = async () => {};
-      const subSession = new ChatSession(gwSub, { threadId: 401, cwd: subDir, sessionDir: join(tmpdir(), "s401") });
+      const subSession = new ChatSession(gwSub, { threadId: 401, cwd: subDir });
       subSession.pi.request = async () => ({});
 
       const snapObj = await subSession.takeRunSnapshot();
@@ -7356,7 +5710,6 @@ async function selfTest() {
 
   assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");
   assert.ok(HELP.includes("/close") && BOT_COMMANDS.some((c) => c.command === "close"), "/close registered");
-  assert.ok(HELP.includes("/handoff") && BOT_COMMANDS.some((c) => c.command === "handoff"), "/handoff registered");
 
   // shell single-quote helper
   {
@@ -7365,29 +5718,7 @@ async function selfTest() {
     assert.equal(shellQuote("foo'bar'baz"), "'foo'\\''bar'\\''baz'");
   }
 
-  // handoffs persistence in loadState (keeps existing file, drops missing)
-  {
-    const tmpStateDir = join(tmpdir(), `test-handoff-state-${Date.now()}`);
-    await mkdir(tmpStateDir, { recursive: true, mode: 0o700 });
-    const existingFile = join(tmpStateDir, "existing.jsonl");
-    const missingFile = join(tmpStateDir, "missing.jsonl");
-    await writeFile(existingFile, '{"type":"session"}\n', { mode: 0o600 });
-    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
-      cwd: tmpStateDir,
-      recentProjects: [tmpStateDir],
-      topics: {},
-      handoffs: {
-        "main": { sessionFile: existingFile, at: 12345 },
-        "t:1": { sessionFile: missingFile, at: 67890 },
-      },
-    }), { mode: 0o600 });
-
-    const state = loadState(tmpStateDir);
-    assert.deepEqual(state.handoffs["main"], { sessionFile: existingFile, at: 12345 });
-    assert.equal(state.handoffs["t:1"], undefined, "missing sessionFile must be dropped");
-  }
-
-  // desktop session filter: given temp dir with encoded subdir layout (--<cwd>--), only matching cwd session is returned
+  // Native session filter: encoded directory layout returns only sessions for the requested cwd.
   {
     const tmpDesktopDir = join(tmpdir(), `test-desktop-sessions-${Date.now()}`);
     const matchDir = encodeCwdSessionDir(tmpDesktopDir, "/test/my-project");
@@ -7418,21 +5749,6 @@ async function selfTest() {
     assert.deepEqual(notFound, []);
   }
 
-  // central handoff guard in beforeStart prevents spawning Pi
-  {
-    const tmpDir = join(tmpdir(), `test-handoff-guard-${Date.now()}`);
-    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
-    const gwGuard = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir });
-    const sess = gwGuard.mainSession;
-    gwGuard.state.handoffs = { [sess.key]: { sessionFile: join(tmpDir, "s.jsonl"), at: Date.now() } };
-    assert.ok(sess.handoff, "Handoff must be active");
-    await assert.rejects(
-      () => sess.pi.request("get_state"),
-      /Self-test must provide a fake connected pane/
-    );
-    assert.equal(sess.pi.proc, null, "Pi process must never spawn while session is handed off");
-  }
-
   // startHerdrWatcher idempotency & late start
   {
     const gwWatcher = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: tmpdir() });
@@ -7448,8 +5764,6 @@ async function selfTest() {
     assert.equal(gwWatcher.herdrWatcher, watcherInstance, "startHerdrWatcher must be idempotent");
     gwWatcher.herdrWatcher.stop();
   }
-
-  // Legacy handoff flow tests were replaced by selfTestPaneBridge: a pane is the only Pi process.
 
   // Herdr pane ownership: resolveHerdrEnvironment
   {
@@ -7506,181 +5820,6 @@ async function selfTest() {
     assert.equal(envFallback.HERDR_PANE_ID, "p_fallback", "Must create new workspace if persisted pane not found");
   }
 
-  // HerdrReporter state transitions with mock socket server
-  {
-    const received = [];
-    const sockPath = join(tmpdir(), `test-reporter-${Date.now()}.sock`);
-    const server = net.createServer((c) => {
-      let buf = "";
-      c.on("data", (chunk) => {
-        buf += chunk.toString("utf8");
-        let idx;
-        while ((idx = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, idx).trim();
-          buf = buf.slice(idx + 1);
-          if (line) {
-            const parsed = JSON.parse(line);
-            received.push(parsed);
-            c.write(JSON.stringify({ id: parsed.id, result: { type: "ok" } }) + "\n");
-          }
-        }
-      });
-    });
-    await new Promise((resolve) => server.listen(sockPath, resolve));
-
-    const reporter = new HerdrReporter({ socketPath: sockPath, paneId: "p1", allowInTest: true });
-    await reporter.reportSession("/tmp/session.jsonl");
-    await reporter.reportMetadata("Telegram");
-    reporter.reportState("working");
-    await sleep(50);
-    reporter.reportState("blocked", "Confirm delete?");
-    await sleep(50);
-    reporter.reportState("idle");
-    await sleep(50);
-    await reporter.releaseAgent();
-
-    server.close();
-    try { await unlink(sockPath); } catch {}
-
-    assert.equal(received.length, 6);
-    assert.equal(received[0].method, "pane.report_agent_session");
-    assert.equal(received[0].params.agent_session_path, "/tmp/session.jsonl");
-    assert.equal(received[1].method, "pane.report_metadata");
-    assert.equal(received[1].params.display_agent, "pi · Telegram");
-    assert.equal(received[1].params.title, "Telegram");
-    assert.equal(received[2].method, "pane.report_agent");
-    assert.equal(received[2].params.state, "working");
-    assert.equal(received[3].method, "pane.report_agent");
-    assert.equal(received[3].params.state, "blocked");
-    assert.equal(received[3].params.message, "Confirm delete?");
-    assert.equal(received[4].method, "pane.report_agent");
-    assert.equal(received[4].params.state, "idle");
-    assert.equal(received[5].method, "pane.release_agent");
-    for (let i = 1; i < received.length; i++) {
-      assert.ok(received[i].params.seq > received[i - 1].params.seq, "seq must monotonically increase");
-    }
-  }
-
-  // Viewer rendering test (pure render function)
-  {
-    // user message
-    const userMsg = renderSessionEntry({ type: "message", message: { role: "user", content: "list files" } });
-    assert.ok(userMsg.includes("› list files"), "Renders user message with ›");
-
-    // assistant message with text & toolCall
-    const asstMsg = renderSessionEntry({
-      type: "message",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "text", text: "I will check the directory." },
-          { type: "toolCall", name: "bash", args: { command: "ls -la" } },
-        ],
-      },
-    });
-    assert.ok(asstMsg.includes("I will check the directory."));
-    assert.ok(asstMsg.includes("⚙️ bash: ls -la"));
-
-    // tool error
-    const toolErr = renderSessionEntry({
-      type: "message",
-      message: { role: "toolResult", toolName: "bash", isError: true, content: "command not found" },
-    });
-    assert.ok(toolErr.includes("❌ bash error: command not found"));
-    assert.ok(toolErr.includes("\x1b[31m"), "Tool error must be in red");
-
-    // compaction
-    const comp = renderSessionEntry({ type: "compaction", tokensBefore: 12000 });
-    assert.ok(comp.includes("📦 Context compacted (12000 tokens)"));
-
-    // model change
-    const modelChange = renderSessionEntry({ type: "model_change", provider: "anthropic", modelId: "claude-sonnet-4-5" });
-    assert.ok(modelChange.includes("⚡ Model changed to anthropic/claude-sonnet-4-5"));
-
-    // unknown type ignored
-    assert.equal(renderSessionEntry({ type: "unknown_custom_future_type", foo: "bar" }), "");
-  }
-
-  // 1. SessionTail reads appended lines across partial writes and resets on truncation
-  {
-    const tmpFile = join(tmpdir(), `test-tail-${Date.now()}.jsonl`);
-    await writeFile(tmpFile, '{"line": 1}\n{"li');
-    const readLines = [];
-    const tail = new SessionTail(tmpFile, {
-      interval: 50,
-      onLines: (lines) => readLines.push(...lines),
-    });
-    await tail.readNew();
-    assert.deepEqual(readLines, ['{"line": 1}']);
-
-    // Append partial remainder + line 2
-    await writeFile(tmpFile, 'ne": 2}\n{"line": 3}\n', { flag: "a" });
-    await tail.readNew();
-    assert.deepEqual(readLines, ['{"line": 1}', '{"line": 2}', '{"line": 3}']);
-
-    // Truncate file (size shrink reset)
-    await writeFile(tmpFile, '{"reset": true}\n');
-    await tail.readNew();
-    assert.deepEqual(readLines, ['{"line": 1}', '{"line": 2}', '{"line": 3}', '{"reset": true}']);
-    tail.stop();
-    await unlink(tmpFile).catch(() => {});
-  }
-
-  // 2. Entry→Telegram mapper: user/assistant/toolCall/thinking/toolResult samples produce the expected messages
-  // (thinking & toolResult dropped; tool calls merged into one panel)
-  {
-    const samples = [
-      { type: "message", message: { role: "user", content: "hello world" } },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "internal thoughts" },
-            { type: "toolCall", name: "bash", args: { command: "ls" } },
-          ],
-        },
-      },
-      { type: "message", message: { role: "toolResult", toolName: "bash", content: "file.txt" } },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "toolCall", name: "read", args: { path: "file.txt" } },
-          ],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "text", text: "Here is the file content." },
-          ],
-        },
-      },
-      { type: "compaction" },
-    ];
-    const mapped = mapBridgeEntries(samples);
-    assert.equal(mapped.length, 4);
-    assert.equal(mapped[0].type, "user");
-    assert.equal(mapped[0].text, "👤 hello world");
-    // Tool panel with bash and read merged, thinking and toolResult dropped
-    assert.equal(mapped[1].type, "tool_panel");
-    assert.equal(mapped[1].tools.length, 2);
-    assert.equal(mapped[1].tools[0].name, "bash");
-    assert.equal(mapped[1].tools[1].name, "read");
-    assert.ok(mapped[1].text.includes("bash: ls"));
-    assert.ok(mapped[1].text.includes("read: file.txt"));
-    // Assistant message text
-    assert.equal(mapped[2].type, "assistant");
-    assert.equal(mapped[2].text, "Here is the file content.");
-    // Compaction
-    assert.equal(mapped[3].type, "compaction");
-    assert.equal(mapped[3].text, "🗜 Compacted");
-  }
-
   // 3. Session-file resolution prefers agent_session.path, falls back to tokens.remote_pi_session
   {
     const withKind = {
@@ -7703,28 +5842,7 @@ async function selfTest() {
     assert.equal(resolveAgentSessionFile({}), null);
   }
 
-  // 4. loadState keeps valid remoteBridges entries and drops malformed ones
-  {
-    const tmpStateDir = join(tmpdir(), `test-bridge-state-${Date.now()}`);
-    await mkdir(tmpStateDir, { recursive: true });
-    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
-      remoteBridges: {
-        "p1": { threadId: 101, name: "📡 pi · repo", sessionFile: "/path/to/s.jsonl" },
-        "p2": { threadId: "not-a-number", name: "bad" },
-        "p3": { threadId: 103 },
-        "": { threadId: 104, name: "no-key" },
-        "p5": null,
-        "p6": "bad-string",
-      },
-    }));
-    const state = loadState(tmpStateDir);
-    assert.deepEqual(state.remoteBridges, {
-      "p1": { threadId: 101, name: "📡 pi · repo", sessionFile: "/path/to/s.jsonl" },
-    });
-    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
-  }
-
-  // 5. Every topic, including a migrated bridge topic, routes through a native PaneRpc ChatSession.
+  // Every topic routes through a native PaneRpc ChatSession.
   {
     const tmpStateDir = join(tmpdir(), `test-dispatch-state-${Date.now()}`);
     await mkdir(tmpStateDir, { recursive: true });
@@ -7732,16 +5850,8 @@ async function selfTest() {
       botToken: "fake:token",
       allowedUserId: "42",
       stateDir: tmpStateDir,
-      sessionDir: tmpStateDir,
       cwd: tmpStateDir,
     });
-    gw.state.remoteBridges = {
-      "pane-bridge": { threadId: 501, name: "📡 test bridge" },
-    };
-    let bridgeHandledPane = null;
-    gw.handleBridgeMessage = async (paneId) => {
-      bridgeHandledPane = paneId;
-    };
     gw.handleUpdate = async () => {};
     gw.telegram = {
       call: async () => ({}),
@@ -7750,7 +5860,7 @@ async function selfTest() {
       setReaction: () => {},
     };
 
-    // Message in bridged topic
+    // Message in the first topic
     await gw.dispatchUpdate({
       message: {
         message_id: 10,
@@ -7760,10 +5870,9 @@ async function selfTest() {
         chat: { type: "private" },
       },
     });
-    assert.equal(bridgeHandledPane, null, "Legacy bridge handler must be unreachable");
-    assert.ok(gw.sessions.get("t:501").pi instanceof PaneRpc, "Migrated topics also use PaneRpc");
+    assert.ok(gw.sessions.get("t:501").pi instanceof PaneRpc, "All topics use PaneRpc");
 
-    // Message in normal unbridged topic
+    // Message in another topic
     await gw.dispatchUpdate({
       message: {
         message_id: 11,
@@ -7775,119 +5884,6 @@ async function selfTest() {
     });
     assert.equal(gw.sessions.has("t:601"), true, "ChatSession MUST be created for normal topic");
     await gw.saveState({});
-    await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
-  }
-
-  // 6. HerdrWatcher opt-in diff produces correct added/removed/updated sets
-  {
-    const watcher = new HerdrWatcher({
-      bin: "herdr",
-      socketPath: "",
-      isExcluded: (id) => id === "w1:p9",
-      onTransition: () => {},
-    });
-
-    const a1 = { pane_id: "p1", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s1.jsonl" } };
-    const a2 = { pane_id: "w1:p9", agent: "pi", tokens: { remote_pi: "on" } }; // excluded
-    const a3 = { pane_id: "p3", agent: "claude", tokens: { remote_pi: "on" } }; // not pi
-
-    const diff1 = watcher.computeOptInDiff([a1, a2, a3]);
-    assert.deepEqual(diff1.added.map((a) => a.pane_id), ["p1"]);
-    assert.deepEqual(diff1.removed, []);
-    assert.deepEqual(diff1.updated, []);
-
-    // Session changed for p1, and p4 added
-    const a1Updated = { pane_id: "p1", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s2.jsonl" } };
-    const a4 = { pane_id: "p4", agent: "pi", tokens: { remote_pi: "on" }, agent_session: { kind: "path", value: "/s4.jsonl" } };
-    const diff2 = watcher.computeOptInDiff([a1Updated, a4]);
-    assert.deepEqual(diff2.added.map((a) => a.pane_id), ["p4"]);
-    assert.deepEqual(diff2.updated.map((a) => a.pane_id), ["p1"]);
-    assert.deepEqual(diff2.removed, []);
-
-    // p1 opt-out (token removed)
-    const a1Off = { pane_id: "p1", agent: "pi" };
-    const diff3 = watcher.computeOptInDiff([a1Off, a4]);
-    assert.deepEqual(diff3.added, []);
-    assert.deepEqual(diff3.updated, []);
-    assert.deepEqual(diff3.removed, ["p1"]);
-  }
-
-  // 7. Echo suppression: a user entry matching recently forwarded text is skipped
-  {
-    const entries = [
-      { type: "message", message: { role: "user", content: "echo this text" } },
-      { type: "message", message: { role: "user", content: "keep this text" } },
-    ];
-    const mapped = mapBridgeEntries(entries, {
-      isEcho: (text) => text.trim() === "echo this text",
-    });
-    assert.equal(mapped.length, 1);
-    assert.equal(mapped[0].type, "user");
-    assert.equal(mapped[0].text, "👤 keep this text");
-  }
-
-  // 8. isTopicGoneError helper
-  {
-    assert.equal(isTopicGoneError(new Error("Bad Request: message thread not found")), true);
-    assert.equal(isTopicGoneError(new Error("Telegram: TOPIC_DELETED")), true);
-    assert.equal(isTopicGoneError(new Error("thread not found")), true);
-    assert.equal(isTopicGoneError(new Error("Network timeout")), false);
-    assert.equal(isTopicGoneError(null), false);
-  }
-
-  // 9. Failed bridge setup retries: doSync deletes failed paneIds from optedInPanes
-  {
-    const watcher = new HerdrWatcher({
-      bin: "herdr",
-      socketPath: "",
-      isExcluded: () => false,
-      onTransition: () => {},
-    });
-    const a1 = { pane_id: "p_fail", agent: "pi", tokens: { remote_pi: "on" } };
-    const diff = watcher.computeOptInDiff([a1]);
-    assert.deepEqual(diff.added.map((a) => a.pane_id), ["p_fail"]);
-    const failedPanes = ["p_fail"];
-    for (const id of failedPanes) watcher.optedInPanes.delete(id);
-    const diffNext = watcher.computeOptInDiff([a1]);
-    assert.deepEqual(diffNext.added.map((a) => a.pane_id), ["p_fail"]);
-  }
-
-  // 10. Topic recreation on deleted topic error & restart noise suppression
-  {
-    const tmpStateDir = join(tmpdir(), `test-recreate-state-${Date.now()}`);
-    await mkdir(tmpStateDir, { recursive: true });
-    const gw = new Gateway({
-      botToken: "fake:token",
-      allowedUserId: "42",
-      stateDir: tmpStateDir,
-      sessionDir: tmpStateDir,
-      cwd: tmpStateDir,
-    });
-    gw.state.remoteBridges = {
-      "p_del": { threadId: 999, name: "📡 old", sessionFile: "/old.jsonl" },
-    };
-    let sends = [];
-    gw.telegram = {
-      call: async (method) => {
-        if (method === "createForumTopic") {
-          return { message_thread_id: 1000 };
-        }
-        return { has_topics_enabled: true };
-      },
-      sendOne: async (chatId, text, extra = {}) => {
-        if (extra.message_thread_id === 999) {
-          throw new Error("Bad Request: message thread not found");
-        }
-        sends.push({ text, extra });
-        return { message_id: 1 };
-      },
-      send: async () => ({ message_id: 1 }),
-      setReaction: () => {},
-    };
-    const agent = { pane_id: "p_del", agent: "pi", tokens: { remote_pi: "on" } };
-    await gw.handleBridgeAdded(agent);
-    assert.equal(gw.state.remoteBridges["p_del"].threadId, 1000, "Deleted topic should be replaced with fresh threadId");
-    assert.ok(sends.some((s) => s.extra.message_thread_id === 1000), "Should send on-message to new topic");
     await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
   }
 
@@ -8009,7 +6005,7 @@ async function selfTest() {
     assert.equal(out, "中文测试");
   }
 
-  // 15. 回归：数字配置解析 — idleStopMinutes 0 生效、非法 maxSessions 回退默认
+  // Numeric configuration rejects invalid values and preserves zero.
   {
     assert.equal(parseNumberConfig(undefined, undefined, 30, { min: 0 }), 30);
     assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
@@ -8019,18 +6015,6 @@ async function selfTest() {
     assert.equal(parseNumberConfig("2.5", undefined, 4, { min: 1, integer: true }), 4);
     assert.equal(parseNumberConfig("8", undefined, 4, { min: 1, integer: true }), 8);
     assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
-    // idleStopMinutes=0 时 checkIdleSessions 不得停任何会话
-    {
-      const gwIdle = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), idleStopMinutes: 0 });
-      let stopped = false;
-      const t = new ChatSession(gwIdle, { threadId: 501, cwd: tmpdir(), sessionDir: join(tmpdir(), "sIdle") });
-      t.stop = () => { stopped = true; };
-      t.lastActiveAt = 0;
-      t.pi = { proc: {} };
-      gwIdle.sessions.set("t:501", t);
-      gwIdle.checkIdleSessions();
-      assert.equal(stopped, false, "idleStopMinutes=0 时不得空闲停止");
-    }
   }
 
   // 16. 回归：send 与 sendOne 背靠背投递保序（sendOne 纳入输出队列）
@@ -8047,22 +6031,6 @@ async function selfTest() {
     assert.deepEqual(order, ["first-sendOne", "second-send"], "sendOne 应与 send 一样走输出队列且保持顺序");
   }
 
-  // 16. 回归：getLastAssistantReply 只读尾部且找不到时向头部扩窗
-  {
-    const tmpLast = join(tmpdir(), `test-last-reply-${Date.now()}.jsonl`);
-    const head = [
-      JSON.stringify({ type: "message", message: { role: "user", content: "hi" } }),
-      JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "早期回复" }] } }),
-    ].join("\n") + "\n";
-    const tail = Array.from({ length: 600 }, (_, i) => JSON.stringify({ type: "message", message: { role: "user", content: `msg ${i}`.padEnd(500, "x") } })).join("\n") + "\n";
-    await writeFile(tmpLast, head + tail);
-    assert.equal(await getLastAssistantReply(tmpLast), "早期回复");
-    // 尾部直接是 assistant 文本时立即返回
-    await writeFile(tmpLast, tail + JSON.stringify({ type: "message", message: { role: "assistant", content: "最新回复" } }) + "\n");
-    assert.equal(await getLastAssistantReply(tmpLast), "最新回复");
-    await unlink(tmpLast).catch(() => {});
-  }
-
   console.log("self-test: ok");
   } finally {
     globalThis.fetch = origGlobalFetch;
@@ -8075,14 +6043,7 @@ async function selfTest() {
 if (import.meta.main) {
   if (process.argv.includes("--self-test")) {
     await selfTest();
-  } else if (process.argv.includes("--watch-session")) {
-    console.error("The legacy read-only session viewer is disabled; use Pi in its Herdr pane.");
-    process.exitCode = 1;
   } else {
-    if (process.env.REMOTE_PI_GATEWAY) {
-      console.error("❌ Refusing to start: already running inside a remote-pi session.");
-      process.exit(1);
-    }
     const gateway = new Gateway(loadConfig());
     for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { gateway.stop(); process.exit(0); });
     gateway.start().catch((error) => { console.error(error); gateway.stop(); process.exit(1); });

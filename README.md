@@ -31,15 +31,15 @@
 
 - ⚡ **Lightweight & Minimalist**: Built around a clean, single-file core (`gateway.mjs`) using only the Node.js standard library plus `markdown-it` for Telegram HTML rendering. No heavy frameworks.
 -  **Sleep & Wake Self-Healing**: Automatically detects system sleep/wake drift on laptops. Upon lid opening or wake, immediately aborts stale poll sockets and probes network connectivity, restoring the connection in 1–2 seconds instead of hanging on 60-second socket timeouts.
-- 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspace switches and recent projects are tracked cleanly in `state.json`, and session paths use stable digests to prevent collision.
-- 🎯 **100% Pi-Native**: Driven strictly via Pi's JSON-RPC protocol (`get_state`, `get_session_stats`, `new_session`, etc.). No private hacks, out-of-band files, or intrusive patches.
+- 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspaces, recent projects, and pane/session bindings are tracked in `state.json`; sessions stay in Pi’s native session directory.
+- 🎯 **100% Pi-Native**: Uses Pi 1.3.0’s public Extension API, Pi CLI, and Herdr socket API. One interactive Pi process owns each session; Telegram and the terminal are views of that process. No private patches or side-channel files.
 - 🌊 **Native Draft Streaming**: Streams thoughts and responses in real time using silent message creation and in-place editing (`sendMessage` + `editMessageText`), eliminating duplicate dialogs, ghost bubbles, and delivery flashes across all clients.
 - 🛠️ **Expandable Tool Cards**: Ongoing tool executions (Bash commands, file read/write, grep) are grouped into native collapsible blockquotes (`<blockquote expandable>`) to keep mobile chat clean and readable.
-- 📄 **Long Replies as Readable Files**: Final replies longer than `longReplyChars` (default 8000) are delivered as a standalone dark-mode-friendly HTML document (rendered with full CommonMark + GFM tables), with the first chunk kept in chat as a preview. Configure or disable (`0`) via `longReplyChars`; `/export` exports the whole session via Pi's native `export_html`.
-- 🚑 **One-Tap Error Recovery**: Model errors, empty replies, unexpected Pi exits and extension failures attach an inline keyboard (1h TTL): retry the last prompt, retry on a fallback model (`fallbackModels`), pick another model, restart Pi, or view the redacted gateway log — no typing required.
-- 🎮 **Telegram Companion Extension**:
-  - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons).
-  - Supports loading custom Pi extensions via config (`-e`), and proxies Pi extension UI requests (`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`) directly to Telegram.
+- 📄 **Long Replies as Readable Files**: Final replies longer than `longReplyChars` (default 8000) are delivered as a standalone dark-mode-friendly HTML document (rendered with full CommonMark + GFM tables), with the first chunk kept in chat as a preview. Configure or disable (`0`) via `longReplyChars`; `/export` exports the whole session via Pi's native `pi --export`.
+- 🚑 **One-Tap Error Recovery**: Model errors, empty replies and extension failures attach an inline keyboard (1h TTL): retry the last prompt, retry on a fallback model (`fallbackModels`), pick another model, restart a gateway-created Pi (desktop Pi must be restarted in its pane), or view the redacted gateway log — no typing required.
+- 🎮 **One Remote-Control Extension**:
+  - `remote-pi.ts` provides `remote_attach` (send local files) and `remote_ask` (multiple-choice questions in Telegram and the terminal; first answer wins). Tools are active only while connected.
+  - Install other extensions through Pi’s native extension mechanism. Their TUI dialogs are not proxied: blocked notifications show the screen tail with Enter/Esc controls only, without parsing numbered options.
 - 🎙️ **Multimodal Context & Voice Transcription (STT)**:
   - **Voice Input**: Configure `sttCommand` (e.g. Groq Whisper API or local Apple Silicon `mlx-whisper`) to convert Telegram voice notes into prompts automatically.
   - **Vision & Attachments**: Send photos (inlined as visual context) or documents, PDFs, and code files (saved locally and passed into context).
@@ -47,7 +47,7 @@
   - Send messages while Pi is working to dynamically steer the agent turn without waiting for it to finish.
   - User messages receive a single receipt reaction (`👀` by default), which stays unchanged. Completion is reported by the run summary card, not another reaction.
 - 📊 **Run Summary Card & Quick Actions**: At the end of every run, sends a summary card with notification (`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`), listing changed files (`+a −d`). Includes inline action buttons: `📄 Diff` (view inline or download unified diff), `✅ Commit` (streamed conventional commit prompt), and `↩️ Undo run` (interactive restore and cleanup).
-- 📌 **Pinned Session Status Board**: Lazily creates and pins a single status board per session (`⏳ Working / 💤 Idle / ⚠️ Pi stopped / 🖥 On desktop`), updated in place with 3-second throttling and a 15-second live ticker. Displays running tool summary, active model, thinking level, context window percent, queued follow-ups, and last run stats.
+- 📌 **Pinned Session Status Board**: Lazily creates and pins a single status board per session (`⏳ Working / 💤 Idle / ⚠️ Pi not running`), updated in place with 3-second throttling and a 15-second live ticker. Displays running tool summary, active model, thinking level, context window percent, queued follow-ups, and last run stats.
 - 🔒 **Single-Instance Mutex & Strict Whitelist**:
   - Unix domain socket file lock prevents concurrent instances from interfering with the same session.
   - Strict numeric `allowedUserId` whitelist only accepts messages from your private chat; rejects unauthorized users and ignores all group chats.
@@ -61,22 +61,21 @@
 | *Plain Text* | Chat with Pi. Messages sent while Pi is working act as live steering instructions |
 | `/cwd [path]` | Switch workspace directory (absolute path or `~`-relative; errors if invalid). Without argument, show inline keyboard of up to 20 recently used projects |
 | `/topic [path]` | Start a new topic (thread) session for parallel tasks; without argument, uses current workspace |
-| `/close` | Close the current topic session (confirm dialog → stop its Pi process and delete the topic) |
+| `/close` | Close the current topic after confirmation: quit/close gateway-created Pi panes; desktop-attached panes only detach. Delete the topic |
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
-| `/resume` | Show recently saved sessions to resume, with access to desktop Pi sessions in the workspace |
+| `/resume` | List sessions for the current workspace from Pi’s native directory; if already open, offer to view the existing pane |
 | `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response). Note: the block on service restart/stop commands here is only an accident guard, not a security boundary — the bot holder already has full shell access |
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
 | `/status` | Show current session ID, active model, token context usage, and cost |
 | `/agents` | Status of every agent in Herdr, grouped by workspace (📱 = Telegram session, 📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
-| `/export` | Export the full session as an HTML file (Pi native `export_html`) and send it as a document |
+| `/export` | Export the full session as an HTML file (Pi native `pi --export`) and send it as a document |
 | `/fork` | Branch the session from a previous user message |
-| `/handoff` | Hand off session to desktop Pi (safely stops phone Pi, gives copyable command & Take Back button) |
 | `/abort` | Stop current agent execution immediately, keeping queued messages |
-| `/queue [clear]` | View the message queue; `/queue clear` is the only command to clear it |
+| `/queue [clear]` | View/reset the gateway’s queue display; Pi 1.3.0 cannot inspect or clear native queues through the public Extension API |
 | `/help` | Show help, followed by available extension, prompt template, and skill commands |
 
 ### Admin (typeable, hidden from the Telegram menu)
@@ -94,8 +93,9 @@
 ## Prerequisites
 
 1. **Node.js**: **>= 22.18.0** (Node 24 LTS recommended; relies on native `import.meta.main`).
-2. **Pi CLI**: A globally installed and authenticated Pi CLI (e.g. `@mariozechner/pi-coding-agent`).
-3. **Telegram Bot Token & Numeric User ID**:
+2. **Pi CLI 1.3.0**: Install and authenticate `@earendil-works/pi-coding-agent`; `pi` must be available on `PATH`. This is the supported public Extension API target.
+3. **[Herdr](https://herdr.dev)**: Required; `herdr` must be available on `PATH`. The gateway reuses a running server or starts a headless server when needed, and fails at startup if Herdr is missing.
+4. **Telegram Bot Token & Numeric User ID**:
    - Talk to [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot` to create your bot and obtain a **Bot Token**.
    - Get your numeric Telegram User ID (send any message to your new bot, then run):
      ```bash
@@ -154,7 +154,18 @@ Edit `~/.config/remote-pi/config.json` with your credentials and workspace path:
 }
 ```
 
-### 4. Start the Gateway
+### 4. Install the Pi Extension
+
+The macOS installer and `pi-remote-gateway upgrade` manage this link automatically. For foreground/Linux use, run from the repository root:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+ln -sfn "$PWD/remote-pi.ts" ~/.pi/agent/extensions/remote-pi.ts
+```
+
+This also replaces an older symlink target. Do not overwrite an unrelated regular file at that path. Reload existing Pi instances with Pi’s native `/reload` after updating the extension.
+
+### 5. Start the Gateway
 
 #### Option A: Foreground (Development / Linux / Debugging)
 
@@ -201,16 +212,9 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 
 | Key | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `piBin` | `PI_BIN` | Auto-detected | Path to the `pi` executable (auto-detects Homebrew / global npm paths) |
-| `approve` | - | `true` | Pass `--approve` to Pi (trusts project-local settings and extensions for this run) |
-| `herdr` | `REMOTE_PI_HERDR` | `true` | Automatically integrate with Herdr (connects to existing server or launches headless server; assigns workspace/pane envs) |
-| `enableCompanionExtension` | `REMOTE_PI_COMPANION_EXTENSION` | `true` | Load companion extension (`remote_attach` and `remote_ask` tools) |
-| `extensions` | `REMOTE_PI_EXTENSIONS` | `[]` | Additional Pi extension file paths to pass via `-e` |
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |
-| `stateDir` | - | `~/.local/var/remote-pi` | Directory for runtime state, session files, downloads, and lock socket |
+| `stateDir` | - | `~/.local/var/remote-pi` | Directory for gateway state, downloads, instance lock and `bridge.sock`; Pi sessions remain in Pi’s native directory |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | Gateway output log file |
-| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | Inactivity minutes before a non-streaming topic session's Pi process is stopped (restarts on next message; main session never idle-stopped); `0` disables idle-stopping entirely |
-| `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | Maximum concurrently running Pi processes across all sessions (stops least recently active non-streaming topic when limit is reached) |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | Replies longer than this are sent as an HTML document (first chunk stays in chat with a note); `0` disables |
 | `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | Days to keep downloaded files in the state downloads dir and `failed-reply-*.txt` copies (cleaned up on start and every 24h by mtime); `0` disables cleanup |
@@ -218,7 +222,7 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | Send a summary and change card with notification and diff/commit/undo buttons at the end of each run |
 | `statusBoard` | `REMOTE_PI_STATUS_BOARD` | `true` | Maintain a pinned status board per session with throttled updates showing status, tool, model, context, and follow-ups |
 
-> **Environment Variable Precedence**: Environment variables always take precedence over `config.json`. For `REMOTE_PI_EXTENSIONS`, you can pass a JSON array string (`'["~/my-ext.ts"]'`) or a comma-separated list.
+> **Environment Variable Precedence**: Listed environment variables take precedence over `config.json`. Pi models, credentials, trust, and additional extensions are managed by Pi itself, not gateway configuration.
 
 ---
 
@@ -233,12 +237,12 @@ The gateway supports running multiple independent Pi sessions in parallel using 
    - Tap **Open** to launch the BotFather Mini App → select your bot → **Bot Settings** → **Threads Settings** → enable **Threaded Mode** (the classic `/mybots` text menu does not expose this setting).
 2. **Create a Topic Session**:
    - Send `/topic [path]` to spin up an independent topic for a project directory. Without an argument, it uses the current session's workspace.
-   - Each topic gets its own isolated Pi process, workspace, and session history (`sessionDir + "-t<threadId>"`).
+   - Each newly created topic starts an interactive Pi in its own Herdr pane/workspace. Sessions use Pi’s native directory, not a separate Telegram history.
 3. **Manage Topics**:
    - Inside a topic, `/cwd <path>` switches the workspace for that topic only and renames the topic tab.
-   - `/close` inside a topic prompts for confirmation, stops that topic's Pi process, and deletes the topic.
+   - `/close` asks for confirmation and deletes the topic. The last view of a gateway-created Pi quits it and closes its pane; a desktop-attached Pi is only detached and keeps running.
    - In the main chat, `/status` lists all running/idle/stopped topic sessions.
-   - Inactive topic sessions are automatically idle-stopped after `idleStopMinutes` (default 30) and seamlessly resumed upon your next message.
+   - Pi is not stopped for inactivity or evicted by a gateway concurrency limit. If Pi exits back to the shell, the next phone message restarts it in the same pane with its existing session.
 
 ### Voice Transcription (STT)
 
@@ -258,45 +262,17 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 }
 ```
 
-### Herdr Desktop Visibility & Notifications
+### One session, any device
 
-When you run [Herdr](https://herdr.dev), the gateway integrates deeply with Herdr's socket API:
+- **From your phone**: Chat in Telegram or create a topic with `/topic [path]`. The gateway opens a real interactive Pi in a Herdr pane; switch to that pane on the desktop and type immediately. `/new` resets the shared session, not a separate phone process.
+- **From your desktop**: Run `/remote-control` (or `/remote-control on|off|status`) in any Pi pane. An unknown pane gets its own Telegram topic; enable Threaded Mode in @BotFather first. The native Herdr metadata token `remote_pi=on` preserves opt-in across extension/session reloads and clears on quit.
+- **Both directions**: Phone prompts appear in the real Pi TUI; desktop-typed prompts appear in Telegram as `🖥 <text>`. Prompts use the socket and Pi’s native input API, never terminal keystrokes or transcript scraping.
+- **Resume without another writer**: `/resume` lists sessions for the current cwd from `~/.pi/agent/sessions` (or Pi’s native directory environment overrides). If another pane already serves a session, the gateway offers to point the topic at that pane instead of opening another Pi on the same file.
+- **Dialogs**: `remote_ask` appears in both views; the first answer dismisses the other. Other extensions’ TUI dialogs stay in the terminal; Herdr blocked notifications include a screen tail and only `⏎ Enter` / `⎋ Esc` controls.
+- **Lifecycle**: Gateway restarts leave Pi running; extensions reconnect and saved bindings restore the views. When Pi quits to the shell, the board shows `⚠️ Pi not running`; the next phone prompt resumes it in the same pane. Closing a desktop-attached topic never kills that Pi.
+- **Visibility**: `/agents` remains a read-only list of all Herdr agents with screen previews. Pi reports its own status through Herdr’s native integration.
 
-1. **Every Telegram session is visible in Herdr**:
-   - Each Telegram chat session (main chat and each topic) gets its own dedicated Herdr workspace labeled `📱 <basename>` (or `📱 <basename>#<threadId>`).
-   - The gateway reports agent status (`working`, `idle`, `blocked` with the question title) directly to Herdr over its socket (source `remote-pi`), so Telegram sessions appear live in Herdr's agent list (`herdr agent list`).
-   - Inside the pane, a compact ANSI viewer (`gateway.mjs --watch-session`) renders a read-only live transcript of the conversation (user messages, assistant text, tool executions, errors, and compactions).
-2. **Desktop Pi Remote Control via Topics (opt-in per agent)**:
-   - When running other desktop Pi agents in Herdr, turning on remote control bridges that agent to its **own Telegram forum topic**. Opt in per agent by typing `/remote-control` (or `/remote-control on|off|status`) inside that desktop Pi.
-   - **Prerequisite**: Threaded Mode / forum topics must be enabled for your bot in Telegram (via @BotFather Mini App: Bot Settings → Threads Settings → Threaded Mode). If topics are not enabled, notifications fall back to the main chat.
-   - `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`.
-   - The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits.
-   - **Live Streaming**: The pane's Pi conversation streams into the topic at message-level granularity (user messages, assistant replies chunked or exported as HTML documents, and tool calls merged in-place into an expandable tool panel; thinking parts and raw tool results are omitted).
-   - **Interactive Prompting & Control**: Send text messages directly into the topic to prompt the desktop agent (with automatic echo suppression). `/status` displays the agent status and current screen, `/abort` sends `Esc` to interrupt the running task.
-   - **Needs confirmation** (`blocked`): you get the screen tail plus buttons for detected options (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`. Notifications for `blocked` ping you, while `done` notifications arrive silently.
-   - `/agents` lists all Herdr agents: `📱` marks Telegram sessions, while `📡` marks desktop agents bridged via remote control.
-
-### Phone ↔ Desktop Handoff
-
-Two Pi processes must never write to the same session file simultaneously. The gateway keeps its sessions in `~/.local/var/remote-pi/sessions`, completely separate from your desktop Pi's default directory (`~/.pi/agent/sessions/`).
-
-- **Phone → Desktop (`/handoff`)**:
-  - Sends `/handoff` to gracefully stop the gateway's Pi process and release Herdr agent authority.
-  - If Herdr is running, the gateway stops the pane viewer and launches the interactive Pi directly in that same Herdr pane via `herdr agent start`, so the official Herdr Pi integration seamlessly takes over status reporting.
-  - Generates a copyable fallback command to continue on desktop:
-    ```bash
-    cd '<cwd>' && pi --session '<sessionFile>'
-    ```
-  - While handed off, the pinned status board displays `🖥 On desktop since HH:MM`, and messages sent in Telegram are not sent to Pi.
-  - Tap `⬅️ Take back` to resume the session on Telegram:
-    - The gateway checks the Herdr pane's agent status: if it is still `working` or `blocked`, it safely refuses to take back to avoid concurrent writes.
-    - If `idle` or `done`, it sends `/quit` to that pane, waits for the desktop Pi process to exit back to the shell, and resumes the session on Telegram (reloading the latest history, restarting the pane viewer, and reporting status).
-    - If the desktop Pi does not exit within 10 seconds, it alerts you and keeps the handoff mark.
-  - Or tap `✨ New session here` to start fresh in Telegram.
-- **Desktop → Phone (Desktop Sessions in `/resume`)**:
-  - Run `/resume`. If previous desktop Pi sessions exist for the current directory, a `🖥 Desktop sessions` button appears.
-  - Lists up to 10 newest desktop session files with relative timestamps and previews.
-  - Pick a session, confirm that the desktop Pi on that session has exited, and the gateway seamlessly loads it via `switch_session`.
+**Pi 1.3.0 public API limits**: Queue inspection/clearing is unavailable, so `/queue clear` resets the gateway display but does not remove Pi’s pending native messages. Automatic retry start/end notifications are also unavailable; other native events, including compaction and run completion, are forwarded.
 
 ---
 
@@ -304,16 +280,18 @@ Two Pi processes must never write to the same session file simultaneously. The g
 
 ```text
 [ Telegram Client ]
-       ↕ (HTTPS Long Polling / SendMessageDraft / Reactions / Callbacks)
-[ gateway.mjs ] (Single daemon process, Node stdlib + markdown-it, Unix Socket Lock)
-       ↕ (JSON-RPC over stdio)
-[ pi --mode rpc --continue ]
-       ↕ (-e remote-extension.mjs & custom extensions)
+       ↕ HTTPS long polling / messages / edits / callbacks
+[ gateway.mjs ] — router, streaming, status boards, run cards
+       ↕ JSON lines over <stateDir>/bridge.sock (Unix socket, mode 0600)
+[ Herdr pane: interactive Pi + remote-pi.ts ] ↔ [ Desktop terminal ]
+       ↕ Pi public Extension API / native CLI
 [ Local Workspace & System Tools ]
 ```
 
-- **Power Management**: On macOS, launchd invokes `/usr/bin/caffeinate -s -i -- node gateway.mjs`. This prevents idle sleep on AC power (allowing Dark Wake to process commands immediately) while preserving manual sleep and lid-close behavior.
-- **Session Isolation**: Sessions spawned by the gateway are stored under `~/.local/var/remote-pi/sessions`, isolated from your desktop Pi session history to avoid concurrency conflicts on the same session file.
+- **One owner, many views**: Each session belongs to one interactive Pi process. `state.json` stores pane/session bindings; native Pi session files remain in `~/.pi/agent/sessions` (subject to Pi’s native environment overrides).
+- **Native lifecycle**: Herdr creates/starts panes; Pi handles prompts, models, compaction, and session replacement. The gateway preserves its RPC-shaped client interface with `PaneRpc`, without spawning another Pi through a subprocess RPC mode.
+- **Power Management**: On macOS, launchd invokes `/usr/bin/caffeinate -s -i -- node gateway.mjs`. This prevents idle sleep on AC power while preserving manual sleep and lid-close behavior.
+- **References**: [Pi Extension API](https://pi.dev/docs/latest/extensions) (implementation targets installed Pi 1.3.0), [Herdr CLI](https://herdr.dev/docs/cli-reference/), and [Herdr integrations](https://herdr.dev/docs/integrations/).
 
 ---
 

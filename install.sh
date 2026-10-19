@@ -7,12 +7,6 @@ while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 LABEL="local.remote-pi"
 
-if [[ "${1:-}" =~ ^(restart|stop|uninstall|upgrade)$ ]] && [[ -n "${REMOTE_PI_GATEWAY:-}" ]]; then
-    echo "❌ Cannot restart/stop/uninstall/upgrade from inside a Remote Pi Gateway session (it would kill itself and lose the connection)." >&2
-    echo "💡 Send /restart (or /upgrade) in Telegram instead." >&2
-    exit 1
-fi
-
 DOMAIN="gui/$(id -u)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONFIG_DIR="$HOME/.config/remote-pi"
@@ -40,9 +34,14 @@ xml_escape() {
 install_command() {
     mkdir -p "$(dirname "$COMMAND")"
     ln -sf "$ROOT/install.sh" "$COMMAND"
-    # 桌面 Pi 的 /remote-control 命令（按 agent 开启 Herdr 状态推送）；Pi 自动发现 ~/.pi/agent/extensions/*.ts
+    # Pi 自动发现此扩展；保留安装路径并替换旧目标（包括悬空软链），不覆盖用户普通文件。
     mkdir -p "$PI_EXTENSION_DIR"
-    ln -sf "$ROOT/herdr-extension.ts" "$PI_EXTENSION"
+    if [[ -e "$PI_EXTENSION" && ! -L "$PI_EXTENSION" ]]; then
+        echo "❌ Refusing to overwrite non-symlink extension: $PI_EXTENSION" >&2
+        return 1
+    fi
+    # ref: ln -sfn replaces the link itself, not a linked directory: https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html
+    ln -sfn "$ROOT/remote-pi.ts" "$PI_EXTENSION"
 }
 
 setup_plist() {
