@@ -3,5 +3,6 @@
     "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
     "allowedUserId": "123456789"
   },
-  "cwd": "~/dev/my-project"
+  "cwd": "~/dev/my-project",
+  "presenceFile": "~/.local/var/remote-pi/present"
 }

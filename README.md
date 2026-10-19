@@ -39,6 +39,7 @@
 - 🚑 **One-Tap Error Recovery**: Model errors, empty replies and extension failures attach an inline keyboard (1h TTL): retry the last prompt, retry on a fallback model (`fallbackModels`), pick another model, restart a gateway-created Pi (desktop Pi must be restarted in its pane), or view the redacted gateway log — no typing required.
 - 🎮 **One Remote-Control Extension**:
   - `remote-pi.ts` provides `remote_attach` (send local files) and `remote_ask` (multiple-choice questions in Telegram and the terminal; first answer wins). Tools are active only while connected.
+  - **TUI Footer Status**: Shows persistent `📱 remote` in the Pi TUI footer while the bridge socket is connected, `📱 reconnecting…` while retrying, and clears when remote control is off. Disconnecting from Telegram shows an informational notification.
   - Install other extensions through Pi’s native extension mechanism. Their TUI dialogs are not proxied: blocked notifications show the screen tail with Enter/Esc controls only, without parsing numbered options.
 - 🎙️ **Multimodal Context & Voice Transcription (STT)**:
   - **Voice Input**: Configure `sttCommand` (e.g. Groq Whisper API or local Apple Silicon `mlx-whisper`) to convert Telegram voice notes into prompts automatically.
@@ -46,7 +47,7 @@
 - 💬 **Live Steering & Reaction ACK**:
   - Send messages while Pi is working to dynamically steer the agent turn without waiting for it to finish.
   - User messages receive a single receipt reaction (`👀` by default), which stays unchanged. Completion is reported by the run summary card, not another reaction.
-- 📊 **Run Summary Card & Quick Actions**: At the end of every run, sends a summary card with notification (`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`), listing changed files (`+a −d`). Includes inline action buttons: `📄 Diff` (view inline or download unified diff), `✅ Commit` (streamed conventional commit prompt), and `↩️ Undo run` (interactive restore and cleanup).
+- 📊 **Run Summary Card & Quick Actions**: At the end of every run, sends a summary card (`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`), listing changed files (`+a −d`). Includes inline action buttons: `📄 Diff` (view inline or download unified diff), `✅ Commit` (streamed conventional commit prompt), and `↩️ Undo run` (interactive restore and cleanup). Terminal-originated runs (`remote_user_input`) and desk-present runs (`presenceFile`) send summary cards silently (`disable_notification: true`).
 - 🔒 **Single-Instance Mutex & Strict Whitelist**:
   - Unix domain socket file lock prevents concurrent instances from interfering with the same session.
   - Strict numeric `allowedUserId` whitelist only accepts messages from your private chat; rejects unauthorized users and ignores all group chats.
@@ -68,6 +69,7 @@
 | `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response). Note: the block on service restart/stop commands here is only an accident guard, not a security boundary — the bot holder already has full shell access |
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
+| `/git_commit_push [instructions]` | Stage, commit, and push changes with antigravity/gemini-3.8-flash (thinking off), then restore the previous model and thinking level (also accepts `/git-commit-push`) |
 | `/status` | Show current session ID, active model, token context usage, and cost |
 | `/agents` | Status of every agent in Herdr, grouped by workspace (📱 = Telegram session, 📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
@@ -227,7 +229,8 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | Replies longer than this are sent as an HTML document (first chunk stays in chat with a note); `0` disables |
 | `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | Days to keep downloaded files in the state downloads dir and `failed-reply-*.txt` copies (cleaned up on start and every 24h by mtime); `0` disables cleanup |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | Comma-separated `provider/modelId` list offering a "Retry with <model>" button on errors (picks the next entry after the current model, wrapping) |
-| `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | Send a summary and change card with notification and diff/commit/undo buttons at the end of each run |
+| `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | Send a summary and change card at the end of each run with diff/commit/undo buttons (sent with notification, or silently for terminal-originated runs and while presenceFile exists) |
+| `presenceFile` | `REMOTE_PI_PRESENCE_FILE` | `""` | Optional presence marker file path; while this file exists, proactive pushes (run completion cards, errors, Herdr blocked alerts) are sent silently (`disable_notification: true`). Can be created/deleted by a screen lock/unlock hook (e.g. sleepwatcher or hammerspoon). Supports `~/` |
 
 > **Environment Variable Precedence**: Listed environment variables take precedence over `config.json`. Pi models, credentials, trust, and additional extensions are managed by Pi itself, not gateway configuration.
 
@@ -272,8 +275,8 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 ### One session, any device
 
 - **From your phone**: Chat in Telegram or create a topic with `/topic [path]`. The gateway opens a real interactive Pi in a Herdr pane; switch to that pane on the desktop and type immediately. `/new` resets the shared session, not a separate phone process.
-- **From your desktop**: Run `/remote-control` (or `/remote-control on|off|status`) in any Pi pane. An unknown pane gets its own Telegram topic; enable Threaded Mode in @BotFather first. The native Herdr metadata token `remote_pi=on` preserves opt-in across extension/session reloads and clears on quit. While the bridge is connected, the Herdr sidebar shows a `📱` badge next to the agent; it disappears when remote control is off or the bridge is disconnected/reconnecting.
-- **Both directions**: Phone prompts appear in the real Pi TUI; desktop-typed prompts appear in Telegram as `🖥 <text>`. Prompts use the socket and Pi’s native input API, never terminal keystrokes or transcript scraping.
+- **From your desktop**: Run `/remote-control` (or `/remote-control on|off|status`) in any Pi pane. An unknown pane gets its own Telegram topic named after Pi's session name (`📡 <session_name>`), falling back to the first user prompt or directory basename. Enable Threaded Mode in @BotFather first. The last exchange (`👤 …` / `🤖 …`) is backfilled as a silent preview message. Renaming via `/name` or in Pi syncs to the topic title (`editForumTopic`). The native Herdr metadata token `remote_pi=on` preserves opt-in across extension/session reloads and clears on quit. While the bridge is connected, the Herdr sidebar shows a `📱` badge next to the agent and the Pi TUI footer shows `📱 remote` (`📱 reconnecting…` during reconnects). Closing a desktop-attached topic turns remote control off and notifies the terminal user without terminating Pi.
+- **Both directions**: Phone prompts appear in the real Pi TUI; desktop-typed prompts appear in Telegram as `🖥 <text>`. Prompts use the socket and Pi’s native input API, never terminal keystrokes or transcript scraping. Prompts originating from the terminal send completion cards and empty-reply warnings silently to Telegram without buzzing your phone.
 - **Resume without another writer**: `/resume` lists sessions for the current cwd from `~/.pi/agent/sessions` (or Pi’s native directory environment overrides). If another pane already serves a session, the gateway offers to point the topic at that pane instead of opening another Pi on the same file.
 - **Dialogs**: `remote_ask` appears in both views; the first answer dismisses the other. Other extensions’ TUI dialogs stay in the terminal; Herdr blocked notifications include a screen tail and only `⏎ Enter` / `⎋ Esc` controls.
 - **Lifecycle**: A gateway (re)start only re-attaches to Pi panes that are still running — it never launches a new Pi by itself; if none is running, the first message starts one. Extensions reconnect and saved bindings restore the views. When Pi quits to the shell, the next phone prompt resumes it in the same pane. Closing a desktop-attached topic never kills that Pi.

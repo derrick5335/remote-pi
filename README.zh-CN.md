@@ -39,6 +39,7 @@
 - 🚑 **错误一键恢复按钮**：模型报错、空回复、扩展失败等场景自动附带内联按钮（1 小时有效）：重发上一次 Prompt、切换备用模型重试（`fallbackModels`）、浏览模型列表、重启网关创建的 Pi（桌面 Pi 需在其窗格内重启）、查看脱敏网关日志，无需手动输命令。
 - 🎮 **统一远程控制扩展**：
   - `remote-pi.ts` 提供 `remote_attach`（发送本地文件）与 `remote_ask`（同时在 Telegram 和终端提问，先回答者生效）；工具仅在连接期间启用。
+  - **TUI 底部常驻状态**：桥接连接时在 Pi TUI 底部状态栏常驻显示 `📱 remote`，重连中显示 `📱 reconnecting…`，关闭后清除。从 Telegram 关闭时向终端用户发送提示通知。
   - 其他扩展通过 Pi 原生扩展机制安装，其 TUI 对话框不做代理：待确认通知仅展示屏幕末尾内容与 Enter/Esc 控件，不解析屏幕编号选项。
 - 🎙️ **多模态与语音转写（STT）**：
   - **语音输入**：支持在配置中指定 `sttCommand`（如 Groq Whisper API 或本地 mlx-whisper），发送语音消息即自动转写为 Prompt 执行。
@@ -46,7 +47,7 @@
 - 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
   - 收到消息时 Bot 仅在原消息标记一次“接收”表情（默认 `👀`），之后保持不变。完成状态由运行摘要卡片通知，不再更换表情。
-- 📊 **运行摘要卡片与快捷操作**：任务结束时自动发送包含提示音的完成卡片（`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`）并列出变更文件清单（`+a −d`）。提供内联快捷操作按钮：`📄 Diff`（内联查看或下载完整 unified diff）、`✅ Commit`（流式常规提交 Prompt）、`↩️ Undo run`（交互式回滚与清理新文件）。
+- 📊 **运行摘要卡片与快捷操作**：任务结束时自动发送完成卡片（`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`）并列出变更文件清单（`+a −d`）。提供内联快捷操作按钮：`📄 Diff`（内联查看或下载完整 unified diff）、`✅ Commit`（流式常规提交 Prompt）、`↩️ Undo run`（交互式回滚与清理新文件）。终端直接发起的运行或桌面在线（`presenceFile`）时静音推送（`disable_notification: true`）。
 - 🔒 **单实例互斥与严格白名单**：
   - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
   - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
@@ -68,6 +69,7 @@
 | `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应。注意：此处对服务重启/停止命令的拦截仅为误操作防护，并非安全边界 —— 持有 Bot 者本就拥有完整 Shell 权限 |
 | `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
+| `/git_commit_push [指令]` | 使用 antigravity/gemini-3.8-flash（关闭思考）自动暂存、提交 Conventional Commit 并推送，完成后自动恢复原模型与思考级别（亦支持 `/git-commit-push`） |
 | `/status` | 查看当前会话 ID、模型、上下文消耗统计及费用 |
 | `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📱 = Telegram 会话，📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
@@ -227,7 +229,8 @@ pi-remote-gateway stop     # 停止后台服务
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | 超过该长度的回复改为发送 HTML 文档（聊天中保留首段预览与提示）；设 `0` 关闭 |
 | `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | 下载目录内文件与 `failed-reply-*.txt` 副本的保留天数（启动时及每 24 小时按 mtime 清理）；设 `0` 关闭清理 |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
-| `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送带通知的运行摘要与变更卡片（含 Diff/Commit/Undo 按钮） |
+| `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送运行摘要与变更卡片（含 Diff/Commit/Undo 按钮；通常带通知，终端发起或 presenceFile 存在时静音） |
+| `presenceFile` | `REMOTE_PI_PRESENCE_FILE` | `""` | 桌面在线状态标记文件路径；该文件存在时，运行完成卡片、错误提醒及 Herdr blocked 确认等主动通知均静音推送（`disable_notification: true`）。可通过屏幕锁屏/解锁钩子（如 sleepwatcher 或 hammerspoon）创建与删除。支持 `~/` |
 
 > **环境变量覆盖说明**：表中环境变量优先于配置文件。模型、凭据、信任与额外扩展由 Pi 自身管理，不再由网关配置注入。
 
@@ -272,8 +275,8 @@ pi-remote-gateway stop     # 停止后台服务
 ### 同一会话，任意设备（One session, any device）
 
 - **从手机开始**：在 Telegram 对话，或通过 `/topic [路径]` 创建 Topic。网关在 Herdr 窗格中启动真正的交互式 Pi；回到桌面直接在该窗格输入即可。`/new` 重置的是双方共享的会话，不是另一份手机进程。
-- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic；请先在 @BotFather 开启 Threaded Mode。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。桥接连接期间，Herdr 侧边栏在 agent 旁显示 `📱` 徽标；远程控制关闭或断开/重连时消失。
-- **双向同步**：手机指令原生显示在 Pi TUI；桌面输入在 Telegram 显示为 `🖥 <text>`。指令通过 socket 与 Pi 原生输入 API 传递，不使用终端按键模拟或会话日志抓取。
+- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic，以 Pi 会话名称命名（`📡 <session_name>`，回退至首条用户指令或目录名）；请先在 @BotFather 开启 Threaded Mode。首条静音消息会自动回填最近一轮对话预览（`👤 …` / `🤖 …`），通过 `/name` 或在 Pi 内重命名会话会自动同步至 Topic 标题（`editForumTopic`）。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。桥接连接期间，Herdr 侧边栏显示 `📱` 徽标，Pi TUI 底部状态栏显示 `📱 remote`（断线重连中显示 `📱 reconnecting…`）。从 Telegram 关闭桌面 Topic 仅断开远程控制并提示终端用户，绝不终止 Pi 进程。
+- **双向同步**：手机指令原生显示在 Pi TUI；桌面输入在 Telegram 显示为 `🖥 <text>`。指令通过 socket 与 Pi 原生输入 API 传递，不使用终端按键模拟或会话日志抓取。桌面发起的运行完成卡片与空回复提示均静音发送，人在电脑前不打扰手机。
 - **恢复会话而不创建第二个写入者**：`/resume` 从 `~/.pi/agent/sessions`（或 Pi 原生目录环境变量指定的位置）列出当前 cwd 的会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
 - **提问与审批**：`remote_ask` 同时出现在两个视图，先回答的一端使另一端关闭。其他扩展的 TUI 对话仍留在终端；Herdr 待确认通知仅附屏幕末尾内容及 `⏎ Enter` / `⎋ Esc` 控件。
 - **生命周期**：网关（重）启动只重新附加仍在运行的 Pi 窗格，绝不自行启动新 Pi；若没有正在运行的 Pi，第一条消息才会启动它。扩展自动重连并恢复已保存的视图绑定。Pi 退出至 Shell 后，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。

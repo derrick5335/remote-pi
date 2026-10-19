@@ -40,6 +40,7 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /abort              Stop current task (queue kept)
 /queue [clear]      View/reset queue display (native queue unavailable)
 /followup <text>    Queue a follow-up prompt
+/git_commit_push [extra] Stage, commit, and push changes
 
 Admin
 /name <name>        Name the session
@@ -59,10 +60,11 @@ const BOT_COMMANDS = [
   ["abort", "Stop task (queue kept)"],
   ["queue", "View or reset queue display"],
   ["followup", "Queue a follow-up"],
+  ["git_commit_push", "Stage, commit and push"],
   // ref: https://core.telegram.org/bots/api#setmycommands — publish /restart in the slash menu.
   ["restart", "Restart the gateway"],
 ].map(([command, description]) => ({ command, description }));
-const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start", "commands", "name", "upgrade"]);
+const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start", "commands", "name", "upgrade", "git-commit-push"]);
 
 function parseCommand(text) {
   const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
@@ -861,12 +863,17 @@ function loadConfig() {
     fallbackModels = file.fallbackModels.map((s) => String(s).trim()).filter(Boolean);
   }
 
+  const presenceFile = (process.env.REMOTE_PI_PRESENCE_FILE || file.presenceFile)
+    ? resolvePath(process.env.REMOTE_PI_PRESENCE_FILE || file.presenceFile, configDir)
+    : "";
+
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || telegram.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || telegram.allowedUserId || ""),
     cwd: targetCwd,
     configPath: path,
     stateDir,
+    presenceFile,
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
@@ -975,9 +982,11 @@ class Telegram {
   async send(chatId, text, extra = {}) {
     let last;
     const parts = chunks(text);
-    const threadExtra = extra?.message_thread_id ? { message_thread_id: extra.message_thread_id } : {};
+    const baseExtra = {};
+    if (extra?.message_thread_id) baseExtra.message_thread_id = extra.message_thread_id;
+    if (extra?.disable_notification) baseExtra.disable_notification = extra.disable_notification;
     for (let i = 0; i < parts.length; i++) {
-      last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : threadExtra);
+      last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : baseExtra);
     }
     return last;
   }
@@ -1748,6 +1757,8 @@ class ChatSession {
     this.updateChain = Promise.resolve();
     this.currentCtxPercent = null;
     this.runSnapshotPromise = null;
+    this.runOrigin = "telegram";
+    this.lastTopicName = null;
 
     this.pi = this.createPi();
   }
@@ -1848,6 +1859,7 @@ class ChatSession {
   }
 
   async prompt(message, images, streamingBehavior) {
+    this.runOrigin = "telegram";
     const t0 = performance.now();
     this.startTyping();
     if (!streamingBehavior && !this.isStreaming) {
@@ -1984,6 +1996,10 @@ class ChatSession {
         if (!argument) return this.send("Usage: /followup <message>");
         return this.prompt(argument, undefined, "followUp");
       }
+      case "git_commit_push":
+      case "git-commit-push": {
+        return this.prompt(`/git-commit-push${argument ? ` ${argument}` : ""}`);
+      }
       case "abort": {
         this.abortedRun = true;
         if (this.pendingUi && this.pi.proc) {
@@ -2078,7 +2094,8 @@ class ChatSession {
     const routes = commandRoutes(data.commands);
     const text = data.commands.map((item) => {
       const name = telegramCommandName(item);
-      const issue = RESERVED_COMMANDS.has(name) ? `Telegram /${name} is gateway-reserved; use Pi terminal`
+      const isForwarded = name === "git_commit_push" || item.name === "git-commit-push";
+      const issue = (RESERVED_COMMANDS.has(name) && !isForwarded) ? `Telegram /${name} is gateway-reserved; use Pi terminal`
         : routes.get(name)?.size > 1 ? `Telegram /${name} is ambiguous; use an unambiguous native name or Pi terminal` : "";
       return `/${item.name}${item.description ? ` — ${item.description}` : ""}${issue ? ` [${issue}]` : ""}`;
     }).join("\n");
@@ -2179,7 +2196,9 @@ class ChatSession {
       await this.gateway.saveState({ cwd: target, recentProjects });
     } else {
       await this.gateway.saveState({ recentProjects });
-      await this.gateway.telegram.call("editForumTopic", { chat_id: this.chatId, message_thread_id: this.threadId, name: (basename(target) || "topic").slice(0, 128) }).catch(() => {});
+      const newTopicName = (basename(target) || "topic").slice(0, 128);
+      this.lastTopicName = newTopicName;
+      await this.gateway.telegram.call("editForumTopic", { chat_id: this.chatId, message_thread_id: this.threadId, name: newTopicName }).catch(() => {});
     }
     await this.pi.start();
     const state = await this.pi.request("get_state");
@@ -2438,7 +2457,27 @@ class ChatSession {
 
   async handleEvent(event) {
     if (event.type === "remote_user_input") {
+      this.runOrigin = "terminal";
       await this.send(`🖥 ${event.text}`, { disable_notification: true });
+      return;
+    }
+    if (event.type === "session_info_changed") {
+      if (this.threadId) {
+        const prefix = this.binding?.owned === false ? "📡 " : "";
+        const base = (event.name || basename(this.cwd) || "topic").trim();
+        const newName = `${prefix}${base}`.slice(0, 128);
+        if (this.lastTopicName !== newName) {
+          this.lastTopicName = newName;
+          // ref: Telegram Bot API editForumTopic works in private chats with topics enabled (https://core.telegram.org/bots/api#editforumtopic)
+          await this.gateway.telegram.call("editForumTopic", {
+            chat_id: this.chatId,
+            message_thread_id: this.threadId,
+            name: newName,
+          }).catch((err) => {
+            console.warn(`[topic] failed to rename topic ${this.threadId}: ${err.message}`);
+          });
+        }
+      }
       return;
     }
     if (event.type === "extension_ui_resolved") {
@@ -2488,12 +2527,18 @@ class ChatSession {
         draft.closed = true;
         this.gateway.queueTelegram(() => this.finishDraft(draft));
       }
+      const runOrigin = this.runOrigin || "telegram";
       if (!this.repliedInRun && !this.abortedRun) {
-        this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry.", errorActions(this, "no text reply")));
+        const silent = runOrigin === "terminal" || this.gateway.isUserPresent();
+        const extra = {
+          ...errorActions(this, "no text reply"),
+          ...(silent ? { disable_notification: true } : {}),
+        };
+        this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry.", extra));
       }
       if (!this.abortedRun && this.gateway.config.doneCard !== false) {
         const snapPromise = this.runSnapshotPromise;
-        this.sendRunCard(snapPromise, durationMs).catch((err) => {
+        this.sendRunCard(snapPromise, durationMs, runOrigin).catch((err) => {
           console.error(`[run-card] failed to send run card:`, err.message);
         });
       }
@@ -2502,6 +2547,7 @@ class ChatSession {
       this.runFirstTokenAt = null;
       this.runFirstUiAt = null;
       this.runSnapshotPromise = null;
+      this.runOrigin = "telegram";
     }
     if (event.type === "queue_update") {
       this.queue = { steering: event.steering, followUp: event.followUp };
@@ -2509,10 +2555,12 @@ class ChatSession {
     if (!this.gateway.chatReady) return;
 
     if (event.type === "auto_retry_start") {
-      await this.send(`⏳ Model error; auto-retrying (${event.attempt}/${event.maxAttempts})…`);
+      const extra = this.gateway.isUserPresent() ? { disable_notification: true } : {};
+      await this.send(`⏳ Model error; auto-retrying (${event.attempt}/${event.maxAttempts})…`, extra);
     }
     if (event.type === "compaction_end" && event.errorMessage) {
-      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`);
+      const extra = this.gateway.isUserPresent() ? { disable_notification: true } : {};
+      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`, extra);
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -2790,7 +2838,7 @@ class ChatSession {
     }
   }
 
-  async sendRunCard(snapshotPromise, durationMs) {
+  async sendRunCard(snapshotPromise, durationMs, origin = this.runOrigin) {
     try {
       const snapshot = snapshotPromise ? await snapshotPromise.catch(() => null) : null;
       const statsAfter = await this.pi.request("get_session_stats", {}, 5000).catch(() => null);
@@ -2839,10 +2887,12 @@ class ChatSession {
 
       const text = formatRunCard({ durationMs, costDelta, tokensDelta, ctxPercent, files });
 
-      let extra = {};
+      const silent = origin === "terminal" || this.gateway.isUserPresent();
+      let extra = silent ? { disable_notification: true } : {};
       if (files && files.length > 0) {
         const ttl24h = 24 * 60 * 60 * 1000;
         extra = {
+          ...extra,
           reply_markup: {
             inline_keyboard: [
               [
@@ -2914,6 +2964,16 @@ class Gateway {
     }
   }
 
+  // ref: Claude Code Remote Control CLAUDE_CLIENT_PRESENCE_FILE skips phone pushes while present (https://code.claude.com/docs/en/remote-control)
+  isUserPresent() {
+    if (!this.config?.presenceFile) return false;
+    try {
+      return Boolean(statSync(this.config.presenceFile, { throwIfNoEntry: false }));
+    } catch {
+      return false;
+    }
+  }
+
   async persistPaneSession(session) {
     this.state.herdrPanes = { ...this.state.herdrPanes, [session.key]: { ...session.binding, cwd: session.cwd } };
     if (session.threadId !== null) this.state.topics[session.threadId] = { ...this.state.topics[session.threadId], cwd: session.cwd };
@@ -2930,15 +2990,30 @@ class Gateway {
         console.warn(`[bridge] Topics must be enabled to attach desktop pane ${hello.paneId}`);
         return;
       }
-      const created = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: `📡 ${basename(hello.cwd) || "Pi"}`.slice(0, 128) });
+      const topicName = hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi";
+      const topicTitle = `📡 ${topicName}`.slice(0, 128);
+      const created = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: topicTitle });
       const threadId = created.message_thread_id;
       const session = new ChatSession(this, { threadId, cwd: hello.cwd });
+      session.lastTopicName = topicTitle;
       session.binding = { paneId: hello.paneId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false };
       this.sessions.set(session.key, session);
       targets = [session];
       await session.send(`📡 Remote control on — ${hello.paneId}\n${hello.cwd}\nThe terminal and this topic share one Pi session.`);
+      if (hello.recent && (hello.recent.lastUserText || hello.recent.lastAssistantText)) {
+        const parts = [];
+        if (hello.recent.lastUserText) parts.push(`👤 ${hello.recent.lastUserText}`);
+        if (hello.recent.lastAssistantText) parts.push(`🤖 ${hello.recent.lastAssistantText}`);
+        if (parts.length) {
+          await session.send(parts.join("\n\n"), { disable_notification: true });
+        }
+      }
     }
     for (const session of targets) {
+      if (session.threadId && !session.lastTopicName) {
+        const prefix = session.binding?.owned === false ? "📡 " : "";
+        session.lastTopicName = `${prefix}${hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi"}`.slice(0, 128);
+      }
       const wasUnbound = !session.pi.proc;
       session.pi.bind(connection);
       const state = hello.state;
@@ -3519,12 +3594,12 @@ class Gateway {
     }
     rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
     const bridge = [...this.sessions.values()].find((s) => s.binding.paneId === paneId);
+    const userPresent = this.isUserPresent();
+    const disableNotification = userPresent || (bridge?.threadId ? !blocked : false);
     const extra = {
       reply_markup: { inline_keyboard: rows },
-      ...(bridge?.threadId ? {
-        message_thread_id: bridge.threadId,
-        disable_notification: blocked ? false : true,
-      } : {}),
+      ...(bridge?.threadId ? { message_thread_id: bridge.threadId } : {}),
+      ...(disableNotification ? { disable_notification: true } : {}),
     };
     const sent = await this.telegram.send(this.chatId, text, extra);
     if (sent?.message_id) {
@@ -3671,6 +3746,7 @@ class Gateway {
     });
     const threadId = created.message_thread_id;
     const newSession = new ChatSession(this, { threadId, cwd: realTarget });
+    newSession.lastTopicName = name;
     this.sessions.set(`t:${threadId}`, newSession);
     this.state.topics[threadId] = { cwd: realTarget };
     await this.saveState({ topics: this.state.topics });
@@ -3814,15 +3890,18 @@ async function selfTestPaneBridge() {
     let live = true;
     let idle = true;
     let autocompleteFactory;
+    const statusCalls = [];
+    const notifyCalls = [];
     const check = () => { assert.ok(live, "replacement must not access stale Pi/ctx"); };
     const entries = [
       { id: "u1", type: "message", message: { role: "user", content: "hello" } },
       { id: "a1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19, cost: { total: 0.2 } } } },
+      { id: "a2", type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }] } },
       { type: "usage", usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0.1 } } },
     ];
     const model = { provider: "fake", id: "m", reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "xhigh", max: null } };
     const ctx = {
-      cwd: dir, model, mode: "tui", isIdle: () => idle, hasPendingMessages: () => false,
+      cwd: dir, model, mode: "tui", hasUI: true, isIdle: () => idle, hasPendingMessages: () => false,
       sessionManager: {
         getSessionFile: () => { check(); return file; }, getSessionId: () => file,
         getEntries: () => entries, getBranch: () => entries,
@@ -3832,8 +3911,9 @@ async function selfTestPaneBridge() {
       abort: () => { aborted++; }, shutdown: () => { quit++; },
       compact: ({ onComplete }) => onComplete({ tokensBefore: 100, estimatedTokensAfter: 20 }),
       ui: {
+        setStatus: (key, text) => { statusCalls.push({ key, text }); },
         addAutocompleteProvider: (factory) => { autocompleteFactory = factory; },
-        notify: () => {},
+        notify: (msg, type) => { notifyCalls.push({ msg, type }); },
         select: (_title, _options, { signal }) => new Promise((done) => {
           const selection = { done, cancelled: false };
           selections.push(selection);
@@ -3882,7 +3962,7 @@ async function selfTestPaneBridge() {
       },
     };
     const bridge = createRemoteBridge(pi, { env, metadata });
-    return { pi, ctx, tools, commands, bridge, emit, get autocompleteFactory() { return autocompleteFactory; }, setIdle: (value) => { idle = value; } };
+    return { pi, ctx, tools, commands, bridge, emit, statusCalls, notifyCalls, get autocompleteFactory() { return autocompleteFactory; }, setIdle: (value) => { idle = value; } };
   };
   try {
     await gateway.bridge.start();
@@ -3913,6 +3993,10 @@ async function selfTestPaneBridge() {
     }
     await until(() => gateway.mainSession.pi.proc);
     await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
+    await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
+    const conn = [...gateway.bridge.connections.values()][0];
+    assert.equal(conn.hello.sessionName, "test");
+    assert.deepEqual(conn.hello.recent, { firstUserText: "hello", lastUserText: "hello", lastAssistantText: "answer" });
     const session = gateway.mainSession;
     assert.ok(session.pi instanceof PaneRpc, "all ChatSessions use PaneRpc");
     assert.deepEqual(current.pi.getActiveTools(), ["read", "bash", "remote_attach", "remote_ask"]);
@@ -4026,9 +4110,20 @@ async function selfTestPaneBridge() {
     assert.equal(quit, 0, "closing a desktop view only turns remote off");
     assert.equal(tokens.remote_pi, null);
     await until(() => badgeCalls().at(-1)?.clear_display_agent === true);
+    assert.equal(current.statusCalls.at(-1)?.text, undefined, "setStatus cleared when remote is off");
+    assert.ok(current.notifyCalls.some((c) => c.msg === "Remote control turned off from Telegram."), "notify user when remote is turned off from Telegram");
     await current.commands.get("remote-control").handler("on", current.ctx);
     await until(() => gateway.mainSession.pi.proc);
     await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
+    await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
+    // Assert connected -> reconnecting -> connected transition on socket drop
+    const connBeforeDrop = [...gateway.bridge.connections.values()][0];
+    connBeforeDrop?.socket?.destroy();
+    await until(() => current.statusCalls.some((c) => c.text === "📱 reconnecting…"));
+    await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
+    // /remote-control status consistent with footer
+    await current.commands.get("remote-control").handler("status", current.ctx);
+    assert.ok(current.notifyCalls.some((c) => c.msg?.includes("connected (📱 remote)")));
     assert.equal(gateway.mainSession.pi.stopping, false);
     gateway.mainSession.pi.stop();
     await gateway.bridge.stop();
@@ -4893,6 +4988,8 @@ async function selfTest() {
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
   assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "status"), { command: "status", description: "Session status, tokens & cost" });
   assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "restart"), { command: "restart", description: "Restart the gateway" });
+  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "git_commit_push"), { command: "git_commit_push", description: "Stage, commit and push" });
+  assert.ok(HELP.includes("/git_commit_push"), "HELP mentions /git_commit_push");
   for (const name of ["name", "restart", "upgrade"]) {
     if (name !== "restart") assert.ok(!BOT_COMMANDS.some((c) => c.command === name), `${name} hidden from menu`);
     assert.ok(HELP.split("\nAdmin\n")[1].includes(`/${name}`), `${name} listed under Admin`);
@@ -5714,6 +5811,12 @@ async function selfTest() {
     assert.equal(prompts.at(-1), "/skill:check-a focus", "legacy skill spelling still works");
     await run(main, "/git_review@my_bot Keep CASE");
     assert.equal(prompts.at(-1), "/git-review Keep CASE");
+    await run(main, "/git_commit_push");
+    assert.equal(prompts.at(-1), "/git-commit-push");
+    await run(main, "/git_commit_push extra instructions");
+    assert.equal(prompts.at(-1), "/git-commit-push extra instructions");
+    await run(main, "/git-commit-push extra instructions");
+    assert.equal(prompts.at(-1), "/git-commit-push extra instructions");
     const topic = new ChatSession(gw, { threadId: 123, cwd: tmpdir() });
     topic.pi.proc = {};
     topic.pi.request = async (type) => { assert.equal(type, "get_commands"); return { commands: [{ name: "git_review", source: "prompt" }, { name: "skill:topic-only", source: "skill" }] }; };
@@ -5953,6 +6056,195 @@ async function selfTest() {
 
     gw.stop();
     await rm(tmpPermDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 19. Desk presence & origin-based notification muting
+  {
+    const tmpDir = join(tmpdir(), `test-desk-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+    const presencePath = join(tmpDir, "presence-marker");
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir, presenceFile: presencePath, doneCard: true });
+    gw.chatReady = true;
+    const sess = gw.mainSession;
+    const sentCalls = [];
+    sess.send = async (text, extra = {}) => { sentCalls.push({ text, extra }); return { message_id: sentCalls.length }; };
+    sess.pi.request = async () => ({ cost: 0 });
+
+    // 1. Terminal-originated run via remote_user_input
+    await sess.handleEvent({ type: "remote_user_input", text: "term cmd" });
+    assert.equal(sess.runOrigin, "terminal");
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal echo is silent");
+
+    // Settles with reply: card is sent with disable_notification: true
+    sess.repliedInRun = true;
+    let cardPromise;
+    const origSendRunCard = sess.sendRunCard.bind(sess);
+    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
+    await sess.handleEvent({ type: "agent_settled" });
+    await cardPromise;
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal-originated run card is silent");
+    assert.equal(sess.runOrigin, "telegram", "runOrigin resets to telegram");
+
+    // 2. Terminal-originated run with no text reply -> error message is silent
+    await sess.handleEvent({ type: "remote_user_input", text: "empty prompt" });
+    sess.repliedInRun = false;
+    sess.abortedRun = false;
+    await sess.handleEvent({ type: "agent_settled" });
+    await gw.telegramChain;
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal empty-reply error is silent");
+
+    // 3. Telegram-originated run -> card is notified
+    sess.pi.request = async (cmd) => { if (cmd === "prompt") return {}; return { cost: 0 }; };
+    await sess.prompt("tg prompt");
+    assert.equal(sess.runOrigin, "telegram");
+    sess.repliedInRun = true;
+    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
+    await sess.handleEvent({ type: "agent_settled" });
+    await cardPromise;
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, undefined, "telegram-originated run card notifies");
+
+    // 4. presenceFile exists -> telegram run card, error, and blocked alert are silent
+    assert.equal(gw.isUserPresent(), false);
+    await writeFile(presencePath, "here");
+    assert.equal(gw.isUserPresent(), true);
+
+    await sess.prompt("tg prompt with presence");
+    sess.repliedInRun = true;
+    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
+    await sess.handleEvent({ type: "agent_settled" });
+    await cardPromise;
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "presenceFile silences telegram run card");
+
+    // Herdr blocked alert with presence
+    gw.herdrWatcher = {
+      cli: async () => "screen content",
+      label: () => "agent-1",
+    };
+    gw.telegram.send = async (chatId, text, extra = {}) => { sentCalls.push({ text, extra }); return { message_id: sentCalls.length }; };
+    await gw.sendHerdrAgent("w1:p1", "blocked", { terminal_title_stripped: "Agent" });
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "presenceFile silences Herdr blocked alerts");
+
+    // Presence removed -> notifies again
+    await unlink(presencePath);
+    assert.equal(gw.isUserPresent(), false);
+    await sess.prompt("tg prompt without presence");
+    sess.repliedInRun = true;
+    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
+    await sess.handleEvent({ type: "agent_settled" });
+    await cardPromise;
+    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, undefined, "cleared presence notifies run card");
+
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 20. Attach backfill, topic naming, and session rename sync
+  {
+    const tmpDir = join(tmpdir(), `test-topic-naming-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir });
+    gw.chatReady = true;
+    gw.me = { has_topics_enabled: true };
+
+    const tgCalls = [];
+    gw.telegram.call = async (method, params) => {
+      tgCalls.push({ method, params });
+      if (method === "createForumTopic") return { message_thread_id: 101 };
+      return true;
+    };
+    const sent = [];
+    gw.telegram.send = async (chat, text, extra = {}) => { sent.push({ text, extra }); return { message_id: sent.length }; };
+
+    // 1. onPaneHello creates topic with sessionName and sends silent preview message
+    await gw.onPaneHello({
+      socket: { write: () => true },
+      clients: new Set(),
+      hello: {
+        paneId: "w1:p-attach",
+        cwd: tmpDir,
+        sessionFile: join(tmpDir, "s.jsonl"),
+        sessionName: "refactor-auth",
+        recent: {
+          firstUserText: "first prompt",
+          lastUserText: "how does auth work?",
+          lastAssistantText: "Auth uses JWT tokens.",
+        },
+      },
+    });
+
+    const createCall = tgCalls.find((c) => c.method === "createForumTopic");
+    assert.equal(createCall?.params?.name, "📡 refactor-auth", "topic named with sessionName");
+    const preview = sent.find((s) => s.text.includes("👤 how does auth work?"));
+    assert.ok(preview, "recent context preview sent");
+    assert.ok(preview.text.includes("🤖 Auth uses JWT tokens."));
+    assert.equal(preview.extra.disable_notification, true, "preview sent silently");
+
+    // 2. session_info_changed updates topic name and prevents double-rename/loop
+    const topicSession = gw.sessions.get("t:101");
+    assert.ok(topicSession, "topic session registered");
+    assert.equal(topicSession.lastTopicName, "📡 refactor-auth");
+
+    tgCalls.length = 0;
+    await topicSession.handleEvent({ type: "session_info_changed", name: "v2-auth" });
+    const editCall = tgCalls.find((c) => c.method === "editForumTopic");
+    assert.equal(editCall?.params?.name, "📡 v2-auth", "editForumTopic called with prefix + new name");
+    assert.equal(topicSession.lastTopicName, "📡 v2-auth");
+
+    // Same event again -> no editForumTopic call
+    tgCalls.length = 0;
+    await topicSession.handleEvent({ type: "session_info_changed", name: "v2-auth" });
+    assert.equal(tgCalls.filter((c) => c.method === "editForumTopic").length, 0, "dedupes same name without loop");
+
+    // 3. Fallback naming when sessionName is empty: uses firstUserText
+    tgCalls.length = 0;
+    sent.length = 0;
+    await gw.onPaneHello({
+      socket: { write: () => true },
+      clients: new Set(),
+      hello: {
+        paneId: "w1:p-fallback",
+        cwd: tmpDir,
+        sessionFile: join(tmpDir, "s2.jsonl"),
+        recent: {
+          firstUserText: "Initial task description",
+        },
+      },
+    });
+    const fallbackCall = tgCalls.find((c) => c.method === "createForumTopic");
+    assert.equal(fallbackCall?.params?.name, "📡 Initial task description", "fallback to firstUserText");
+
+    // 4. Topic session created via /topic (owned: true) renames without 📡 prefix
+    const topicOwned = new ChatSession(gw, { threadId: 202, cwd: tmpDir });
+    topicOwned.binding = { paneId: "w1:p-owned", sessionFile: join(tmpDir, "s3.jsonl"), cwd: tmpDir, owned: true };
+    topicOwned.lastTopicName = "topic-orig";
+    gw.sessions.set("t:202", topicOwned);
+
+    tgCalls.length = 0;
+    await topicOwned.handleEvent({ type: "session_info_changed", name: "owned-renamed" });
+    const ownedEdit = tgCalls.find((c) => c.method === "editForumTopic");
+    assert.equal(ownedEdit?.params?.name, "owned-renamed", "owned topic renames without prefix");
+
+    // 5. Backfill when final assistant entry is tool-call-only: still shows earlier assistant text
+    tgCalls.length = 0;
+    sent.length = 0;
+    await gw.onPaneHello({
+      socket: { write: () => true },
+      clients: new Set(),
+      hello: {
+        paneId: "w1:p-toolcall",
+        cwd: tmpDir,
+        sessionFile: join(tmpDir, "s-tool.jsonl"),
+        sessionName: "tool-session",
+        recent: {
+          firstUserText: "write tests",
+          lastUserText: "run tests",
+          lastAssistantText: "All 12 tests passed.",
+        },
+      },
+    });
+    const toolPreview = sent.find((s) => s.text.includes("🤖 All 12 tests passed."));
+    assert.ok(toolPreview, "backfill displays earlier assistant text even when last entry in session was tool-call-only");
+
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
   console.log("self-test: ok");

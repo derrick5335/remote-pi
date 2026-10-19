@@ -122,10 +122,33 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       await metadata(env, "pane.report_metadata", { pane_id: paneId, source: "remote-pi", ...fields });
     } catch { /* display-only badge; never break the bridge */ }
   };
+  // ref: Claude Code Remote Control shows persistent active indicator (https://code.claude.com/docs/en/remote-control)
+  const setStatus = (text) => {
+    try {
+      if (ctx?.hasUI || ctx?.mode === "tui") ctx.ui?.setStatus?.("remote-pi", text);
+    } catch { /* display-only footer status; never break the bridge */ }
+  };
+  const getRecent = () => {
+    try {
+      const branch = ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || [];
+      const messages = branch.filter((e) => e?.type === "message" && e?.message);
+      const userTexts = messages.filter((e) => e.message.role === "user").map((e) => textOf(e.message.content).trim()).filter(Boolean);
+      const assistantTexts = messages.filter((e) => e.message.role === "assistant").map((e) => textOf(e.message.content).trim()).filter(Boolean);
+      return {
+        firstUserText: userTexts[0]?.slice(0, 60) || undefined,
+        lastUserText: userTexts.at(-1)?.slice(0, 300) || undefined,
+        lastAssistantText: assistantTexts.at(-1)?.slice(0, 800) || undefined,
+      };
+    } catch {
+      return {};
+    }
+  };
   const hello = () => send({
     type: "hello", paneId, cwd: ctx.cwd, sessionFile: ctx.sessionManager.getSessionFile(),
     sessionId: ctx.sessionManager.getSessionId(), pid: process.pid, version: 1,
     reason: startEvent.reason, previousSessionFile: startEvent.previousSessionFile, state: state(),
+    sessionName: pi.getSessionName?.() || ctx?.sessionManager?.getSessionName?.() || undefined,
+    recent: getRecent(),
   });
   const disconnect = () => {
     clearTimeout(retryTimer);
@@ -137,6 +160,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     current?.setTimeout(2000, () => current.destroy());
     setTools(false);
     void setBadge(false);
+    setStatus(enabled ? "📱 reconnecting…" : undefined);
   };
   const reconnect = () => {
     if (!enabled || disposed || retryTimer) return;
@@ -153,6 +177,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       setTools(true);
       hello();
       void setBadge(true);
+      setStatus("📱 remote");
     });
     current.on("error", () => {});
     current.on("close", () => {
@@ -160,6 +185,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       socket = null;
       setTools(false);
       void setBadge(false);
+      setStatus(enabled ? "📱 reconnecting…" : undefined);
       for (const dialog of dialogs.values()) dialog.finish(undefined);
       reconnect();
     });
@@ -249,7 +275,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       if (typeof request.name !== "string") throw new Error("Session name required");
       pi.setSessionName(request.name); return {};
     case "get_last_assistant_text": {
-      const last = ctx.sessionManager.getBranch().filter((e) => e.type === "message" && e.message.role === "assistant").at(-1);
+      const last = ctx.sessionManager.getBranch().filter((e) => e.type === "message" && e.message.role === "assistant" && textOf(e.message.content).trim()).at(-1);
       return { text: last ? textOf(last.message.content) : null };
     }
     case "get_fork_messages": return { messages: ctx.sessionManager.getBranch().filter((e) => e.type === "message" && e.message.role === "user").map((e) => ({ entryId: e.id, text: textOf(e.message.content) })) };
@@ -272,7 +298,13 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       if (result.code !== 0) throw new Error(result.stderr || "Export failed");
       return { path: out };
     }
-    case "remote_off": enabled = false; await setOn(false); response(request, {}); disconnect(); return {};
+    case "remote_off":
+      enabled = false;
+      await setOn(false);
+      try { if (ctx?.hasUI || ctx?.mode === "tui") ctx.ui?.notify?.("Remote control turned off from Telegram.", "info"); } catch {}
+      response(request, {});
+      disconnect();
+      return {};
     case "quit":
       response(request, {});
       ctx.abort(); ctx.shutdown(); return {};
@@ -307,11 +339,11 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       if (env.HERDR_ENV !== "1" || !paneId || !env.HERDR_SOCKET_PATH) return ctx.ui.notify("/remote-control only works inside a Herdr pane.", "error");
       const arg = argument.trim().toLowerCase();
       if (arg && !["on", "off", "status"].includes(arg)) return ctx.ui.notify("Usage: /remote-control [on|off|status]", "error");
-      if (arg === "status") return ctx.ui.notify(`Remote control: ${enabled ? socket?.readyState === "open" ? "connected" : "reconnecting" : "off"}`, "info");
+      if (arg === "status") return ctx.ui.notify(`Remote control: ${enabled ? socket?.readyState === "open" ? "connected (📱 remote)" : "reconnecting (📱 reconnecting…)" : "off"}`, "info");
       try {
         enabled = arg === "on" || arg !== "off" && !enabled;
         await setOn(enabled);
-        if (enabled) { path ||= await bridgePath(env); open(); } else disconnect();
+        if (enabled) { setStatus("📱 reconnecting…"); path ||= await bridgePath(env); open(); } else disconnect();
         ctx.ui.notify(`Remote control ${enabled ? "on" : "off"}.`, "info");
       } catch (error) { ctx.ui.notify(`/remote-control failed: ${error.message}`, "error"); }
     },
@@ -380,20 +412,26 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !paneId) return;
     const pane = await metadata(env, "pane.get", { pane_id: paneId }).catch(() => null);
     enabled = pane?.pane?.tokens?.remote_pi === "on" || env.REMOTE_PI_ATTACH === "1" && event.reason === "startup";
-    if (!enabled) return;
+    if (!enabled) { setStatus(undefined); return; }
     await setOn(true);
     path = await bridgePath(env);
+    setStatus("📱 reconnecting…");
     open();
   });
   pi.on("session_shutdown", async (event) => {
     disposed = true;
     if (event.reason === "quit" && enabled) { await setOn(false).catch(() => {}); await setBadge(false); }
+    setStatus(undefined);
     disconnect();
   });
   // Pi 1.3.0 exposes no public auto_retry_start/end hooks; retry notifications are unavailable here.
   for (const type of ["agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end"]) {
     pi.on(type, (event, currentCtx) => { ctx = currentCtx; send(event); });
   }
+  pi.on("session_info_changed", (event, currentCtx) => {
+    ctx = currentCtx;
+    send(event);
+  });
   pi.on("input", (event, currentCtx) => {
     ctx = currentCtx;
     if (event.source === "interactive") send({ type: "remote_user_input", text: event.text });
