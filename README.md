@@ -20,7 +20,7 @@
 
 ## Scope & Platform Notice
 
-- **Chat Interface**: **Currently Telegram Only**. The gateway is deeply integrated with the Telegram Bot API (leveraging real-time in-place streaming messages via `sendMessage` + `editMessageText`, inline button keyboards, emoji reaction state machines, expandable blockquotes, and media downloads).
+- **Chat Interface**: **Currently Telegram Only**. The gateway is deeply integrated with the Telegram Bot API (leveraging real-time in-place streaming messages via `sendMessage` + `editMessageText`, inline button keyboards, receipt emoji reactions, expandable blockquotes, and media downloads).
 - **Supported OS**:
   - **macOS**: Provides an out-of-the-box `./install.sh` script to install the gateway as a persistent launchd daemon, paired with `caffeinate` to keep Pi responsive while connected to power without preventing normal sleep.
   - **Linux**: Can be run directly in the foreground or managed via standard systemd user units.
@@ -45,7 +45,7 @@
   - **Vision & Attachments**: Send photos (inlined as visual context) or documents, PDFs, and code files (saved locally and passed into context).
 - 💬 **Live Steering & Reaction ACK**:
   - Send messages while Pi is working to dynamically steer the agent turn without waiting for it to finish.
-  - Immediate emoji reactions on user messages (`👀` upon receipt, updated to `🫡` upon completion) eliminate mobile waiting anxiety.
+  - User messages receive a single receipt reaction (`👀` by default), which stays unchanged. Completion is reported by the run summary card, not another reaction.
 - 📊 **Run Summary Card & Quick Actions**: At the end of every run, sends a summary card with notification (`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`), listing changed files (`+a −d`). Includes inline action buttons: `📄 Diff` (view inline or download unified diff), `✅ Commit` (streamed conventional commit prompt), and `↩️ Undo run` (interactive restore and cleanup).
 - 📌 **Pinned Session Status Board**: Lazily creates and pins a single status board per session (`⏳ Working / 💤 Idle / ⚠️ Pi stopped / 🖥 On desktop`), updated in place with 3-second throttling and a 15-second live ticker. Displays running tool summary, active model, thinking level, context window percent, queued follow-ups, and last run stats.
 - 🔒 **Single-Instance Mutex & Strict Whitelist**:
@@ -198,7 +198,6 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | Inactivity minutes before a non-streaming topic session's Pi process is stopped (restarts on next message; main session never idle-stopped) |
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | Maximum concurrently running Pi processes across all sessions (stops least recently active non-streaming topic when limit is reached) |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
-| `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | Replies longer than this are sent as an HTML document (first chunk stays in chat with a note); `0` disables |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | Comma-separated `provider/modelId` list offering a "Retry with <model>" button on errors (picks the next entry after the current model, wrapping) |
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | Send a summary and change card with notification and diff/commit/undo buttons at the end of each run |

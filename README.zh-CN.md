@@ -20,7 +20,7 @@
 
 ## 平台与定位说明
 
-- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessage` + `editMessageText` 原地消息流式实时呈现、内联按钮、消息 Reaction 表情状态机、多模态附件解析与可折叠引用块）。
+- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessage` + `editMessageText` 原地消息流式实时呈现、内联按钮、消息接收 Reaction 表情、多模态附件解析与可折叠引用块）。
 - **运行环境**：
   - **macOS**：提供开箱即用的 `./install.sh` 脚本，将网关注册为 launchd 用户守护进程，配合 `caffeinate` 保持接电状态下常驻防睡眠。
   - **Linux**：支持直接前台运行或由用户编写 systemd 服务常驻。
@@ -45,7 +45,7 @@
   - **视觉与附件**：直接向 Bot 发送图片（模型原生视觉上下文）或代码/文档/音视频文件（自动下载至本地供 Pi 处理分析）。
 - 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
-  - 收到消息时 Bot 立即在原消息标记“接收”表情（默认 `👀`），执行完成自动替换为“完成”表情（默认 `🫡`），彻底消除移动端等待焦虑。
+  - 收到消息时 Bot 仅在原消息标记一次“接收”表情（默认 `👀`），之后保持不变。完成状态由运行摘要卡片通知，不再更换表情。
 - 📊 **运行摘要卡片与快捷操作**：任务结束时自动发送包含提示音的完成卡片（`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`）并列出变更文件清单（`+a −d`）。提供内联快捷操作按钮：`📄 Diff`（内联查看或下载完整 unified diff）、`✅ Commit`（流式常规提交 Prompt）、`↩️ Undo run`（交互式回滚与清理新文件）。
 - 📌 **置顶状态看板**：每个会话首次运行自动创建并置顶一条状态看板（`⏳ Working / 💤 Idle / ⚠️ Pi stopped / 🖥 On desktop`），采用 3 秒节流原地更新，流式期间每 15 秒心跳跳动耗时。清晰展示当前工具、生效模型、Thinking 等级、上下文窗口百分比、排队追问数与上次运行摘要。
 - 🔒 **单实例互斥与严格白名单**：
@@ -198,7 +198,6 @@ pi-remote-gateway stop     # 停止后台服务
 | `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | 非流式 Topic 会话无活动的空闲分钟数，达到后自动停止其 Pi 进程（下次消息自动恢复；主会话永不休眠） |
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | 所有会话中允许同时运行的最大 Pi 进程数（超限时自动挂起最近最少使用的非流式 Topic） |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
-| `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
 | `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | 超过该长度的回复改为发送 HTML 文档（聊天中保留首段预览与提示）；设 `0` 关闭 |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送带通知的运行摘要与变更卡片（含 Diff/Commit/Undo 按钮） |

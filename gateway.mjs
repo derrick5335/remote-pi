@@ -1022,7 +1022,6 @@ function loadConfig() {
     extensions,
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
-    doneEmoji: process.env.TELEGRAM_DONE_EMOJI || telegram.doneEmoji || "\u{1FAE1}",
     idleStopMinutes: Number(process.env.REMOTE_PI_IDLE_STOP_MINUTES || file.idleStopMinutes || 30),
     maxSessions: Number(process.env.REMOTE_PI_MAX_SESSIONS || file.maxSessions || 4),
     longReplyChars: Number.isNaN(longReplyChars) ? 8000 : longReplyChars,
@@ -2157,7 +2156,6 @@ class ChatSession {
     this.repliedInRun = false;
     this.typingTimer = null;
     this.pendingUi = null;
-    this.activeMessageIds = [];
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
@@ -2274,12 +2272,6 @@ class ChatSession {
     if (this.typingTimer) {
       clearInterval(this.typingTimer);
       this.typingTimer = null;
-    }
-  }
-
-  settleActiveReactions() {
-    for (const id of this.activeMessageIds.splice(0)) {
-      this.gateway.queueTelegram(() => this.gateway.telegram.setReaction(this.chatId, id, this.gateway.config.doneEmoji));
     }
   }
 
@@ -2437,7 +2429,6 @@ class ChatSession {
     const wasStreaming = this.isStreaming;
     const pendingUi = this.pendingUi;
     this.resetSessionState();
-    this.settleActiveReactions();
     this.scheduleStatusBoardUpdate();
     if (wasStreaming || pendingUi) {
       console.error(`${new Date().toISOString()} [pi${this.threadId ? `:${this.threadId}` : ""}] process exited unexpectedly (${code ?? signal})`);
@@ -2541,7 +2532,6 @@ class ChatSession {
           ? { provider: stateBefore.model.provider, modelId: stateBefore.model.id }
           : this.lastModel;
         this.resetSessionState();
-        this.settleActiveReactions();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
           return this.send("New session cancelled");
@@ -2641,7 +2631,6 @@ class ChatSession {
         const kept = this.queue;
         this.resetSessionState();
         if (!clear) this.queue = kept;
-        this.settleActiveReactions();
         return this.send(clear ? "⏹ Stopped; queue cleared" : "⏹ Stopped (queued messages kept; /abort clear to clear)");
       }
       case "upgrade": {
@@ -3414,7 +3403,6 @@ class ChatSession {
       }
       this.scheduleStatusBoardUpdate();
       this.abortedRun = false;
-      this.settleActiveReactions();
       this.runStartedAt = null;
       this.runFirstTokenAt = null;
       this.runFirstUiAt = null;
@@ -4131,7 +4119,6 @@ class Gateway {
         const groupTask = async () => {
           await group.ready;
           if (group.cancelled || !group.messages.length) return;
-          session.activeMessageIds.push(...group.messages.map((item) => item.message_id));
           session.runStartedAt = performance.now();
           session.runFirstTokenAt = null;
           session.runFirstUiAt = null;
@@ -4197,7 +4184,6 @@ class Gateway {
       const session = this.getOrCreateSession(m);
       session.touchActivity();
       await session.handleCommand(cmd, m.text, update.update_id);
-      await this.telegram.setReaction(this.chatId, m.message_id, this.config.doneEmoji);
     } catch (error) {
       console.error(`[${priority}] error:`, error);
       const session = update.message ? this.getOrCreateSession(update.message) : this.mainSession;
@@ -4227,7 +4213,6 @@ class Gateway {
       }
     } catch (error) {
       console.error("Telegram input:", error);
-      session.settleActiveReactions();
       await session.send(`❌ ${error.message}`);
     } finally {
       console.log(`${new Date().toISOString()} [update] #${update.update_id} finished in ${Math.round(performance.now() - t0)}ms`);
@@ -4271,7 +4256,6 @@ class Gateway {
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       session.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await session.send("Submitted.");
-      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       return;
     }
 
@@ -4286,7 +4270,6 @@ class Gateway {
           const tStt = performance.now();
           const transcript = await runStt(this.config.sttCommand, media.saved.path);
           console.log(`${new Date().toISOString()} [stt] transcribed voice in ${Math.round(performance.now() - tStt)}ms`);
-          session.activeMessageIds.push(message.message_id);
           session.runStartedAt = performance.now();
           session.runFirstTokenAt = null;
           session.runFirstUiAt = null;
@@ -4296,7 +4279,6 @@ class Gateway {
           return session.send(`❌ ${error.message}`);
         }
       }
-      session.activeMessageIds.push(message.message_id);
       session.runStartedAt = performance.now();
       session.runFirstTokenAt = null;
       session.runFirstUiAt = null;
@@ -4311,13 +4293,8 @@ class Gateway {
 
     const command = parseCommand(text);
     if (command) {
-      if (command.name === "followup") session.activeMessageIds.push(message.message_id);
       await session.handleCommand(command, text);
-      if (command.name !== "followup") {
-        await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
-      }
     } else {
-      session.activeMessageIds.push(message.message_id);
       session.runStartedAt = performance.now();
       session.runFirstTokenAt = null;
       session.runFirstUiAt = null;
@@ -4461,7 +4438,6 @@ class Gateway {
       } else {
         await watcher.cli(["agent", "prompt", paneId, text]);
       }
-      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       return this.telegram.send(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, { disable_notification: true });
     } catch (error) {
       return this.telegram.send(this.chatId, `❌ ${error.message}`);
@@ -5169,13 +5145,54 @@ async function selfTest() {
     const tg = new Telegram("123456:fake-token", "/tmp/fake-offset");
     const calls = [];
     tg.call = async (method, body) => { calls.push({ method, body }); return true; };
-    await tg.setReaction(123, 456, "🫡");
+    await tg.setReaction(123, 456, "👀");
     assert.deepEqual(calls[0], {
       method: "setMessageReaction",
-      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "🫡" }] },
+      body: { chat_id: 123, message_id: 456, reaction: [{ type: "emoji", emoji: "👀" }] },
     });
-    assert.equal(await tg.setReaction(123, 0, "🫡"), null);
+    assert.equal(await tg.setReaction(123, 0, "👀"), null);
     assert.equal(calls.length, 1);
+  }
+
+  // Receipt reactions stay unchanged; completion is delivered by the run card.
+  {
+    const gwAck = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), ackEmoji: "👀", doneCard: true, statusBoard: false });
+    gwAck.chatReady = true;
+    const session = gwAck.mainSession;
+    const reactions = [];
+    const sent = [];
+    gwAck.telegram.setReaction = async (_chat, id, emoji) => { reactions.push({ id, emoji }); };
+    gwAck.telegram.send = async (_chat, text) => { sent.push(text); };
+    session.prompt = async () => {};
+    session.handleCommand = async () => {};
+    session.pi.write = () => {};
+    session.pi.request = async () => ({ cost: 0 });
+    const message = (id, text) => ({ message_id: id, text, from: { id: 1 }, chat: { type: "private" } });
+
+    await gwAck.handleMessage(message(1, "hello"));
+    session.repliedInRun = true;
+    let cardPromise;
+    const sendRunCard = session.sendRunCard.bind(session);
+    session.sendRunCard = (...args) => (cardPromise = sendRunCard(...args));
+    await session.handleEvent({ type: "agent_settled" });
+    await cardPromise;
+    await gwAck.telegramChain;
+    assert.ok(sent.some((text) => text.startsWith("✅ Done")), "Completion must still send a run card");
+
+    await gwAck.handleMessage(message(2, "/status"));
+    await gwAck.handleMessage(message(3, "/followup next"));
+    await gwAck.handlePriorityUpdate({ message: message(4, "/abort") }, "p0");
+    session.pendingUi = { id: "ack-ui" };
+    await gwAck.handleMessage(message(5, "answer"));
+    gwAck.extractMedia = async () => ({ saved: { path: "/tmp/ack.jpg" }, label: "photo" });
+    await gwAck.handleMessage(message(6, "photo"));
+    gwAck.herdrWatcher = {
+      cliJson: async () => ({ agent: { agent_status: "idle" } }),
+      cli: async () => {},
+      label: () => "agent",
+    };
+    await gwAck.replyToHerdrAgent("w1:p1", message(7, "next"));
+    assert.deepEqual(reactions, Array.from({ length: 7 }, (_, i) => ({ id: i + 1, emoji: "👀" })), "Each input gets only its receipt reaction, never a completion reaction");
   }
 
   {
