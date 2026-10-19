@@ -35,6 +35,8 @@
 - 🎯 **100% 基于 Pi 原生状态与能力**：会话状态、模型列表、上下文统计、参数配置等全部通过 JSON-RPC 严格依赖 Pi 原生提供的数据接口，无私有黑盒或非标准文件桥接。
 - 🌊 **原生流式输出**：通过静音消息创建与原地实时编辑（`sendMessage` + `editMessageText`）呈现思考过程与回复，从根源上杜绝跨接口草稿转换导致的幽灵气泡、残留与重复闪烁。
 - 🛠️ **原生可折叠工具卡片**：Agent 连续调用工具（Bash、读写文件、Grep 等）时，自动生成原生可折叠引用块（`<blockquote expandable>`），保持手机端信息整洁不刷屏。
+- 📄 **超长回复转文件阅读**：超过 `longReplyChars`（默认 8000）的最终回复不再刷屏，改为发送一份自适应暗色模式的独立 HTML 文档（完整 CommonMark + GFM 表格渲染），聊天中仅保留首段预览与提示；可用 `longReplyChars` 调整或设 `0` 关闭；`/export` 通过 Pi 原生 `export_html` 导出整个会话。
+- 🚑 **错误一键恢复按钮**：模型报错、空回复、Pi 异常退出、扩展失败等场景自动附带内联按钮（1 小时有效）：重发上一次 Prompt、切换备用模型重试（`fallbackModels`）、浏览模型列表、重启 Pi、查看脱敏网关日志，无需手动输命令。
 - 🎮 **Telegram Companion 扩展**：
   - 自带 `remote-extension.mjs`，向模型提供 `remote_attach`（主动将本地生成的文件/产物发回聊天窗口）与 `remote_ask`（交互按钮问答）两个工具（保持对 `telegram_attach`/`telegram_ask` 的兼容）。
   - 支持配置加载用户自定义的 Pi 扩展（`-e` 注入），并在 Telegram 中无缝代理扩展的 UI 交互（`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`）。
@@ -68,6 +70,7 @@
 | `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
 | `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
+| `/export` | 通过 Pi 原生 `export_html` 将整个会话导出为 HTML 文件并发送 |
 | `/fork` | 从历史用户消息创建分支会话 |
 | `/handoff` | 将当前会话移交至桌面端 Pi（安全停止手机端 Pi，提供一键复制命令与收回按钮） |
 | `/abort` | 立即中断当前正在运行的任务 |
@@ -194,6 +197,8 @@ pi-remote-gateway stop     # 停止后台服务
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | 所有会话中允许同时运行的最大 Pi 进程数（超限时自动挂起最近最少使用的非流式 Topic） |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
 | `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
+| `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | 超过该长度的回复改为发送 HTML 文档（聊天中保留首段预览与提示）；设 `0` 关闭 |
+| `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
 
 > **环境变量覆盖说明**：环境变量优先级高于配置文件。例如 `REMOTE_PI_EXTENSIONS` 可以传入 JSON 数组字符串（如 `'["~/ext.ts"]'`）或逗号分隔的路径列表。
 

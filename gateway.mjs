@@ -54,7 +54,7 @@ const BOT_COMMANDS = [
   ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
   ["session", "Session & cost"], ["agents", "Herdr agent status"],
   ["fork", "Branch from history"], ["clone", "Clone current branch"],
-  ["compact", "Compact context"], ["export", "Export session"],
+  ["compact", "Compact context"], ["export", "Export as HTML"],
   ["handoff", "Hand off session to desktop"],
   ["abort", "Stop task (queue kept)"],
   ["restart", "Restart gateway"],
@@ -229,6 +229,173 @@ md.renderer.render = (tokens, options, env) => {
 
 function telegramHtml(text) {
   return md.render(String(text || ""));
+}
+
+const htmlRenderer = new MarkdownIt({ html: false, linkify: true });
+
+function extractTitle(markdown) {
+  const lines = String(markdown || "").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const headingMatch = trimmed.match(/^#{1,6}\s+(.+?)(?:\s+#+)?$/);
+    if (headingMatch) {
+      return headingMatch[1].trim().slice(0, 60);
+    }
+  }
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      return trimmed.slice(0, 60);
+    }
+  }
+  return "Reply";
+}
+
+function renderReplyHtml(markdown) {
+  const title = extractTitle(markdown);
+  const content = htmlRenderer.render(markdown || "");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --code-bg: #f6f8fa;
+  --border: #d0d7de;
+  --th-bg: #f6f8fa;
+  --link: #0969da;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --code-bg: #161b22;
+    --border: #30363d;
+    --th-bg: #161b22;
+    --link: #2f81f7;
+  }
+}
+body {
+  box-sizing: border-box;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  background: var(--bg);
+  color: var(--fg);
+}
+a { color: var(--link); }
+pre {
+  background: var(--code-bg);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+pre code {
+  font-size: 0.85em;
+}
+table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 16px 0;
+  width: 100%;
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  text-align: left;
+}
+th {
+  background: var(--th-bg);
+}
+blockquote {
+  margin: 0;
+  padding: 0 1em;
+  opacity: 0.85;
+  border-left: 4px solid var(--border);
+}
+img { max-width: 100%; }
+</style>
+</head>
+<body>
+${content}
+</body>
+</html>`;
+}
+
+function formatStamp(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function nextFallbackModel(list, current) {
+  if (!Array.isArray(list) || !list.length) return null;
+  const currentStr = typeof current === "string"
+    ? current
+    : (current && current.provider ? `${current.provider}/${current.modelId || current.id}` : "");
+  const idx = list.indexOf(currentStr);
+  if (idx !== -1) {
+    for (let i = 1; i <= list.length; i++) {
+      const candidate = list[(idx + i) % list.length];
+      if (candidate && candidate !== currentStr) return candidate;
+    }
+    return null;
+  }
+  for (const candidate of list) {
+    if (candidate && candidate !== currentStr) return candidate;
+  }
+  return null;
+}
+
+function redactLog(text, botToken = "") {
+  let result = String(text || "");
+  if (botToken) {
+    result = result.replaceAll(botToken, "[REDACTED]");
+  }
+  return result.replace(/(api[_-]?key|token|secret|authorization)\S*\s*[:=]\s*\S+/gi, "[REDACTED]");
+}
+
+function errorActions(session, errorText, { endedRun = false } = {}) {
+  const ONE_HOUR = 60 * 60_000;
+  const isRateOrQuota = /429|rate.?limit|quota|exhausted/i.test(errorText || "");
+  const targetModel = nextFallbackModel(session.gateway.config.fallbackModels || [], session.lastModel);
+  const canRetry = !!session.lastPrompt && (!session.isStreaming || endedRun);
+
+  const buttons = [];
+  const retryBtn = canRetry ? {
+    label: "🔁 Retry",
+    action: { type: "retry" },
+  } : null;
+
+  const fallbackBtn = (canRetry && targetModel) ? {
+    label: `🔀 Retry with ${targetModel}`,
+    action: { type: "retry_fallback", model: targetModel },
+  } : null;
+
+  // 429/限流/配额场景优先推荐切模型重试
+  if (isRateOrQuota && fallbackBtn) {
+    buttons.push(fallbackBtn);
+    if (retryBtn) buttons.push(retryBtn);
+  } else {
+    if (retryBtn) buttons.push(retryBtn);
+    if (fallbackBtn) buttons.push(fallbackBtn);
+  }
+
+  buttons.push({ label: "🧠 Models", action: { type: "models" } });
+  buttons.push({ label: "♻️ Restart Pi", action: { type: "restart_pi" } });
+  buttons.push({ label: "📜 Log", action: { type: "show_log" } });
+
+  return session.keyboard(buttons, ONE_HOUR);
 }
 
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -627,6 +794,18 @@ function loadConfig() {
   if (!targetCwd) throw new Error(`"cwd" is required: set "cwd" in ${path} or export PI_CWD`);
 
   const telegram = typeof file.telegram === "object" && file.telegram !== null ? file.telegram : {};
+  const envLongReply = process.env.REMOTE_PI_LONG_REPLY_CHARS;
+  const longReplyChars = envLongReply !== undefined
+    ? Number(envLongReply)
+    : (file.longReplyChars !== undefined ? Number(file.longReplyChars) : 8000);
+
+  let fallbackModels = [];
+  if (process.env.REMOTE_PI_FALLBACK_MODELS !== undefined) {
+    fallbackModels = process.env.REMOTE_PI_FALLBACK_MODELS.split(",").map((s) => s.trim()).filter(Boolean);
+  } else if (Array.isArray(file.fallbackModels)) {
+    fallbackModels = file.fallbackModels.map((s) => String(s).trim()).filter(Boolean);
+  }
+
   const config = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || telegram.botToken,
     allowedUserId: String(process.env.TELEGRAM_ALLOWED_USER_ID || telegram.allowedUserId || ""),
@@ -644,6 +823,8 @@ function loadConfig() {
     doneEmoji: process.env.TELEGRAM_DONE_EMOJI || telegram.doneEmoji || "\u{1FAE1}",
     idleStopMinutes: Number(process.env.REMOTE_PI_IDLE_STOP_MINUTES || file.idleStopMinutes || 30),
     maxSessions: Number(process.env.REMOTE_PI_MAX_SESSIONS || file.maxSessions || 4),
+    longReplyChars: Number.isNaN(longReplyChars) ? 8000 : longReplyChars,
+    fallbackModels,
   };
   config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
@@ -1478,6 +1659,7 @@ class ChatSession {
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
     this.lastModel = null;
+    this.lastPrompt = null;
     this.commandAliases = new Map();
     this.mediaGroups = new Map();
     this.eventChain = Promise.resolve();
@@ -1540,8 +1722,8 @@ class ChatSession {
     return this.gateway.action({ ...payload, sessionKey: this.key }, ttl);
   }
 
-  keyboard(items) {
-    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } };
+  keyboard(items, ttl) {
+    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action, ttl) }]) } };
   }
 
   queueEvent(event) {
@@ -1578,7 +1760,7 @@ class ChatSession {
     this.settleActiveReactions();
     if (wasStreaming || pendingUi) {
       console.error(`${new Date().toISOString()} [pi${this.threadId ? `:${this.threadId}` : ""}] process exited unexpectedly (${code ?? signal})`);
-      this.gateway.queueTelegram(() => this.send(`⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`));
+      this.gateway.queueTelegram(() => this.send(`⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`, errorActions(this, `Pi process exited unexpectedly (${code ?? signal})`)));
     }
   }
 
@@ -1617,6 +1799,9 @@ class ChatSession {
   async prompt(message, images, streamingBehavior) {
     const t0 = performance.now();
     this.startTyping();
+    if (!streamingBehavior && !this.isStreaming) {
+      this.lastPrompt = { message, images };
+    }
     try {
       const fields = { message };
       if (images) fields.images = images;
@@ -1844,6 +2029,40 @@ class ChatSession {
       ? data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n")
       : "No extension commands, prompt templates, or skills loaded.";
     await this.send(text);
+  }
+
+  async retryLastPrompt() {
+    const { message, images } = this.lastPrompt;
+    this.runStartedAt = performance.now();
+    this.runFirstTokenAt = null;
+    this.runFirstUiAt = null;
+    await this.send(`🔁 Retrying last prompt (${message.length} chars)…`);
+    await this.prompt(message, images);
+  }
+
+  async restartPi(notice = "♻️ Restarting Pi…") {
+    await this.send(notice);
+    this.pi.stop();
+    this.resetSessionState();
+    this.pi = this.createPi();
+    await this.pi.start();
+    const state = await this.pi.request("get_state");
+    if (state?.model?.provider && state?.model?.id) {
+      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
+    await this.send(`✅ Pi restarted; Session: ${state.sessionId}`);
+  }
+
+  async sendGatewayLog() {
+    let text = "(log file empty or missing)";
+    try {
+      const raw = await readFile(this.gateway.config.logFile, "utf8");
+      const tail = raw.split("\n").slice(-40).join("\n");
+      text = redactLog(tail, this.gateway.config.botToken);
+    } catch (error) {
+      text = `(failed to read log: ${error.message})`;
+    }
+    await this.send(`📜 Last 40 log lines:\n${expandableBlockquote(text)}`);
   }
 
   async showCwds() {
@@ -2199,6 +2418,23 @@ class ChatSession {
       await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
       this.lastModel = { provider: action.provider, modelId: action.modelId };
       await this.send(`✅ ${action.provider}/${action.modelId}`);
+    } else if (action.type === "retry" || action.type === "retry_fallback") {
+      if (!this.lastPrompt) return this.send("No prompt to retry");
+      if (this.isStreaming) return this.send("⚠️ Still streaming; /abort first");
+      if (action.type === "retry_fallback") {
+        const [provider, ...rest] = String(action.model).split("/");
+        const modelId = rest.join("/");
+        await this.pi.request("set_model", { provider, modelId });
+        this.lastModel = { provider, modelId };
+        await this.send(`✅ Switched to ${provider}/${modelId}`);
+      }
+      await this.retryLastPrompt();
+    } else if (action.type === "models") {
+      await this.showModels("");
+    } else if (action.type === "restart_pi") {
+      await this.restartPi("♻️ Restarting Pi…");
+    } else if (action.type === "show_log") {
+      await this.sendGatewayLog();
     } else if (action.type === "thinking") {
       await this.pi.request("set_thinking_level", { level: action.level });
       await this.send(`✅ thinking: ${action.level}`);
@@ -2282,7 +2518,7 @@ class ChatSession {
         this.gateway.queueTelegram(() => this.finishDraft(draft));
       }
       if (!this.repliedInRun && !this.abortedRun) {
-        this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry."));
+        this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry.", errorActions(this, "no text reply")));
       }
       this.abortedRun = false;
       this.settleActiveReactions();
@@ -2337,6 +2573,7 @@ class ChatSession {
       if (event.message.stopReason === "error" || event.message.errorMessage) {
         const errText = formatAssistantError(event.message.errorMessage);
         draft.text = draft.text ? `${draft.text}\n\n${errText}` : errText;
+        this.gateway.queueTelegram(() => this.send("🛠 Recovery actions:", errorActions(this, `${event.message.errorMessage || ""} ${errText}`, { endedRun: true })));
       }
       const outTok = event.message.usage?.output;
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] message_end (${outTok ? `${outTok} tokens` : "assistant"}${event.message.stopReason ? `, reason: ${event.message.stopReason}` : ""})`);
@@ -2377,7 +2614,7 @@ class ChatSession {
       }
     }
     if (event.type === "extension_ui_request") await this.handleUiRequest(event);
-    if (event.type === "extension_error") await this.send(`❌ Extension ${event.extensionPath}: ${event.error}`);
+    if (event.type === "extension_error") await this.send(`❌ Extension ${event.extensionPath}: ${event.error}`, errorActions(this, event.error));
   }
 
   scheduleToolPanelUpdate(force = false, isSettled = false) {
@@ -2462,6 +2699,29 @@ class ChatSession {
     if (!draft.text) return;
     draft.closed = true;
     const t0 = performance.now();
+    const limit = this.gateway.config.longReplyChars ?? 8000;
+    // 超长回复不再刷屏：首段留在原地，全文渲染为独立 HTML 文档发送（0 关闭）
+    if (limit > 0 && draft.text.length > limit) {
+      try {
+        const name = `reply-${formatStamp()}.html`;
+        const path = join(this.gateway.config.downloadsDir, name);
+        await writeFile(path, renderReplyHtml(draft.text));
+        const note = `\n\n… (full reply attached, ${draft.text.length} chars)`;
+        const first = chunks(draft.text)[0];
+        const head = (first.length + note.length > MAX_MESSAGE ? first.slice(0, MAX_MESSAGE - note.length) : first) + note;
+        if (draft.messageId) {
+          await this.gateway.telegram.edit(this.chatId, draft.messageId, head, false);
+        } else {
+          await this.sendOne(head);
+        }
+        await this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra());
+        const apiMs = Math.round(performance.now() - t0);
+        console.log(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] long reply sent as ${name} (${draft.text.length} chars, took ${apiMs}ms)`);
+        return;
+      } catch (error) {
+        console.error(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] long reply document failed (${error.message}); falling back to chunks`);
+      }
+    }
     try {
       const parts = chunks(draft.text);
       if (draft.messageId) {
@@ -3373,6 +3633,79 @@ async function selfTest() {
       const copies = (await readdir(tmpUi)).filter((f) => f.startsWith("failed-reply-"));
       assert.equal(copies.length, 1);
       assert.equal(await readFile(join(tmpUi, copies[0]), "utf8"), "recover me");
+    }
+
+    // Phase 3：超长回复改为 HTML 文档附件；发送失败回退分段
+    {
+      const tmpLong = join(tmpdir(), `test-remote-pi-long-${Date.now()}`);
+      await mkdir(tmpLong, { recursive: true, mode: 0o700 });
+      const gwLong = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpLong, downloadsDir: tmpLong, longReplyChars: 100 });
+      const longEdits = [];
+      const longSends = [];
+      let docCalls = 0;
+      gwLong.telegram.edit = async (_c, id, text) => { longEdits.push({ id, text }); return true; };
+      gwLong.telegram.sendOne = async (_c, text) => { longSends.push(text); return { message_id: 1 }; };
+      gwLong.telegram.sendDocument = async () => { docCalls++; return { message_id: 2 }; };
+      const longText = `# Big\n\n${"word ".repeat(80)}`;
+      await gwLong.mainSession.finishDraft({ text: longText, messageId: 7 });
+      assert.equal(docCalls, 1, "long reply sent as document");
+      assert.ok(longEdits[0].text.includes("(full reply attached"), "first chunk kept with note");
+      assert.equal(longSends.length, 0, "no extra plain chunks");
+      const savedHtml = (await readdir(tmpLong)).find((f) => f.startsWith("reply-") && f.endsWith(".html"));
+      assert.ok(savedHtml, "reply html file written");
+      assert.ok((await readFile(join(tmpLong, savedHtml), "utf8")).includes("<h1>Big</h1>"), "html rendered from markdown");
+      // 发送文档失败 → 回退全量分段（原地 edit 回完整首段）
+      let failDoc = true;
+      gwLong.telegram.sendDocument = async () => { if (failDoc) throw new Error("upload failed"); };
+      await gwLong.mainSession.finishDraft({ text: longText, messageId: 8 });
+      assert.ok(!longEdits.at(-1).text.includes("(full reply attached"), "fallback drops the note");
+      assert.ok(longEdits.at(-1).text.startsWith("# Big"), "fallback edits full first chunk");
+      // longReplyChars: 0 → 关闭，直接分段
+      gwLong.config.longReplyChars = 0;
+      failDoc = false; docCalls = 0;
+      longSends.length = 0;
+      await gwLong.mainSession.finishDraft({ text: longText, messageId: null });
+      assert.equal(docCalls, 0, "disabled via 0");
+      assert.ok(longSends.length >= 1);
+    }
+
+    // Phase 3：错误恢复按钮 errorActions + retry 回调
+    {
+      const gwErr = new Gateway({
+        allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(),
+        fallbackModels: ["anthropic/claude", "google/gemini"],
+      });
+      const s = gwErr.mainSession;
+      assert.ok(errorActions(s, "boom").reply_markup.inline_keyboard.length >= 3, "static buttons always present");
+      assert.ok(!JSON.stringify(errorActions(s, "boom")).includes("Retry"), "no lastPrompt → no retry");
+      s.lastPrompt = { message: "do it", images: undefined };
+      s.lastModel = { provider: "anthropic", modelId: "claude" };
+      const kb = errorActions(s, "boom").reply_markup.inline_keyboard;
+      assert.equal(kb[0][0].text, "🔁 Retry");
+      assert.ok(kb[1][0].text.includes("google/gemini"), "next fallback after current");
+      const kb429 = errorActions(s, "429 rate limit exceeded").reply_markup.inline_keyboard;
+      assert.ok(kb429[0][0].text.includes("Retry with"), "rate limit puts fallback first");
+      const kbWrap = errorActions(s, "boom", { endedRun: false }).reply_markup.inline_keyboard;
+      s.isStreaming = true;
+      assert.ok(!JSON.stringify(errorActions(s, "boom")).includes("Retry"), "streaming → retry omitted");
+      assert.ok(kbWrap.length >= 3);
+      // retry 回调：重发上一次 prompt
+      s.isStreaming = false;
+      const sent = [];
+      s.send = async (text) => { sent.push(text); };
+      s.startTyping = () => {};
+      s.stopTyping = () => {};
+      const rpcCalls = [];
+      s.pi.request = async (type, fields) => { rpcCalls.push({ type, fields }); };
+      await s.handleCallbackAction({ type: "retry" }, { id: "c1" });
+      assert.equal(rpcCalls.at(-1).type, "prompt");
+      assert.equal(rpcCalls.at(-1).fields.message, "do it");
+      assert.ok(sent.some((t) => t.includes("Retrying")), "retry notifies");
+      // retry_fallback：先 set_model 再 prompt
+      await s.handleCallbackAction({ type: "retry_fallback", model: "google/gemini" }, { id: "c2" });
+      assert.equal(rpcCalls.at(-2).type, "set_model");
+      assert.deepEqual(rpcCalls.at(-2).fields, { provider: "google", modelId: "gemini" });
+      assert.equal(rpcCalls.at(-1).type, "prompt");
     }
 
     // Test remote_attach / telegram_attach auto delivery via tool_execution_end
@@ -4342,6 +4675,34 @@ async function selfTest() {
     await topSession.switchCwd(p2, null);
     const realP2 = await realpath(p2);
     assert.ok(gwTopCwd.state.recentProjects.includes(realP2), "Topic cwd 切换应将目标加入 recentProjects");
+  }
+
+  // Phase 3：renderReplyHtml / nextFallbackModel / redactLog
+  {
+    const html = renderReplyHtml("# My Report\n\n<script>alert(1)</script>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    assert.ok(html.includes('meta name="viewport" content="width=device-width,initial-scale=1"'), "viewport meta");
+    assert.ok(!/<script>/.test(html) && html.includes("&lt;script&gt;"), "raw HTML escaped");
+    assert.ok(html.includes("<table>") && html.includes("<th>a</th>"), "GFM table rendered");
+    assert.ok(html.match(/<title>[^<]*My Report[^<]*<\/title>/), "title from first heading");
+    assert.ok(html.includes("prefers-color-scheme: dark"), "dark mode media query");
+    const html2 = renderReplyHtml("no headings at all\nsecond line");
+    assert.ok(html2.includes("<title>no headings at all</title>"), "title falls back to first line");
+  }
+  {
+    const list = ["anthropic/claude", "google/gemini", "openai/gpt"];
+    assert.equal(nextFallbackModel(list, { provider: "anthropic", modelId: "claude" }), "google/gemini");
+    assert.equal(nextFallbackModel(list, { provider: "openai", modelId: "gpt" }), "anthropic/claude", "wrap-around");
+    assert.equal(nextFallbackModel(list, "unknown/model"), "anthropic/claude", "current not in list → first entry");
+    assert.equal(nextFallbackModel([], "anthropic/claude"), null, "empty list → null");
+    assert.equal(nextFallbackModel(["anthropic/claude"], { provider: "anthropic", modelId: "claude" }), null, "single-entry list at current → null");
+    assert.equal(nextFallbackModel(null, null), null, "no list → null");
+  }
+  {
+    const sample = "2026-01-01 bot 123:ABC connecting\napi_key=sk-123\nTOKEN: xyz\nauthorization: Bearer b\nplain line";
+    const redacted = redactLog(sample, "123:ABC");
+    assert.ok(!redacted.includes("sk-123") && !redacted.includes("123:ABC"), "secrets removed");
+    assert.ok(!redacted.includes("xyz") && !redacted.includes("Bearer b"), "token-style pairs removed");
+    assert.ok(redacted.includes("plain line"), "non-secret lines kept");
   }
 
   assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");
