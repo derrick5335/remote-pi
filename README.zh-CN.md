@@ -38,7 +38,7 @@
 - 📄 **超长回复转文件阅读**：超过 `longReplyChars`（默认 8000）的最终回复不再刷屏，改为发送一份自适应暗色模式的独立 HTML 文档（完整 CommonMark + GFM 表格渲染），聊天中仅保留首段预览与提示；可用 `longReplyChars` 调整或设 `0` 关闭；`/export` 通过 Pi 原生 `export_html` 导出整个会话。
 - 🚑 **错误一键恢复按钮**：模型报错、空回复、Pi 异常退出、扩展失败等场景自动附带内联按钮（1 小时有效）：重发上一次 Prompt、切换备用模型重试（`fallbackModels`）、浏览模型列表、重启 Pi、查看脱敏网关日志，无需手动输命令。
 - 🎮 **Telegram Companion 扩展**：
-  - 自带 `remote-extension.mjs`，向模型提供 `remote_attach`（主动将本地生成的文件/产物发回聊天窗口）与 `remote_ask`（交互按钮问答）两个工具（保持对 `telegram_attach`/`telegram_ask` 的兼容）。
+  - 自带 `remote-extension.mjs`，向模型提供 `remote_attach`（主动将本地生成的文件/产物发回聊天窗口）与 `remote_ask`（交互按钮问答）两个工具。
   - 支持配置加载用户自定义的 Pi 扩展（`-e` 注入），并在 Telegram 中无缝代理扩展的 UI 交互（`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`）。
 - 🎙️ **多模态与语音转写（STT）**：
   - **语音输入**：支持在配置中指定 `sttCommand`（如 Groq Whisper API 或本地 mlx-whisper），发送语音消息即自动转写为 Prompt 执行。
@@ -69,15 +69,23 @@
 | `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应。注意：此处对服务重启/停止命令的拦截仅为误操作防护，并非安全边界 —— 持有 Bot 者本就拥有完整 Shell 权限 |
 | `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
-| `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
+| `/status` | 查看当前会话 ID、模型、上下文消耗统计及费用 |
 | `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📱 = Telegram 会话，📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/export` | 通过 Pi 原生 `export_html` 将整个会话导出为 HTML 文件并发送 |
 | `/fork` | 从历史用户消息创建分支会话 |
 | `/handoff` | 将当前会话移交至桌面端 Pi（安全停止手机端 Pi，提供一键复制命令与收回按钮） |
-| `/abort` | 立即中断当前正在运行的任务 |
+| `/abort` | 立即中断当前正在运行的任务，保留排队消息 |
+| `/queue [clear]` | 查看消息队列；仅 `/queue clear` 可清空队列 |
+| `/help` | 显示操作帮助，随后列出已加载的扩展命令、提示词模板及技能命令 |
+
+### 管理命令（可手动输入，不显示在 Telegram 菜单中）
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `/name <name>` | 设置会话名称 |
+| `/restart` | 重启网关 |
 | `/upgrade` | 自升级：fast-forward git pull → npm install → 离线自检（失败自动回滚）→ 重启 |
-| `/help` | 显示完整的操作帮助 |
 
 > **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。
 
@@ -259,7 +267,7 @@ pi-remote-gateway stop     # 停止后台服务
    - 网关直接通过 socket（source `remote-pi`）向 Herdr 实时汇报状态（`working`、`idle`，或包含提问标题的 `blocked` 待确认状态），在 `herdr agent list` 中与本地 agent 一同展示。
    - 对应窗格内启动紧凑 ANSI 观察器（`gateway.mjs --watch-session`），实时滚动展示只读会话日志（用户指令、模型回答、工具调用及报错、上下文压缩等）。
 2. **桌面 Pi 远程控制 Topic 联动（按 agent 手动开启）**：
-   - 在桌面端跑其他 Pi agent 时，开启远程控制可将该 agent 桥接到**专属 Telegram Topic**。在桌面 Pi 中输入 `/remote-control`（或 `/remote-control on|off|status`；兼容老命令别名 `/remote-pi`）开启。
+   - 在桌面端跑其他 Pi agent 时，开启远程控制可将该 agent 桥接到**专属 Telegram Topic**。在桌面 Pi 中输入 `/remote-control`（或 `/remote-control on|off|status`）开启。
    - **前置要求**：Telegram 需为该 Bot 开启 Threaded Mode / 话题模式（在 @BotFather Mini App 中设置：Bot Settings → Threads Settings → Threaded Mode）。若未开启话题模式，通知将自动降级回退至主会话。
    - `install.sh`（以及 `pi-remote-gateway upgrade`）会把 `herdr-extension.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`。
    - 开关作为 Herdr 原生 pane metadata token（`remote_pi=on`）存在 pane 上，Pi 退出时自动清除。

@@ -72,23 +72,4 @@ export default function (pi) {
     "Ask the user a multiple-choice question with buttons",
     ["Use remote_ask only when the next step is genuinely ambiguous and one of the options would unblock it; otherwise pick the reasonable default and say so."]
   );
-
-  // Backward-compatibility aliases for existing prompts and sessions
-  registerAttach(
-    pi,
-    "telegram_attach",
-    "Telegram Attach (Alias)",
-    "Alias for remote_attach to maintain backward compatibility.",
-    "Deliver local files to the chat",
-    ["Alias for remote_attach."]
-  );
-
-  registerAsk(
-    pi,
-    "telegram_ask",
-    "Telegram Ask (Alias)",
-    "Alias for remote_ask to maintain backward compatibility.",
-    "Ask the user a multiple-choice question with buttons",
-    ["Alias for remote_ask."]
-  );
 }

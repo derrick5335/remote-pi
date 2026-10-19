@@ -40,7 +40,7 @@ xml_escape() {
 install_command() {
     mkdir -p "$(dirname "$COMMAND")"
     ln -sf "$ROOT/install.sh" "$COMMAND"
-    # 桌面 Pi 的 /remote-pi 命令（按 agent 开启 Herdr 状态推送）；Pi 自动发现 ~/.pi/agent/extensions/*.ts
+    # 桌面 Pi 的 /remote-control 命令（按 agent 开启 Herdr 状态推送）；Pi 自动发现 ~/.pi/agent/extensions/*.ts
     mkdir -p "$PI_EXTENSION_DIR"
     ln -sf "$ROOT/herdr-extension.ts" "$PI_EXTENSION"
 }

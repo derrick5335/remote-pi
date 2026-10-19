@@ -22,8 +22,7 @@ const HELP = `Remote Pi
 
 Just send text to chat with Pi; messages sent while it is working act as steering.
 
-/help               Show this help
-/commands           Extension, prompt & skill commands
+/help               Show help and extension, prompt & skill commands
 /cwd [path]         Switch workspace; no argument shows recent projects
 /topic [path]       Start a new topic session (parallel task)
 /close              Close current topic session
@@ -33,35 +32,33 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /thinking [level]
 /resume             Pick a past session
 /new                New session
-/name <name>        Name the session
-/session            Current model, session, tokens & cost
+/status             Current model, session, tokens & cost
 /agents             Status of all Herdr agents (📡 = pushed here)
 /fork               Branch from a past user message
-/clone              Clone the current branch
 /compact [focus]    Compact the context
 /export             Export as HTML
 /handoff            Hand off session to desktop Pi
 /abort              Stop current task (queue kept)
-/abort clear        Stop and clear the queue
-/restart            Restart the gateway
-/upgrade            Upgrade gateway to latest (git pull + self-test + restart)
 /queue [clear]      View or clear the message queue
-/followup <text>    Queue a follow-up prompt`;
+/followup <text>    Queue a follow-up prompt
+
+Admin
+/name <name>        Name the session
+/restart            Restart the gateway
+/upgrade            Upgrade gateway to latest (git pull + self-test + restart)`;
 
 const BOT_COMMANDS = [
-  ["help", "Help"], ["commands", "Extension, prompt & skill commands"],
+  ["help", "Help"],
   ["cwd", "Switch workspace or show history"],
   ["topic", "New topic session"], ["close", "Close current topic"],
   ["sh", "Run a shell command"], ["get", "Download a file"],
   ["model", "View or switch model"], ["thinking", "View or set thinking level"],
-  ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
-  ["session", "Session & cost"], ["agents", "Herdr agent status"],
-  ["fork", "Branch from history"], ["clone", "Clone current branch"],
+  ["resume", "Resume a past session"], ["new", "New session"],
+  ["status", "Session status, tokens & cost"], ["agents", "Herdr agent status"],
+  ["fork", "Branch from history"],
   ["compact", "Compact context"], ["export", "Export as HTML"],
   ["handoff", "Hand off session to desktop"],
   ["abort", "Stop task (queue kept)"],
-  ["restart", "Restart gateway"],
-  ["upgrade", "Upgrade gateway to latest"],
   ["queue", "View or clear queue"],
   ["followup", "Queue a follow-up"],
 ].map(([command, description]) => ({ command, description }));
@@ -77,8 +74,8 @@ function getUpdatePriority(update) {
   if (!text) return "p2";
   const cmd = parseCommand(text);
   if (!cmd) return "p2";
-  if (["abort", "restart", "new", "reset"].includes(cmd.name)) return "p0";
-  if (["status", "session", "queue", "help", "start", "commands"].includes(cmd.name)) return "p1";
+  if (["abort", "restart", "new"].includes(cmd.name)) return "p0";
+  if (["status", "queue", "help", "start", "commands"].includes(cmd.name)) return "p1";
   return "p2";
 }
 
@@ -1880,7 +1877,7 @@ function herdrChoices(screen) {
   return choices.length >= 2 ? choices : [];
 }
 
-// /remote-control（herdr-extension.ts，兼容 /remote-pi）通过 herdr 原生 pane metadata token 标记订阅
+// /remote-control（herdr-extension.ts）通过 herdr 原生 pane metadata token 标记订阅
 const HERDR_OPT_IN_TOKEN = "remote_pi";
 
 function herdrOptedIn(agent) {
@@ -2253,9 +2250,7 @@ class PiRpc {
     if (typeof this.config.beforeStart === "function") await this.config.beforeStart();
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
-    const companionPath = existsSync(join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs"))
-      ? join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs")
-      : join(dirname(fileURLToPath(import.meta.url)), "telegram-extension.mjs");
+    const companionPath = join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs");
     const extensionsToLoad = [];
     if (this.config.enableCompanionExtension && existsSync(companionPath)) {
       extensionsToLoad.push(companionPath);
@@ -2795,15 +2790,16 @@ class ChatSession {
     const t0 = performance.now();
     try {
       switch (name) {
-      case "start": case "help": return this.send(HELP);
-      case "commands": return this.showCommands();
+      case "start": return this.send(HELP);
+      case "help": case "commands":
+        await this.send(HELP);
+        return this.showCommands();
       case "cwd": return argument ? this.switchCwd(resolvePath(argument.trim(), this.cwd), null) : this.showCwds();
       case "topic": return this.gateway.handleTopicCommand(this, argument);
       case "close": return this.gateway.handleCloseCommand(this);
       case "model": return this.showModels(argument);
       case "thinking": return this.showThinking(argument);
       case "resume": return this.showSessions();
-      case "reset":
       case "new": {
         this.abortedRun = true;
         if (this.pi.proc) {
@@ -2836,15 +2832,10 @@ class ChatSession {
         await this.pi.request("set_session_name", { name: argument });
         return this.send(`✅ Session name: ${argument}`);
       }
-      case "session": case "status": return this.showSession();
+      case "status": return this.showSession();
       case "handoff": return this.handleHandoff();
       case "agents": return this.gateway.showHerdrAgents();
       case "fork": return this.showForks();
-      case "clone": {
-        const result = await this.pi.request("clone");
-        if (!result.cancelled) await this.onSessionSwitched();
-        return this.send(result.cancelled ? "Clone cancelled" : "✅ Current branch cloned");
-      }
       case "compact": {
         this.startTyping();
         try {
@@ -2864,7 +2855,7 @@ class ChatSession {
         await this.sendDocument(result.path);
         return;
       }
-      case "sh": case "bash": {
+      case "sh": {
         if (!argument) return this.send("Usage: /sh <command>");
         if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
           return this.send("❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
@@ -2905,18 +2896,16 @@ class ChatSession {
       }
       case "abort": {
         this.abortedRun = true;
-        const clear = argument === "clear";
         if (this.pendingUi && this.pi.proc) {
           this.pi.write({ type: "extension_ui_response", id: this.pendingUi.id, cancelled: true });
         }
         if (this.pi.proc) {
-          if (clear) await this.pi.request("clear_queue").catch(() => {});
           await this.pi.request("abort").catch(() => {});
         }
         const kept = this.queue;
         this.resetSessionState();
-        if (!clear) this.queue = kept;
-        return this.send(clear ? "⏹ Stopped; queue cleared" : "⏹ Stopped (queued messages kept; /abort clear to clear)");
+        this.queue = kept;
+        return this.send("⏹ Stopped (queued messages kept; use /queue clear to clear)");
       }
       case "upgrade": {
         this.startTyping();
@@ -2964,7 +2953,7 @@ class ChatSession {
         if (alias) return this.prompt(`/${alias}${argument ? ` ${argument}` : ""}`);
         const commands = await this.pi.request("get_commands");
         if (commands.commands.some((item) => item.name.toLowerCase() === name)) return this.prompt(original);
-        return this.send(`Unknown command: /${name}\nUse /help or /commands`);
+        return this.send(`Unknown command: /${name}\nUse /help`);
       }
       }
     } finally {
@@ -2993,10 +2982,10 @@ class ChatSession {
   }
 
   async showCommands() {
+    if (this.handoff) return;
     const data = await this.pi.request("get_commands");
-    const text = data.commands.length
-      ? data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n")
-      : "No extension commands, prompt templates, or skills loaded.";
+    if (!data.commands.length) return;
+    const text = data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n");
     await this.send(text);
   }
 
@@ -3777,7 +3766,7 @@ class ChatSession {
       const runningTool = this.toolPanel?.tools?.slice().reverse().find((item) => item.status === "running");
       this.currentToolSummary = runningTool ? runningTool.summary : null;
       this.scheduleStatusBoardUpdate();
-      if ((event.toolName === "remote_attach" || event.toolName === "telegram_attach") && !event.isError) {
+      if (event.toolName === "remote_attach" && !event.isError) {
         // 扩展返回的 details.paths 已解析为绝对路径；旧版扩展回退 args.paths 时按会话 cwd 解析
         const rawPaths = event.result?.details?.paths || event.args?.paths || [];
         const paths = event.result?.details?.paths ? rawPaths : rawPaths.map((p) => resolve(this.cwd, p));
@@ -4590,9 +4579,9 @@ class Gateway {
     if (session.handoff) {
       const text = message.text?.trim();
       const command = text ? parseCommand(text) : null;
-      if (command && ["status", "session", "help", "start", "agents", "commands"].includes(command.name)) {
+      if (command && ["status", "help", "start", "agents", "commands"].includes(command.name)) {
         // allow through to handleCommand below
-      } else if (command && ["new", "reset"].includes(command.name)) {
+      } else if (command?.name === "new") {
         return session.handleNewSessionHere();
       } else {
         return session.sendHandoffPrompt();
@@ -5559,7 +5548,7 @@ async function selfTest() {
       assert.equal(rpcCalls.at(-1).type, "prompt");
     }
 
-    // Test remote_attach / telegram_attach auto delivery via tool_execution_end
+    // Test remote_attach auto delivery via tool_execution_end
     gw.chatReady = true;
     const docs = [];
     gw.telegram.sendDocument = async (_chat, path) => docs.push(path);
@@ -5570,25 +5559,15 @@ async function selfTest() {
       isError: false,
       result: { details: { paths: ["/tmp/file1.png", "/tmp/file2.pdf"] } },
     });
-    await gw.mainSession.handleEvent({
-      type: "tool_execution_end",
-      toolCallId: "call-2",
-      toolName: "telegram_attach",
-      isError: false,
-      result: { details: { paths: ["/tmp/file3.txt"] } },
-    });
     await Promise.all([gw.telegramChain, gw.uploadChain]);
-    assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf", "/tmp/file3.txt"]);
+    assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
 
     // Test priority command classification and preemptive dispatch
     assert.equal(getUpdatePriority({ stopped_message_generation: true }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/abort" } }), "p0");
-    assert.equal(getUpdatePriority({ message: { text: "/abort clear" } }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/new" } }), "p0");
-    assert.equal(getUpdatePriority({ message: { text: "/reset" } }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/restart" } }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/status" } }), "p1");
-    assert.equal(getUpdatePriority({ message: { text: "/session" } }), "p1");
     assert.equal(getUpdatePriority({ message: { text: "/queue" } }), "p1");
     assert.equal(getUpdatePriority({ message: { text: "/help" } }), "p1");
     assert.equal(getUpdatePriority({ message: { text: "/commands" } }), "p1");
@@ -6168,7 +6147,12 @@ async function selfTest() {
     assert.equal(r.status, 0, `herdr-extension.ts syntax check: ${r.stderr}`);
   }
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
-  assert.ok(BOT_COMMANDS.some((c) => c.command === "upgrade"), "BOT_COMMANDS registers upgrade");
+  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "status"), { command: "status", description: "Session status, tokens & cost" });
+  for (const name of ["name", "restart", "upgrade"]) {
+    assert.ok(!BOT_COMMANDS.some((c) => c.command === name), `${name} hidden from menu`);
+    assert.ok(HELP.split("\nAdmin\n")[1].includes(`/${name}`), `${name} listed under Admin`);
+  }
+  assert.ok(!BOT_COMMANDS.some((c) => c.command === "commands"), "command discovery folded into help");
 
   // 1. pollBackoffMs 指数退避与全抖动
   assert.equal(pollBackoffMs(1, () => 1), 1000);
@@ -7510,6 +7494,68 @@ async function selfTest() {
     assert.equal(gw.state.remoteBridges["p_del"].threadId, 1000, "Deleted topic should be replaced with fresh threadId");
     assert.ok(sends.some((s) => s.extra.message_thread_id === 1000), "Should send on-message to new topic");
     await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // Help includes native Pi commands only when available.
+  {
+    const gwHelp = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const sess = gwHelp.mainSession;
+    const sent = [];
+    sess.send = async (text) => { sent.push(text); };
+    let commands = [
+      { name: "review", description: "Review changes", source: "extension" },
+      { name: "summarize", source: "prompt" },
+      { name: "skill:check", description: "Run checks", source: "skill" },
+    ];
+    sess.pi.request = async (type) => {
+      assert.equal(type, "get_commands");
+      assert.equal(sent.at(-1), HELP, "help sent before command discovery");
+      return { commands };
+    };
+    for (const name of ["help", "commands"]) {
+      sent.length = 0;
+      await sess.handleCommand({ name, argument: "" }, `/${name}`);
+      assert.deepEqual(sent, [HELP, "/review — Review changes\n/summarize\n/skill:check — Run checks"]);
+    }
+    commands = [];
+    sent.length = 0;
+    await sess.handleCommand({ name: "help", argument: "" }, "/help");
+    assert.deepEqual(sent, [HELP], "no empty command-list notice");
+    sess.pi.request = async () => { assert.fail("static help must not start Pi"); };
+    sent.length = 0;
+    await sess.handleCommand({ name: "start", argument: "" }, "/start");
+    assert.deepEqual(sent, [HELP]);
+    gwHelp.state.handoffs = { [sess.key]: { sessionFile: "/tmp/help.jsonl", at: Date.now() } };
+    sent.length = 0;
+    await sess.handleCommand({ name: "help", argument: "" }, "/help");
+    assert.deepEqual(sent, [HELP], "help stays available during handoff without starting Pi");
+  }
+
+  // Abort preserves both queues; queue clear removes them through native RPC.
+  {
+    const gwQueue = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const sess = gwQueue.mainSession;
+    const sent = [];
+    const calls = [];
+    sess.send = async (text) => { sent.push(text); };
+    sess.pi.request = async (type) => {
+      calls.push(type);
+      return { steering: ["steer"], followUp: ["follow"] };
+    };
+    for (const proc of [null, {}]) {
+      sess.pi.proc = proc;
+      const queue = { steering: ["steer"], followUp: ["follow"] };
+      sess.queue = queue;
+      calls.length = 0;
+      await sess.handleCommand({ name: "abort", argument: "" }, "/abort");
+      assert.equal(sess.queue, queue, "abort keeps queued messages");
+      assert.deepEqual(calls, proc ? ["abort"] : []);
+      assert.ok(sent.at(-1).includes("use /queue clear to clear"));
+      await sess.handleCommand({ name: "queue", argument: "clear" }, "/queue clear");
+      assert.deepEqual(sess.queue, { steering: [], followUp: [] });
+      assert.deepEqual(calls, proc ? ["abort", "clear_queue"] : []);
+      assert.equal(sent.at(-1), proc ? "Cleared\nsteering: 1\nfollow-up: 1" : "Cleared\nsteering: 0\nfollow-up: 0");
+    }
   }
 
   // 11. Command with bot-suffix in parseCommand

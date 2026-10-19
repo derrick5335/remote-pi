@@ -38,7 +38,7 @@
 - 📄 **Long Replies as Readable Files**: Final replies longer than `longReplyChars` (default 8000) are delivered as a standalone dark-mode-friendly HTML document (rendered with full CommonMark + GFM tables), with the first chunk kept in chat as a preview. Configure or disable (`0`) via `longReplyChars`; `/export` exports the whole session via Pi's native `export_html`.
 - 🚑 **One-Tap Error Recovery**: Model errors, empty replies, unexpected Pi exits and extension failures attach an inline keyboard (1h TTL): retry the last prompt, retry on a fallback model (`fallbackModels`), pick another model, restart Pi, or view the redacted gateway log — no typing required.
 - 🎮 **Telegram Companion Extension**:
-  - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons; aliases `telegram_attach` / `telegram_ask` retained for compatibility).
+  - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons).
   - Supports loading custom Pi extensions via config (`-e`), and proxies Pi extension UI requests (`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`) directly to Telegram.
 - 🎙️ **Multimodal Context & Voice Transcription (STT)**:
   - **Voice Input**: Configure `sttCommand` (e.g. Groq Whisper API or local Apple Silicon `mlx-whisper`) to convert Telegram voice notes into prompts automatically.
@@ -69,15 +69,23 @@
 | `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response). Note: the block on service restart/stop commands here is only an accident guard, not a security boundary — the bot holder already has full shell access |
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
-| `/session` or `/status`| Show current session ID, active model, token context usage, and cost |
+| `/status` | Show current session ID, active model, token context usage, and cost |
 | `/agents` | Status of every agent in Herdr, grouped by workspace (📱 = Telegram session, 📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
 | `/export` | Export the full session as an HTML file (Pi native `export_html`) and send it as a document |
 | `/fork` | Branch the session from a previous user message |
 | `/handoff` | Hand off session to desktop Pi (safely stops phone Pi, gives copyable command & Take Back button) |
-| `/abort` | Stop current agent execution immediately |
+| `/abort` | Stop current agent execution immediately, keeping queued messages |
+| `/queue [clear]` | View the message queue; `/queue clear` is the only command to clear it |
+| `/help` | Show help, followed by available extension, prompt template, and skill commands |
+
+### Admin (typeable, hidden from the Telegram menu)
+
+| Command | Description |
+| :--- | :--- |
+| `/name <name>` | Set the session name |
+| `/restart` | Restart the gateway |
 | `/upgrade` | Self-upgrade the gateway: fast-forward git pull → npm install → offline self-test (auto-rollback on failure) → restart |
-| `/help` | Show full help menu |
 
 > **Tip**: Skills and custom commands installed in Pi are automatically surfaced in Telegram as callable commands (e.g. `/skill_name`).
 
@@ -259,7 +267,7 @@ When you run [Herdr](https://herdr.dev), the gateway integrates deeply with Herd
    - The gateway reports agent status (`working`, `idle`, `blocked` with the question title) directly to Herdr over its socket (source `remote-pi`), so Telegram sessions appear live in Herdr's agent list (`herdr agent list`).
    - Inside the pane, a compact ANSI viewer (`gateway.mjs --watch-session`) renders a read-only live transcript of the conversation (user messages, assistant text, tool executions, errors, and compactions).
 2. **Desktop Pi Remote Control via Topics (opt-in per agent)**:
-   - When running other desktop Pi agents in Herdr, turning on remote control bridges that agent to its **own Telegram forum topic**. Opt in per agent by typing `/remote-control` (or `/remote-control on|off|status`; `/remote-pi` kept as a deprecated alias) inside that desktop Pi.
+   - When running other desktop Pi agents in Herdr, turning on remote control bridges that agent to its **own Telegram forum topic**. Opt in per agent by typing `/remote-control` (or `/remote-control on|off|status`) inside that desktop Pi.
    - **Prerequisite**: Threaded Mode / forum topics must be enabled for your bot in Telegram (via @BotFather Mini App: Bot Settings → Threads Settings → Threaded Mode). If topics are not enabled, notifications fall back to the main chat.
    - `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`.
    - The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits.

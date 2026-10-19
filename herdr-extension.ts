@@ -1,5 +1,5 @@
 // Desktop Pi extension (installed by install.sh into ~/.pi/agent/extensions/remote-pi.ts).
-// Adds /remote-control (and deprecated /remote-pi): bridge this Pi agent's Herdr pane to its own Telegram topic.
+// Adds /remote-control: bridge this Pi agent's Herdr pane to its own Telegram topic.
 // The opt-in lives on the pane itself as a Herdr-native metadata token (remote_pi=on), which the
 // gateway reads via `herdr agent list/get`; session path fallback is reported as remote_pi_session.
 // ref: Herdr socket API pane.report_metadata & pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
@@ -90,11 +90,6 @@ export default function (pi) {
 
   pi.registerCommand("remote-control", {
     description: "Bridge this Pi agent to its own Telegram topic (on | off | status; no argument toggles)",
-    handler,
-  });
-
-  pi.registerCommand("remote-pi", {
-    description: "Deprecated alias of /remote-control",
     handler,
   });
 
