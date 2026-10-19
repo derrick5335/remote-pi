@@ -20,6 +20,8 @@ CONFIG="$CONFIG_DIR/config.json"
 LOG_DIR="$HOME/.local/var/log"
 LOG_FILE="$LOG_DIR/remote-pi.log"
 COMMAND="$HOME/.local/bin/pi-remote-gateway"
+PI_EXTENSION_DIR="$HOME/.pi/agent/extensions"
+PI_EXTENSION="$PI_EXTENSION_DIR/remote-pi.ts"
 NODE="$(command -v node || true)"
 [[ -n "$NODE" ]] || { echo "❌ node not found; install Node.js (>=22.18.0) first" >&2; exit 1; }
 PI="$(command -v pi || true)"
@@ -38,6 +40,9 @@ xml_escape() {
 install_command() {
     mkdir -p "$(dirname "$COMMAND")"
     ln -sf "$ROOT/install.sh" "$COMMAND"
+    # 桌面 Pi 的 /remote-pi 命令（按 agent 开启 Herdr 状态推送）；Pi 自动发现 ~/.pi/agent/extensions/*.ts
+    mkdir -p "$PI_EXTENSION_DIR"
+    ln -sf "$ROOT/herdr-extension.ts" "$PI_EXTENSION"
 }
 
 setup_plist() {
@@ -184,6 +189,7 @@ upgrade() {
         npm install --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1
         echo "❌ Self-test failed; rolled back to $old" >&2; exit 1
     fi
+    install_command
     echo "✅ Upgrade complete"
     [[ "$flag" == "--no-restart" ]] && return 0
     if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
@@ -201,6 +207,6 @@ case "${1:-install}" in
     restart)   restart ;;
     status)    status ;;
     logs)      tail -f "$LOG_FILE" ;;
-    uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; echo "Removed service; kept $CONFIG" ;;
+    uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; [[ -L "$PI_EXTENSION" ]] && rm -f "$PI_EXTENSION"; echo "Removed service; kept $CONFIG" ;;
     *) echo "Usage: $0 [install|upgrade|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
 esac

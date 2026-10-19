@@ -23,6 +23,7 @@ Telegram Bot gateway for Pi RPC。Pi 在本仓库工作，通过 Telegram 收发
 
 - `gateway.mjs`：单文件核心，无额外框架（仅依赖 `markdown-it` 用于 Telegram HTML 格式渲染）。轮询 Telegram → RPC 驱动 Pi 子进程；流式输出采用静音消息 + 原地编辑（`sendMessage` + `editMessageText`）。
 - `remote-extension.mjs`：Companion extension，给模型提供 `remote_attach`（发文件）和 `remote_ask`（内联按钮提问）两个工具（兼容别名 `telegram_attach`/`telegram_ask`）。可通过配置禁用或添加更多自定义扩展。
+- `herdr-extension.ts`：桌面 Pi extension（install.sh 软链到 `~/.pi/agent/extensions/remote-pi.ts`），提供 `/remote-pi` 命令，用 Herdr 原生 pane metadata token `remote_pi=on` 标记该 agent 推送到 Telegram；网关 `HerdrWatcher` 订阅 herdr socket 的 `pane.agent_status_changed`，只推已标记 pane 的完成/待确认，`/agents` 查看全部 agent。
 - `install.sh`：安装 launchd 服务，`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - Telegram 命令：`/sh`（直跑 shell）、`/get`（下载文件）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。
 - 安全：只接受配置的私聊用户；Telegram 非端到端加密，控制该账号即等于控制本机用户权限，勿拉群。

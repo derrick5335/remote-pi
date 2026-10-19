@@ -64,6 +64,7 @@
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
 | `/session` or `/status`| Show current session ID, active model, token context usage, and cost |
+| `/agents` | Status of every agent in Herdr, grouped by workspace (📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
 | `/fork` | Branch the session from a previous user message |
 | `/abort` | Stop current agent execution immediately |
@@ -212,6 +213,22 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
   "sttCommand": "mlx_whisper --model mlx-community/whisper-large-v3-turbo $1"
 }
 ```
+
+### Herdr Agent Notifications (opt-in per agent)
+
+When you run several Pi agents in [Herdr](https://herdr.dev), the gateway can ping you on Telegram when one of them **finishes** or **needs your confirmation**. Nothing is pushed by default: opt in per agent by typing this inside that desktop Pi:
+
+```text
+/remote-pi          # toggle push for this agent
+/remote-pi on|off|status
+```
+
+- `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`, which provides the command. In an already running Pi, run `/reload` once.
+- The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits. No side files.
+- The gateway subscribes to Herdr's `pane.agent_status_changed` events over its socket, and does a full `herdr agent list` reconciliation every minute.
+- **Needs confirmation** (`blocked`): you get the screen tail plus buttons for the numbered options it detects (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`. Keys are only sent if the agent is still blocked.
+- **Finished** (`working → done/idle`): you get the tail of its output. **Reply** to any notification to send that agent a prompt (or, when it is blocked, to type an answer).
+- `/agents` lists all Herdr agents, including the ones that are not opted in.
 
 ---
 

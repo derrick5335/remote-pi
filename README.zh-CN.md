@@ -64,6 +64,7 @@
 | `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
 | `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
+| `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/fork` | 从历史用户消息创建分支会话 |
 | `/abort` | 立即中断当前正在运行的任务 |
@@ -212,6 +213,22 @@ pi-remote-gateway stop     # 停止后台服务
   "sttCommand": "mlx_whisper --model mlx-community/whisper-large-v3-turbo $1"
 }
 ```
+
+### Herdr Agent 状态推送（按 agent 手动开启）
+
+在 [Herdr](https://herdr.dev) 里同时跑多个 Pi agent 时，网关可以在某个 agent **完成** 或 **需要你确认** 时主动推送到 Telegram。默认不推送：需要在对应的桌面 Pi 里输入以下命令，为这个 agent 单独开启：
+
+```text
+/remote-pi          # 切换本 agent 的推送开关
+/remote-pi on|off|status
+```
+
+- `install.sh`（以及 `pi-remote-gateway upgrade`）会把 `herdr-extension.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`，由它提供该命令；已在运行的 Pi 执行一次 `/reload` 即可加载。
+- 开关作为 Herdr 原生 pane metadata token（`remote_pi=on`）存在 pane 上，该 Pi 退出时自动清除，不写任何旁路文件。
+- 网关通过 Herdr socket 订阅 `pane.agent_status_changed` 事件，并每分钟用 `herdr agent list` 全量对账兜底。
+- **需要确认**（`blocked`）：推送屏幕末尾内容，附带识别出的编号选项按钮（`1. Yes`、`2. …`）以及 `⏎ Enter` / `⎋ Esc`；仅当 agent 仍处于 blocked 时才会发送按键。
+- **完成**（`working → done/idle`）：推送输出末尾内容。直接**回复**任意一条通知，即可给该 agent 发送新指令（若它处于 blocked，则作为回答输入）。
+- `/agents` 列出 Herdr 中所有 agent，包括未开启推送的。
 
 ---
 

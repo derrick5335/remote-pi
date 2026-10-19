@@ -30,6 +30,7 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /new                New session
 /name <name>        Name the session
 /session            Current model, session, tokens & cost
+/agents             Status of all Herdr agents (📡 = pushed here)
 /fork               Branch from a past user message
 /clone              Clone the current branch
 /compact [focus]    Compact the context
@@ -46,7 +47,7 @@ const BOT_COMMANDS = [
   ["cwd", "Switch workspace or show history"], ["sh", "Run a shell command"], ["get", "Download a file"],
   ["model", "View or switch model"], ["thinking", "View or set thinking level"],
   ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
-  ["session", "Session & cost"],
+  ["session", "Session & cost"], ["agents", "Herdr agent status"],
   ["fork", "Branch from history"], ["clone", "Clone current branch"],
   ["compact", "Compact context"], ["export", "Export session"], ["abort", "Stop task (queue kept)"],
   ["restart", "Restart gateway"],
@@ -825,6 +826,180 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled } = {}) {
   };
 }
 
+const HERDR_STATUS_ICON = { working: "⏳", blocked: "✋", done: "✅", idle: "💤", unknown: "❔" };
+
+// 审批/提问 UI 的编号选项（Claude Code「❯ 1. Yes」、Codex「› 1. Yes, proceed」等）；只取屏幕上最后一组连续编号
+function herdrChoices(screen) {
+  const choices = [];
+  for (const line of String(screen || "").split("\n").slice(-30)) {
+    const match = line.match(/^[\s│┃|]*(?:[❯›>▶➜]\s*)?(\d)[.)]\s+(\S.*?)\s*[│┃|]?\s*$/);
+    if (!match) continue;
+    if (match[1] === "1") choices.length = 0;
+    if (choices.length && Number(match[1]) !== Number(choices.at(-1).key) + 1) continue;
+    choices.push({ key: match[1], label: match[2].slice(0, 40) });
+  }
+  return choices.length >= 2 ? choices : [];
+}
+
+// /remote-pi（herdr-remote-extension.ts）通过 herdr 原生 pane metadata token 标记订阅
+const HERDR_OPT_IN_TOKEN = "remote_pi";
+
+function herdrOptedIn(agent) {
+  return agent?.agent === "pi" && agent?.tokens?.[HERDR_OPT_IN_TOKEN] === "on";
+}
+
+function herdrTail(screen, maxLines = 30, maxChars = 2500) {
+  const lines = String(screen || "").replace(/\s+$/, "").split("\n");
+  return lines.slice(-maxLines).join("\n").slice(-maxChars).trim();
+}
+
+// ref: Herdr socket API events.subscribe（`herdr api schema --json`；订阅后连接变为单向事件流，订阅集合变化需重连）
+// 推送负责实时性，每分钟 agent list 全量对账兜底（漏事件、herdr 重启、合盖睡眠）
+class HerdrWatcher {
+  constructor({ bin, socketPath, isExcluded, onTransition }) {
+    this.bin = bin;
+    this.socketPath = socketPath;
+    this.isExcluded = isExcluded;
+    this.onTransition = onTransition;
+    this.statuses = new Map();
+    this.agents = new Map();
+    this.workspaces = new Map();
+    this.socket = null;
+    this.subscribedKey = null;
+    this.syncChain = Promise.resolve();
+    this.syncTimer = null;
+    this.reconcileTimer = null;
+    this.stopped = false;
+  }
+
+  async cli(args, timeout = 5000) {
+    return runCommand(this.bin, args, { timeout });
+  }
+
+  async cliJson(args, timeout = 5000) {
+    return JSON.parse(await this.cli(args, timeout)).result;
+  }
+
+  start() {
+    this.stopped = false;
+    this.sync();
+    this.reconcileTimer = setInterval(() => this.sync(), 60_000);
+    this.reconcileTimer.unref?.();
+  }
+
+  stop() {
+    this.stopped = true;
+    clearInterval(this.reconcileTimer);
+    clearTimeout(this.syncTimer);
+    const socket = this.socket;
+    this.socket = null;
+    socket?.destroy();
+  }
+
+  scheduleSync(delay) {
+    clearTimeout(this.syncTimer);
+    this.syncTimer = setTimeout(() => this.sync(), delay);
+    this.syncTimer.unref?.();
+  }
+
+  sync() {
+    this.syncChain = this.syncChain.then(() => this.doSync()).catch((error) => {
+      console.warn(`${new Date().toISOString()} [herdr] sync failed: ${error.message}`);
+      if (!this.stopped) this.scheduleSync(15_000);
+    });
+    return this.syncChain;
+  }
+
+  async doSync() {
+    if (this.stopped) return;
+    const [agentList, workspaceList] = await Promise.all([this.cliJson(["agent", "list"]), this.cliJson(["workspace", "list"])]);
+    this.workspaces = new Map((workspaceList?.workspaces ?? []).map((w) => [w.workspace_id, w.label]));
+    const agents = agentList?.agents ?? [];
+    this.agents = new Map(agents.map((a) => [a.pane_id, a]));
+    for (const agent of agents) this.observe(agent.pane_id, agent.agent_status);
+    for (const paneId of this.statuses.keys()) if (!this.agents.has(paneId)) this.statuses.delete(paneId);
+    const paneIds = [...this.agents.keys()].sort();
+    if (paneIds.join(",") !== this.subscribedKey || !this.socket) this.subscribe(paneIds);
+  }
+
+  // 首次见到某 pane 只记录不通知；聚焦 pane 完成后直接是 idle 而非 done，因此 working→idle 也算完成
+  observe(paneId, status) {
+    const prev = this.statuses.get(paneId);
+    this.statuses.set(paneId, status);
+    if (prev === undefined || prev === status || this.isExcluded(paneId)) return;
+    const finished = (status === "done" || status === "idle") && (prev === "working" || prev === "blocked");
+    if (status === "blocked" || finished) this.notify(paneId, status === "blocked" ? "blocked" : "done");
+  }
+
+  // 只推送在 Pi 里执行过 /remote-pi 的 pane：现取 agent get，以 pane 上的 remote_pi token 为准（默认不推送）
+  async notify(paneId, status) {
+    try {
+      const agent = (await this.cliJson(["agent", "get", paneId]))?.agent;
+      if (!agent) return;
+      this.agents.set(paneId, agent);
+      if (!herdrOptedIn(agent)) return;
+      await this.onTransition({ paneId, status, agent });
+    } catch (error) {
+      console.warn(`${new Date().toISOString()} [herdr] notify ${paneId} failed: ${error.message}`);
+    }
+  }
+
+  subscribe(paneIds) {
+    this.socket?.destroy();
+    this.subscribedKey = paneIds.join(",");
+    const socket = net.connect(this.socketPath);
+    this.socket = socket;
+    let buffer = "";
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({
+        id: "remote-pi:watch",
+        method: "events.subscribe",
+        params: { subscriptions: [{ type: "pane.agent_detected" }, ...paneIds.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId }))] },
+      })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (line) this.handleLine(socket, line);
+      }
+    });
+    socket.on("error", (error) => console.warn(`${new Date().toISOString()} [herdr] event socket: ${error.message}`));
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      if (!this.stopped) this.scheduleSync(5000);
+    });
+  }
+
+  handleLine(socket, line) {
+    let message;
+    try { message = JSON.parse(line); } catch { return; }
+    if (message.error) {
+      // 典型是 pane_not_found（list 与 subscribe 之间 pane 被关）；断开后由 close 回调重新对账
+      console.warn(`${new Date().toISOString()} [herdr] subscribe failed: ${message.error.message || message.error.code}`);
+      socket.destroy();
+      return;
+    }
+    if (message.event === "pane_agent_detected" || message.event === "pane.agent_detected") {
+      this.scheduleSync(300);
+    } else if (message.event === "pane.agent_status_changed" && message.data?.pane_id) {
+      const agent = this.agents.get(message.data.pane_id);
+      if (agent) agent.agent_status = message.data.agent_status;
+      this.observe(message.data.pane_id, message.data.agent_status);
+    }
+  }
+
+  label(paneId) {
+    const agent = this.agents.get(paneId);
+    const name = agent?.name || agent?.agent || "agent";
+    const where = this.workspaces.get(agent?.workspace_id) || (agent?.cwd ? basename(agent.cwd) : "");
+    return `${name}${where ? ` · ${where}` : ""} (${paneId})`;
+  }
+}
+
 class PiRpc {
   constructor(config, onEvent, onClose) {
     this.config = config;
@@ -875,6 +1050,7 @@ class PiRpc {
         console.warn(`${new Date().toISOString()} [herdr] resolveHerdrEnvironment failed: ${err.message}`);
       }
     }
+    this.herdrEnv = herdrEnv;
     const env = {
       ...process.env,
       REMOTE_PI_GATEWAY: "1",
@@ -1018,6 +1194,8 @@ class Gateway {
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
     this.lastModel = null;
+    this.herdrWatcher = null;
+    this.herdrMessages = new Map();
 
     const origSend = this.telegram.send.bind(this.telegram);
     this.telegram.send = (chatId, text, extra = {}) =>
@@ -1050,6 +1228,7 @@ class Gateway {
       this.lastModel = { provider: state.model.provider, modelId: state.model.id };
     }
     await this.registerBotCommands();
+    this.startHerdrWatcher();
     console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
     await this.telegram.poll((update) => this.dispatchUpdate(update));
   }
@@ -1235,6 +1414,9 @@ class Gateway {
       await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
       return;
     }
+
+    const herdrPane = this.herdrWatcher && this.herdrMessages.get(message.reply_to_message?.message_id);
+    if (herdrPane && message.text && !message.text.startsWith("/")) return this.replyToHerdrAgent(herdrPane, message);
 
     const media = await this.extractMedia(message);
     if (media) {
@@ -1424,6 +1606,7 @@ class Gateway {
         return this.telegram.send(this.chatId, `✅ Session name: ${argument}`);
       }
       case "session": case "status": return this.showSession();
+      case "agents": return this.showHerdrAgents();
       case "fork": return this.showForks();
       case "clone": {
         const result = await this.pi.request("clone");
@@ -1631,12 +1814,107 @@ class Gateway {
     await this.telegram.send(this.chatId, `Current directory: ${this.config.cwd}\n\nPick a workspace project:`, this.keyboard(keyboardItems));
   }
 
-  action(payload) {
+  action(payload, ttl = 10 * 60_000) {
     const now = Date.now();
     for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
     const token = randomBytes(6).toString("base64url");
-    this.actions.set(token, { ...payload, expires: now + 10 * 60_000 });
+    this.actions.set(token, { ...payload, expires: now + ttl });
     return `a:${token}`;
+  }
+
+  startHerdrWatcher() {
+    const env = this.pi.herdrEnv;
+    if (this.config.herdr === false || !env?.HERDR_BIN_PATH || !env?.HERDR_SOCKET_PATH) return;
+    this.herdrWatcher = new HerdrWatcher({
+      bin: env.HERDR_BIN_PATH,
+      socketPath: env.HERDR_SOCKET_PATH,
+      // 网关自己的 Pi 已在本对话里流式输出，不再重复推送
+      isExcluded: (paneId) => paneId === this.pi.herdrEnv?.HERDR_PANE_ID,
+      onTransition: ({ paneId, status, agent }) => this.sendHerdrAgent(paneId, status, agent),
+    });
+    this.herdrWatcher.start();
+  }
+
+  async sendHerdrAgent(paneId, status, agent) {
+    const watcher = this.herdrWatcher;
+    const blocked = status === "blocked";
+    const screen = await watcher.cli(["agent", "read", paneId, "--source", blocked ? "visible" : "recent-unwrapped", "--lines", "60"]).catch(() => "");
+    const tail = herdrTail(screen);
+    const label = watcher.label(paneId);
+    const head = blocked ? `✋ ${label} needs your confirmation`
+      : status === "done" ? `✅ ${label} finished`
+      : `${HERDR_STATUS_ICON[status] || "❔"} ${label} — ${status}`;
+    const text = [
+      head,
+      agent?.terminal_title_stripped ? `\`${agent.terminal_title_stripped.replace(/`/g, "'")}\`` : "",
+      tail ? expandableBlockquote(tail) : "",
+      blocked ? "Tap a button, or reply to this message to type an answer." : "Reply to this message to send this agent a prompt.",
+    ].filter(Boolean).join("\n\n");
+
+    // 审批按钮 24h 有效（手机上可能晚些才看到）；同一条通知的按钮按 group 一次性消费
+    const ttl = 24 * 60 * 60_000;
+    const group = randomBytes(4).toString("hex");
+    const keyButton = (label, keys) => ({ text: label.slice(0, 60), callback_data: this.action({ type: "herdr_keys", paneId, keys, label, group }, ttl) });
+    const rows = [];
+    if (blocked) {
+      for (const choice of herdrChoices(tail)) rows.push([keyButton(`${choice.key}. ${choice.label}`, [choice.key])]);
+      rows.push([keyButton("⏎ Enter", ["enter"]), keyButton("⎋ Esc", ["esc"])]);
+    }
+    rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
+    const sent = await this.telegram.send(this.chatId, text, { reply_markup: { inline_keyboard: rows } });
+    if (sent?.message_id) {
+      this.herdrMessages.set(sent.message_id, paneId);
+      if (this.herdrMessages.size > 200) this.herdrMessages.delete(this.herdrMessages.keys().next().value);
+    }
+  }
+
+  async showHerdrAgents() {
+    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available (disabled in config, or its server is not running).");
+    await this.herdrWatcher.sync();
+    const ownPane = this.pi.herdrEnv?.HERDR_PANE_ID;
+    const agents = [...this.herdrWatcher.agents.values()].filter((agent) => agent.pane_id !== ownPane);
+    if (!agents.length) return this.telegram.send(this.chatId, "No agents running in Herdr.");
+    const byWorkspace = new Map();
+    for (const agent of agents) {
+      const ws = this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.workspace_id;
+      if (!byWorkspace.has(ws)) byWorkspace.set(ws, []);
+      byWorkspace.get(ws).push(agent);
+    }
+    const lines = [];
+    for (const [ws, list] of byWorkspace) {
+      lines.push(`**${ws}**`);
+      for (const agent of list) {
+        const title = agent.terminal_title_stripped ? ` — ${agent.terminal_title_stripped.replace(/[`*_[\]]/g, "")}` : "";
+        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${herdrOptedIn(agent) ? " 📡" : ""}${title}`);
+      }
+      lines.push("");
+    }
+    lines.push("📡 = pushed to Telegram (run /remote-pi inside that Pi to toggle). Tap an agent to see its screen.");
+    return this.telegram.send(this.chatId, lines.join("\n"), this.keyboard(agents.map((agent) => ({
+      label: `${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} · ${this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.pane_id}`,
+      action: { type: "herdr_peek", paneId: agent.pane_id },
+    }))));
+  }
+
+  async replyToHerdrAgent(paneId, message) {
+    const watcher = this.herdrWatcher;
+    const text = message.text.trim();
+    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+    try {
+      const agent = (await watcher.cliJson(["agent", "get", paneId]))?.agent;
+      if (!agent) return this.telegram.send(this.chatId, `❌ ${paneId} no longer hosts an agent`);
+      // agent prompt 会拒绝 blocked 状态（agent_blocked）；此时把文本打进提问 UI 再回车
+      if (agent.agent_status === "blocked") {
+        await watcher.cli(["pane", "send-text", paneId, text]);
+        await watcher.cli(["agent", "send-keys", paneId, "enter"]);
+      } else {
+        await watcher.cli(["agent", "prompt", paneId, text]);
+      }
+      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
+      return this.telegram.send(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, { disable_notification: true });
+    } catch (error) {
+      return this.telegram.send(this.chatId, `❌ ${error.message}`);
+    }
   }
 
   keyboard(items) {
@@ -1780,6 +2058,29 @@ class Gateway {
       } else if (action.type === "cwd") {
         await this.switchCwd(action.path, callback.id);
         return;
+      } else if (action.type === "herdr_peek") {
+        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
+        if (!agent) return this.telegram.answer(callback.id, "Agent is gone");
+        await this.sendHerdrAgent(action.paneId, agent.agent_status, agent);
+      } else if (action.type === "herdr_keys") {
+        for (const [k, v] of this.actions) {
+          if (v.group === action.group) this.actions.delete(k);
+        }
+        const removeButtons = () => callback.message && this.telegram.call("editMessageReplyMarkup", {
+          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+        // 只在仍处于 blocked 时发键，避免把「1」误打进已恢复工作的 agent
+        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
+        if (agent?.agent_status !== "blocked") {
+          await removeButtons();
+          await this.telegram.send(this.chatId, `⚠️ ${this.herdrWatcher.label(action.paneId)} is no longer waiting (${agent?.agent_status || "gone"}); nothing sent.`);
+          return this.telegram.answer(callback.id, "Not waiting");
+        }
+        await this.herdrWatcher.cli(["agent", "send-keys", action.paneId, ...action.keys]);
+        await removeButtons();
+        await sleep(1500);
+        const after = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]).catch(() => null))?.agent?.agent_status || "unknown";
+        await this.telegram.send(this.chatId, `➡️ ${action.label} → ${this.herdrWatcher.label(action.paneId)} · now ${HERDR_STATUS_ICON[after] || ""} ${after}`, { disable_notification: true });
       } else if (action.type === "ui") {
         // ref: Telegram Bot API callback single consumption (https://core.telegram.org/bots/api#callbackquery)
         for (const [k, v] of this.actions) {
@@ -2131,6 +2432,7 @@ class Gateway {
   stop() {
     this.resetSessionState();
     this.telegram?.stopWakeMonitor?.();
+    this.herdrWatcher?.stop();
     if (this.lockServer) {
       try { this.lockServer.close(); } catch {}
       this.lockServer = null;
@@ -2820,6 +3122,33 @@ async function selfTest() {
   {
     const r = spawnSync("bash", ["-n", join(dirname(fileURLToPath(import.meta.url)), "install.sh")]);
     assert.equal(r.status, 0, "install.sh bash syntax check");
+  }
+  // Herdr agent 推送：选项解析、opt-in 判定、状态迁移去重
+  assert.deepEqual(
+    herdrChoices("Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No, tell Claude what to do"),
+    [{ key: "1", label: "Yes" }, { key: "2", label: "Yes, and don't ask again" }, { key: "3", label: "No, tell Claude what to do" }],
+  );
+  assert.deepEqual(herdrChoices("│ › 1. Yes, proceed │\n│   2. No │").map((c) => c.key), ["1", "2"]);
+  assert.deepEqual(herdrChoices("1. only one option"), []);
+  assert.deepEqual(herdrChoices("1. old\n2. old\nfoo\n1. new\n2. new\n3. new").map((c) => c.label), ["new", "new", "new"]);
+  assert.equal(herdrTail("a\nb\nc\n\n\n", 2), "b\nc");
+  assert.equal(herdrOptedIn({ agent: "pi", tokens: { remote_pi: "on" } }), true);
+  assert.equal(herdrOptedIn({ agent: "pi" }), false);
+  assert.equal(herdrOptedIn({ agent: "claude", tokens: { remote_pi: "on" } }), false);
+  {
+    const notified = [];
+    const watcher = new HerdrWatcher({ bin: "herdr", socketPath: "", isExcluded: (id) => id === "w1:p9", onTransition: () => {} });
+    watcher.notify = (paneId, status) => notified.push(`${paneId}:${status}`);
+    for (const [pane, status] of [["w1:p1", "done"], ["w1:p1", "working"], ["w1:p1", "blocked"], ["w1:p1", "blocked"], ["w1:p1", "working"],
+      ["w1:p1", "idle"], ["w1:p1", "done"], ["w1:p2", "idle"], ["w1:p2", "idle"], ["w1:p9", "working"], ["w1:p9", "done"]]) {
+      watcher.observe(pane, status);
+    }
+    assert.deepEqual(notified, ["w1:p1:blocked", "w1:p1:done"], "首见不推、重复不推、idle→done 不重复、排除网关自身 pane");
+  }
+  assert.ok(HELP.includes("/agents") && BOT_COMMANDS.some((c) => c.command === "agents"), "/agents registered");
+  {
+    const r = spawnSync("node", ["--check", "--experimental-strip-types", join(dirname(fileURLToPath(import.meta.url)), "herdr-extension.ts")]);
+    assert.equal(r.status, 0, `herdr-extension.ts syntax check: ${r.stderr}`);
   }
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
   assert.ok(BOT_COMMANDS.some((c) => c.command === "upgrade"), "BOT_COMMANDS registers upgrade");
