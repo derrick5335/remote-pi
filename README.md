@@ -35,6 +35,8 @@
 - 🎯 **100% Pi-Native**: Driven strictly via Pi's JSON-RPC protocol (`get_state`, `get_session_stats`, `new_session`, etc.). No private hacks, out-of-band files, or intrusive patches.
 - 🌊 **Native Draft Streaming**: Streams thoughts and responses in real time using silent message creation and in-place editing (`sendMessage` + `editMessageText`), eliminating duplicate dialogs, ghost bubbles, and delivery flashes across all clients.
 - 🛠️ **Expandable Tool Cards**: Ongoing tool executions (Bash commands, file read/write, grep) are grouped into native collapsible blockquotes (`<blockquote expandable>`) to keep mobile chat clean and readable.
+- 📄 **Long Replies as Readable Files**: Final replies longer than `longReplyChars` (default 8000) are delivered as a standalone dark-mode-friendly HTML document (rendered with full CommonMark + GFM tables), with the first chunk kept in chat as a preview. Configure or disable (`0`) via `longReplyChars`; `/export` exports the whole session via Pi's native `export_html`.
+- 🚑 **One-Tap Error Recovery**: Model errors, empty replies, unexpected Pi exits and extension failures attach an inline keyboard (1h TTL): retry the last prompt, retry on a fallback model (`fallbackModels`), pick another model, restart Pi, or view the redacted gateway log — no typing required.
 - 🎮 **Telegram Companion Extension**:
   - Automatically loads `remote-extension.mjs`, giving the model two tools: `remote_attach` (send local files and generated artifacts back to chat) and `remote_ask` (interactive multiple-choice questions via buttons; aliases `telegram_attach` / `telegram_ask` retained for compatibility).
   - Supports loading custom Pi extensions via config (`-e`), and proxies Pi extension UI requests (`ctx.ui.select` / `ctx.ui.confirm` / `ctx.ui.input`) directly to Telegram.
@@ -68,6 +70,7 @@
 | `/session` or `/status`| Show current session ID, active model, token context usage, and cost |
 | `/agents` | Status of every agent in Herdr, grouped by workspace (📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
+| `/export` | Export the full session as an HTML file (Pi native `export_html`) and send it as a document |
 | `/fork` | Branch the session from a previous user message |
 | `/abort` | Stop current agent execution immediately |
 | `/upgrade` | Self-upgrade the gateway: fast-forward git pull → npm install → offline self-test (auto-rollback on failure) → restart |
@@ -193,6 +196,8 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | Maximum concurrently running Pi processes across all sessions (stops least recently active non-streaming topic when limit is reached) |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
 | `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
+| `longReplyChars` | `REMOTE_PI_LONG_REPLY_CHARS` | `8000` | Replies longer than this are sent as an HTML document (first chunk stays in chat with a note); `0` disables |
+| `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | Comma-separated `provider/modelId` list offering a "Retry with <model>" button on errors (picks the next entry after the current model, wrapping) |
 
 > **Environment Variable Precedence**: Environment variables always take precedence over `config.json`. For `REMOTE_PI_EXTENSIONS`, you can pass a JSON array string (`'["~/my-ext.ts"]'`) or a comma-separated list.
 
