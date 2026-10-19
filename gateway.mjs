@@ -2297,6 +2297,9 @@ class ChatSession {
     try {
       const stats = await this.pi.request("get_session_stats").catch(() => null);
       if (stats?.sessionFile) {
+        // 先报一次当前状态：Herdr 只有收到 report_agent 才把该 pane 视为 agent，session/metadata 才会生效
+        this.herdrReporter.currentSessionPath = stats.sessionFile;
+        this.herdrReporter.reportState(this.isStreaming ? "working" : "idle");
         await this.herdrReporter.reportSession(stats.sessionFile);
         const title = this.threadId ? (basename(this.cwd) || `Topic #${this.threadId}`) : "Telegram";
         await this.herdrReporter.reportMetadata(title);
