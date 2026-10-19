@@ -300,6 +300,7 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 1. **Local Privileges**: Controlling the Telegram Bot grants full access to execute shell commands and modify files with the privileges of your host user account.
 2. **Never Add to Groups**: This bot is exclusively designed for 1-on-1 private chats. Do not add the bot to any group chat.
 3. **Protect Your Config**: `~/.config/remote-pi/config.json` holds your Bot Token. Always ensure permissions are set to `600` (`chmod 600 config.json`).
+4. **Log Privacy & Permissions**: The log file (`~/.local/var/log/remote-pi.log`) is restricted to mode `600` and records content-free metadata only (message kind, length, and tool name; no message text or tool arguments).
 
 ---
 

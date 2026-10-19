@@ -67,7 +67,6 @@ function parseCommand(text) {
 }
 
 function getUpdatePriority(update) {
-  if (update?.stopped_message_generation) return "p0";
   const text = update?.message?.text?.trim();
   if (!text) return "p2";
   const cmd = parseCommand(text);
@@ -1091,17 +1090,6 @@ class Telegram {
     console.log(`${new Date().toISOString()} [tg:call] sendDocument ok in ${Math.round(performance.now() - t0)}ms`);
   }
 
-  async sendDraft(chatId, draftId, text) {
-    const plain = String(text || "");
-    try {
-      return await this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: telegramHtml(plain), parse_mode: "HTML", can_stop: true }, 10_000, 2);
-    } catch (error) {
-      if (!error.message.includes("can't parse entities")) throw error;
-      console.error("Draft HTML parse fallback:", error.message);
-      return this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: plain, can_stop: true }, 10_000, 2);
-    }
-  }
-
   async deleteMessage(chatId, messageId) {
     await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, 10_000, 1);
   }
@@ -1219,7 +1207,7 @@ class Telegram {
       try {
         this.currentPollAc = new AbortController();
         const updates = await this.call("getUpdates", {
-          offset, timeout: 50, allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+          offset, timeout: 50, allowed_updates: ["message", "callback_query"],
         }, 60_000, 1, this.currentPollAc.signal, true);
         this.currentPollAc = null;
         if (!this.polling) break;
@@ -2706,7 +2694,8 @@ class ChatSession {
     if (event.type === "tool_execution_start") {
       if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, sending: false };
       const summary = toolSummary(event.toolName, event.args);
-      console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] start: ${summary}`);
+      // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — do not log tool arguments/paths to disk
+      console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] start: ${event.toolName}`);
       this.toolPanel.tools.push({
         id: event.toolCallId,
         summary,
@@ -3381,9 +3370,15 @@ class Gateway {
     const trimLog = () => stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
     await trimLog();
     setInterval(trimLog, 60 * 60_000).unref();
+    // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — protect log and state permissions
+    await chmod(this.config.logFile, 0o600).catch(() => {});
     await Promise.all([
       mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
       mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
+    ]);
+    await Promise.all([
+      chmod(this.config.stateDir, 0o700).catch(() => {}),
+      chmod(this.config.downloadsDir, 0o700).catch(() => {}),
     ]);
     await this.acquireLock();
     if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test cannot start the gateway");
@@ -3528,12 +3523,14 @@ class Gateway {
       return group.done;
     }
     if (update.message) {
+      if (!this.isAllowed(update.message.from, update.message.chat)) return Promise.resolve();
       const session = this.getOrCreateSession(update.message);
       const next = session.updateChain.then(() => this.handleUpdate(update, session));
       session.updateChain = next.catch((err) => console.error("Telegram update error:", err));
       return next;
     }
     if (update.callback_query) {
+      if (!this.isAllowed(update.callback_query.from, update.callback_query.message?.chat)) return Promise.resolve();
       const token = update.callback_query.data?.startsWith("a:") ? update.callback_query.data.slice(2) : "";
       const action = token ? this.actions.get(token) : null;
       const sessionKey = (!action?.type?.startsWith("herdr_") && action?.sessionKey) ? action.sessionKey : null;
@@ -3548,12 +3545,6 @@ class Gateway {
   async handlePriorityUpdate(update, priority) {
     const t0 = performance.now();
     try {
-      if (update.stopped_message_generation) {
-        console.log(`${new Date().toISOString()} [p0] stopped_message_generation`);
-        const streamingSession = [...this.sessions.values()].find((s) => s.isStreaming) || this.mainSession;
-        await streamingSession.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
-        return;
-      }
       const m = update.message;
       if (!m || !this.isAllowed(m.from, m.chat)) return;
       this.chatReady = true;
@@ -3588,14 +3579,24 @@ class Gateway {
         this.chatReady = true;
         const m = update.message;
         const lag = m.date ? `${Date.now() - m.date * 1000}ms` : "0ms";
-        const preview = (m.text || m.caption || (m.photo ? "[photo]" : m.voice ? "[voice]" : "[file]")).slice(0, 50).replace(/\n/g, " ");
-        console.log(`${new Date().toISOString()} [update] msg #${m.message_id} (tg lag: ${lag}): ${preview}`);
+        const kind = m.text ? "text"
+          : m.photo ? "photo"
+          : m.voice ? "voice"
+          : m.document ? "document"
+          : m.video ? "video"
+          : m.video_note ? "video_note"
+          : m.audio ? "audio"
+          : "other";
+        const textLen = (m.text || m.caption || "").length;
+        const meta = textLen ? `${kind}, ${textLen} chars` : kind;
+        // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — do not log user message content
+        console.log(`${new Date().toISOString()} [update] msg #${m.message_id} (tg lag: ${lag}): ${meta}`);
         await this.handleMessage(update.message, session);
       } else if (update.callback_query) {
         const callback = update.callback_query;
         if (!this.isAllowed(callback.from, callback.message?.chat)) return;
         this.chatReady = true;
-        console.log(`${new Date().toISOString()} [update] callback #${callback.id}: ${callback.data}`);
+        console.log(`${new Date().toISOString()} [update] callback #${callback.id}`);
         await this.handleCallback(callback, session);
       }
     } catch (error) {
@@ -4504,7 +4505,6 @@ async function selfTest() {
     assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
 
     // Test priority command classification and preemptive dispatch
-    assert.equal(getUpdatePriority({ stopped_message_generation: true }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/abort" } }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/new" } }), "p0");
     assert.equal(getUpdatePriority({ message: { text: "/restart" } }), "p0");
@@ -4528,13 +4528,13 @@ async function selfTest() {
     };
 
     // Dispatch slow P2 update, followed immediately by P0
-    gw.dispatchUpdate({ message: { text: "/sh sleep 10" } });
+    gw.dispatchUpdate({ message: { from: { id: 1 }, text: "/sh sleep 10" } });
     await sleep(5);
     assert.equal(p2Started, true);
     assert.equal(p2Finished, false);
 
     // P0 should execute immediately without waiting for P2 to finish
-    gw.dispatchUpdate({ message: { text: "/abort" } });
+    gw.dispatchUpdate({ message: { from: { id: 1 }, text: "/abort" } });
     assert.equal(p0Executed, true);
     assert.equal(p2Finished, false);
 
@@ -4567,14 +4567,9 @@ async function selfTest() {
       assert.ok(errs.some((e) => e.includes("preview update failed")), "flushDraft 失败应留日志");
     }
 
-    // 回归（审计修复 L4）：handleUpdate 不再含 stopped_message_generation 死分支（p0 必然先拦截）
+    // poll allowed_updates only includes message and callback_query
     {
-      const calls = [];
-      gw.mainSession.pi.proc = {};
-      gw.mainSession.pi.request = async (type) => { calls.push(type); return {}; };
-      await gw.handleUpdate({ stopped_message_generation: true, update_id: 424242 });
-      assert.deepEqual(calls, [], "handleUpdate 不应再处理 stopped_message_generation");
-      gw.mainSession.pi.proc = undefined;
+      assert.equal(Telegram.prototype.poll.toString().match(/allowed_updates:\s*(\[[^\]]+\])/)?.[1], '["message", "callback_query"]');
     }
 
     // Test /new preserves last effective model
@@ -6029,6 +6024,74 @@ async function selfTest() {
     const p2 = gwSendOne.telegram.send("1", "second-send");
     await Promise.all([p1, p2]);
     assert.deepEqual(order, ["first-sendOne", "second-send"], "sendOne 应与 send 一样走输出队列且保持顺序");
+  }
+
+  // 17. 回归：未授权的 Topic 消息不创建会话/状态/回复
+  {
+    const tmpAuthDir = join(tmpdir(), `test-auth-${Date.now()}`);
+    await mkdir(tmpAuthDir, { recursive: true, mode: 0o700 });
+    const gwAuth = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpAuthDir });
+    const sends = [];
+    gwAuth.telegram.send = async (...args) => { sends.push(args); };
+    gwAuth.telegram.call = async (...args) => { sends.push(args); };
+    await gwAuth.dispatchUpdate({
+      update_id: 999,
+      message: {
+        message_id: 1,
+        from: { id: 2 },
+        chat: { id: 2, type: "private" },
+        message_thread_id: 777,
+        is_topic_message: true,
+        text: "hello from intruder",
+      },
+    });
+    assert.equal(gwAuth.sessions.has("t:777"), false);
+    assert.equal(gwAuth.state.topics?.[777], undefined);
+    assert.equal(sends.length, 0);
+
+    // Also verify callback_query from non-allowed user is dropped without session lookup
+    await gwAuth.dispatchUpdate({
+      update_id: 1000,
+      callback_query: {
+        id: "cq-1",
+        from: { id: 2 },
+        message: { chat: { id: 2, type: "private" } },
+        data: "some_data",
+      },
+    });
+    assert.equal(sends.length, 0);
+    await rm(tmpAuthDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 18. 回归：启动时收紧日志与状态目录权限
+  {
+    const tmpPermDir = join(tmpdir(), `test-perm-${Date.now()}`);
+    const stateDir = join(tmpPermDir, "state");
+    const dlDir = join(tmpPermDir, "dl");
+    const logFile = join(tmpPermDir, "test.log");
+    await mkdir(stateDir, { recursive: true, mode: 0o755 });
+    await mkdir(dlDir, { recursive: true, mode: 0o755 });
+    await writeFile(logFile, "log data", { mode: 0o644 });
+
+    const gw = new Gateway({
+      allowedUserId: "1",
+      botToken: "1:x",
+      stateDir,
+      downloadsDir: dlDir,
+      logFile,
+    });
+    await assert.rejects(
+      () => gw.start(),
+      /Self-test cannot start the gateway/,
+      "start() 应在完成权限收紧与锁获取后于自测模式下抛出"
+    );
+
+    assert.equal((await stat(logFile)).mode & 0o777, 0o600);
+    assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
+    assert.equal((await stat(dlDir)).mode & 0o777, 0o700);
+
+    gw.stop();
+    await rm(tmpPermDir, { recursive: true, force: true }).catch(() => {});
   }
 
   console.log("self-test: ok");

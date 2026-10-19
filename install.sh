@@ -44,7 +44,17 @@ install_command() {
     ln -sfn "$ROOT/remote-pi.ts" "$PI_EXTENSION"
 }
 
+secure_log() {
+    # ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — protect log directory and file permissions
+    mkdir -p "$LOG_DIR"
+    chmod 700 "$LOG_DIR"
+    [[ -f "$LOG_FILE" ]] || (umask 077 && touch "$LOG_FILE")
+    chmod 600 "$LOG_FILE"
+}
+
 setup_plist() {
+    secure_log
+
     local esc_node esc_gateway esc_root esc_log
     esc_node="$(xml_escape "$NODE")"
     esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
@@ -128,6 +138,7 @@ start() {
         return
     fi
     [[ -f "$PLIST" ]] || { echo "Missing $PLIST; run $ROOT/install.sh install" >&2; exit 1; }
+    secure_log
     launchctl bootstrap "$DOMAIN" "$PLIST"
     sleep 2
     status
@@ -143,6 +154,7 @@ restart() {
         launchctl kickstart -k "$DOMAIN/$LABEL"
     else
         [[ -f "$PLIST" ]] || { echo "Missing $PLIST; run $ROOT/install.sh install" >&2; exit 1; }
+        secure_log
         launchctl bootstrap "$DOMAIN" "$PLIST"
     fi
     sleep 2
