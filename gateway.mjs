@@ -3645,7 +3645,8 @@ class ChatSession {
   }
 
   async handleUiRequest(request) {
-    if (request.method !== "notify") {
+    // 只有需要用户作答的对话框才算 blocked；setStatus/setWidget/setTitle 等是无需应答的单向 UI 更新
+    if (["select", "confirm", "input", "editor"].includes(request.method)) {
       this.herdrReporter?.reportState("blocked", request.title || request.message || "Waiting for input");
     }
     if (["select", "confirm"].includes(request.method)) {
@@ -4557,7 +4558,7 @@ class Gateway {
   async handleTopicCommand(session, argument) {
     const me = await this.telegram.call("getMe");
     if (!me?.has_topics_enabled) {
-      return session.send("Topics are not enabled for this bot. Please enable topic mode in @BotFather:\n/mybots → select your bot → Bot Settings → Topics → Turn on.");
+      return session.send("Topics are not enabled for this bot. Enable Threaded Mode in the @BotFather Mini App:\nopen @BotFather → tap Open → select your bot → Bot Settings → Threads Settings → Threaded Mode.");
     }
     const target = argument ? resolvePath(argument.trim(), session.cwd) : session.cwd;
     let realTarget, targetStat;

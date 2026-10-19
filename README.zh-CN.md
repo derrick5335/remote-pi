@@ -216,7 +216,7 @@ pi-remote-gateway stop     # 停止后台服务
 
 1. **在 @BotFather 中开启 Topic 模式**：
    - 在 Telegram 打开 [@BotFather](https://t.me/BotFather)。
-   - 发送 `/mybots` → 选择你的 Bot → **Bot Settings** → **Topics** → **Turn on**。
+   - 点击 **Open** 打开 BotFather Mini App → 选择你的 Bot → **Bot Settings** → **Threads Settings** → 开启 **Threaded Mode**（经典 `/mybots` 文字菜单里没有这个选项）。
 2. **创建 Topic 会话**：
    - 发送 `/topic [路径]` 为指定项目目录创建独立 Topic；不带参数则复用当前会话的工作目录。
    - 每个 Topic 拥有完全独立的 Pi 进程、工作区和会话历史（存储在 `sessionDir + "-t<threadId>"`，多 Topic 访问同一项目也不冲突）。

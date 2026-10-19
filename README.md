@@ -216,7 +216,7 @@ The gateway supports running multiple independent Pi sessions in parallel using 
 
 1. **Enable Topics in @BotFather**:
    - Open [@BotFather](https://t.me/BotFather) on Telegram.
-   - Send `/mybots` → select your bot → **Bot Settings** → **Topics** → **Turn on**.
+   - Tap **Open** to launch the BotFather Mini App → select your bot → **Bot Settings** → **Threads Settings** → enable **Threaded Mode** (the classic `/mybots` text menu does not expose this setting).
 2. **Create a Topic Session**:
    - Send `/topic [path]` to spin up an independent topic for a project directory. Without an argument, it uses the current session's workspace.
    - Each topic gets its own isolated Pi process, workspace, and session history (`sessionDir + "-t<threadId>"`).
