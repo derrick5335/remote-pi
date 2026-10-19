@@ -37,6 +37,7 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /clone              Clone the current branch
 /compact [focus]    Compact the context
 /export             Export as HTML
+/handoff            Hand off session to desktop Pi
 /abort              Stop current task (queue kept)
 /abort clear        Stop and clear the queue
 /restart            Restart the gateway
@@ -53,7 +54,9 @@ const BOT_COMMANDS = [
   ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
   ["session", "Session & cost"], ["agents", "Herdr agent status"],
   ["fork", "Branch from history"], ["clone", "Clone current branch"],
-  ["compact", "Compact context"], ["export", "Export session"], ["abort", "Stop task (queue kept)"],
+  ["compact", "Compact context"], ["export", "Export session"],
+  ["handoff", "Hand off session to desktop"],
+  ["abort", "Stop task (queue kept)"],
   ["restart", "Restart gateway"],
   ["upgrade", "Upgrade gateway to latest"],
   ["queue", "View or clear queue"],
@@ -388,7 +391,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -399,16 +402,136 @@ function loadState(stateDir) {
         }
       }
     }
+    const handoffs = {};
+    if (typeof raw.handoffs === "object" && raw.handoffs !== null) {
+      for (const [key, info] of Object.entries(raw.handoffs)) {
+        if (typeof info?.sessionFile === "string" && existsSync(info.sessionFile)) {
+          handoffs[key] = {
+            sessionFile: info.sessionFile,
+            at: typeof info.at === "number" ? info.at : Date.now(),
+          };
+        }
+      }
+    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
         ? raw.recentProjects.filter((p) => typeof p === "string" && existsSync(p))
         : [],
       topics,
+      handoffs,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {} };
+    return { cwd: null, recentProjects: [], topics: {}, handoffs: {} };
   }
+}
+
+function shellQuote(str) {
+  return `'${String(str).replaceAll("'", "'\\''")}'`;
+}
+
+function formatRelativeTime(timestamp) {
+  const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (diffSec < 60) return "just now";
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+function getDesktopSessionDir() {
+  return process.env.PI_CODING_AGENT_SESSION_DIR || join(homedir(), ".pi", "agent", "sessions");
+}
+
+async function readFirstLine(filePath) {
+  let fh;
+  try {
+    fh = await open(filePath, "r");
+    const buf = Buffer.alloc(4096);
+    const { bytesRead } = await fh.read(buf, 0, 4096, 0);
+    const str = buf.toString("utf8", 0, bytesRead);
+    const nl = str.indexOf("\n");
+    return nl === -1 ? str : str.slice(0, nl);
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+}
+
+async function parseSessionHeader(filePath) {
+  try {
+    const firstLine = await readFirstLine(filePath);
+    if (!firstLine) return null;
+    const header = JSON.parse(firstLine);
+    return header?.type === "session" ? header : null;
+  } catch {
+    return null;
+  }
+}
+
+async function parseSessionPreview(filePath) {
+  try {
+    const fh = await open(filePath, "r");
+    const buf = Buffer.alloc(16384);
+    const { bytesRead } = await fh.read(buf, 0, 16384, 0);
+    await fh.close();
+    const raw = buf.toString("utf8", 0, bytesRead);
+    let title = "";
+    for (const line of raw.split("\n", 20)) {
+      if (!line) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch {
+        const m = line.match(/"role"\s*:\s*"user"[\s\S]*?"text"\s*:\s*"([^"\\]{1,60})/);
+        if (m) title = m[1];
+        continue;
+      }
+      if (entry.type === "session_info" && entry.name) title = entry.name;
+      if (!title && entry.type === "message" && entry.message?.role === "user") {
+        title = extractText(entry.message.content).slice(0, 60);
+      }
+      if (title) break;
+    }
+    return title;
+  } catch {
+    return "";
+  }
+}
+
+function encodeCwdSessionDir(baseDir, cwd) {
+  const slug = cwd.replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-");
+  return join(baseDir, `--${slug}--`);
+}
+
+async function scanDesktopSessions(desktopDir, targetCwd, limit = 10) {
+  if (!desktopDir || !targetCwd) return [];
+  const dir = encodeCwdSessionDir(desktopDir, targetCwd);
+  if (!existsSync(dir)) return [];
+  let names;
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".jsonl"));
+  } catch {
+    return [];
+  }
+  const matched = [];
+  for (const name of names) {
+    const path = join(dir, name);
+    try {
+      const header = await parseSessionHeader(path);
+      if (header?.cwd === targetCwd) {
+        const fileStat = await stat(path).catch(() => null);
+        if (fileStat) {
+          matched.push({ path, mtime: fileStat.mtimeMs, id: header.id });
+        }
+      }
+    } catch {}
+  }
+  matched.sort((a, b) => b.mtime - a.mtime);
+  const sliced = matched.slice(0, limit);
+  return Promise.all(sliced.map(async (item) => {
+    const title = (await parseSessionPreview(item.path)) || basename(item.path);
+    return { ...item, title };
+  }));
 }
 
 function resolveSessionDir(stateDir, cwd) {
@@ -1220,6 +1343,9 @@ class PiRpc {
       this.proc.once("spawn", resolveSpawn);
       this.proc.once("error", reject);
     });
+    if (typeof this.config.onStarted === "function") {
+      this.config.onStarted();
+    }
     this.proc.stdin.on("error", () => {}); // EPIPE 竞态（kill 时在途写入）；pending 由 close 路径 reject
 
     let buffer = "";
@@ -1368,7 +1494,15 @@ class ChatSession {
       cwd: this.cwd,
       sessionDir: this.sessionDir,
       threadId: this.threadId,
-      beforeStart: () => this.gateway.acquireSessionSlot(this),
+      beforeStart: async () => {
+        if (this.handoff) {
+          throw new Error("This session is on the desktop — tap Take back first.");
+        }
+        await this.gateway.acquireSessionSlot(this);
+      },
+      onStarted: () => {
+        this.gateway.startHerdrWatcher();
+      },
       getExcludePaneIds: () => this.gateway.getOwnedPaneIds(this),
     };
     return new PiRpc(
@@ -1376,6 +1510,10 @@ class ChatSession {
       (event) => this.queueEvent(event),
       (exit) => this.handlePiExit(exit),
     );
+  }
+
+  get handoff() {
+    return this.gateway.state.handoffs?.[this.key] ?? null;
   }
 
   touchActivity() {
@@ -1455,9 +1593,11 @@ class ChatSession {
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
     for (const group of this.mediaGroups.values()) {
-      if (group.timer) clearTimeout(group.timer);
-      group.cancelled = true;
-      if (group.resolveReady) group.resolveReady();
+      if (typeof group === "object" && group !== null) {
+        if (group.timer) clearTimeout(group.timer);
+        group.cancelled = true;
+        if (group.resolveReady) group.resolveReady();
+      }
     }
     this.mediaGroups.clear();
     for (const [key, action] of this.gateway.actions) {
@@ -1547,6 +1687,7 @@ class ChatSession {
         return this.send(`✅ Session name: ${argument}`);
       }
       case "session": case "status": return this.showSession();
+      case "handoff": return this.handleHandoff();
       case "agents": return this.gateway.showHerdrAgents();
       case "fork": return this.showForks();
       case "clone": {
@@ -1678,6 +1819,7 @@ class ChatSession {
   }
 
   async handleMediaGroup(messages) {
+    if (this.handoff) return this.sendHandoffPrompt();
     const mediaList = await Promise.all(messages.map((m) => this.gateway.extractMedia(m)));
     const files = [];
     const images = [];
@@ -1831,27 +1973,11 @@ class ChatSession {
     const sorted = files.filter(Boolean).sort((a, b) => b.mtime - a.mtime).slice(0, 15);
     const parseHead = async ({ path, name, mtime }) => {
       try {
-        const fh = await open(path, "r");
-        const buf = Buffer.alloc(16384);
-        const { bytesRead } = await fh.read(buf, 0, 16384, 0);
-        await fh.close();
-        const raw = buf.toString("utf8", 0, bytesRead);
-        let header;
-        let title = "";
-        for (const line of raw.split("\n", 20)) {
-          if (!line) continue;
-          let entry;
-          try { entry = JSON.parse(line); } catch {
-            const m = line.match(/"role"\s*:\s*"user"[\s\S]*?"text"\s*:\s*"([^"\\]{1,60})/);
-            if (m) title = m[1];
-            continue;
-          }
-          if (entry.type === "session") header = entry;
-          if (entry.type === "session_info" && entry.name) title = entry.name;
-          if (!title && entry.type === "message" && entry.message?.role === "user") title = extractText(entry.message.content).slice(0, 60);
-          if (header && title) break;
+        const header = await parseSessionHeader(path);
+        if (header?.cwd === this.cwd) {
+          const title = (await parseSessionPreview(path)) || name;
+          return { path, id: header.id, title, mtime };
         }
-        if (header?.cwd === this.cwd) return { path, id: header.id, title: title || name, mtime };
       } catch (error) {
         console.error(`Skipping session ${path}:`, error.message);
       }
@@ -1862,14 +1988,190 @@ class ChatSession {
 
   async showSessions() {
     const sessions = (await this.sessionFiles()).slice(0, 12);
-    if (!sessions.length) return this.send("No past sessions for this directory yet.");
-    return this.send("Pick a session:", this.keyboard(sessions.map((session) => ({
+    const desktopSessions = await scanDesktopSessions(getDesktopSessionDir(), this.cwd, 10);
+    if (!sessions.length && !desktopSessions.length) return this.send("No past sessions for this directory yet.");
+    const items = sessions.map((session) => ({
       label: session.title,
       action: { type: "resume", path: session.path },
+    }));
+    if (desktopSessions.length > 0) {
+      items.push({
+        label: "🖥 Desktop sessions",
+        action: { type: "desktop_sessions" },
+      });
+    }
+    return this.send("Pick a session:", this.keyboard(items));
+  }
+
+  async showDesktopSessions() {
+    const sessions = await scanDesktopSessions(getDesktopSessionDir(), this.cwd, 10);
+    if (!sessions.length) return this.send("No desktop sessions found for this directory.");
+    return this.send("Pick a desktop session:", this.keyboard(sessions.map((session) => ({
+      label: `${formatRelativeTime(session.mtime)} · ${session.title}`,
+      action: { type: "pick_desktop_session", path: session.path },
     }))));
   }
 
+  async confirmDesktopSession(sessionPath) {
+    const keyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm", callback_data: this.action({ type: "confirm_desktop_resume", path: sessionPath, confirmed: true }) },
+            { text: "Cancel", callback_data: this.action({ type: "confirm_desktop_resume", path: sessionPath, confirmed: false }) },
+          ],
+        ],
+      },
+    };
+    return this.send("Quit the desktop Pi on this session first", keyboard);
+  }
+
+  async handleConfirmDesktopResume(sessionPath, confirmed) {
+    if (!confirmed) {
+      return this.send("Resume cancelled");
+    }
+    if (this.gateway.state.handoffs?.[this.key]) {
+      delete this.gateway.state.handoffs[this.key];
+      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+    }
+    if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+    this.resetSessionState();
+    const result = await this.pi.request("switch_session", { sessionPath });
+    if (!result.cancelled) {
+      const state = await this.pi.request("get_state").catch(() => null);
+      if (state?.model?.provider && state?.model?.id) {
+        this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+      }
+    }
+    return this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
+  }
+
+  async handleHandoff() {
+    if (this.isStreaming) {
+      return this.send("Cannot hand off while Pi is working. Send /abort first.");
+    }
+    if (this.handoff) {
+      return this.sendHandoffPrompt();
+    }
+    const stats = await this.pi.request("get_session_stats");
+    const sessionFile = stats?.sessionFile;
+    if (!sessionFile) return this.send("No active session file to hand off.");
+    this.stop();
+    const at = Date.now();
+    this.gateway.state.handoffs = {
+      ...this.gateway.state.handoffs,
+      [this.key]: { sessionFile, at },
+    };
+    await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+    const cmd = `cd ${shellQuote(this.cwd)} && pi --session ${shellQuote(sessionFile)}`;
+    return this.send(`🖥 Continue on desktop:\n\`\`\`\n${cmd}\n\`\`\``, this.keyboard([
+      { label: "⬅️ Take back", action: { type: "take_back" } },
+    ]));
+  }
+
+  async sendHandoffPrompt() {
+    return this.send("This session is on the desktop. Quit the desktop Pi, then tap Take back.", this.keyboard([
+      { label: "⬅️ Take back", action: { type: "take_back" } },
+      { label: "✨ New session here", action: { type: "new_session_here" } },
+    ]));
+  }
+
+  async checkHerdrWorkingPi() {
+    try {
+      let agentList;
+      if (this.gateway.herdrWatcher) {
+        agentList = await this.gateway.herdrWatcher.cliJson(["agent", "list"]);
+      } else {
+        const bin = process.env.HERDR_BIN_PATH || "herdr";
+        const out = await runCommand(bin, ["agent", "list"], { timeout: 3000 });
+        agentList = JSON.parse(out).result;
+      }
+      const agents = agentList?.agents ?? [];
+      const ownPanes = new Set(this.gateway.getOwnedPaneIds());
+      return agents.some((a) => !ownPanes.has(a.pane_id) && a.agent === "pi" && a.cwd === this.cwd && a.agent_status === "working");
+    } catch {
+      return false;
+    }
+  }
+
+  async handleTakeBack(confirmed = false) {
+    const handoffInfo = this.handoff;
+    if (!handoffInfo?.sessionFile) {
+      return this.send("No handoff session file found.");
+    }
+    if (!confirmed && (await this.checkHerdrWorkingPi())) {
+      const keyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "Confirm", callback_data: this.action({ type: "take_back", confirmed: true }) },
+              { text: "Cancel", callback_data: this.action({ type: "take_back_cancel" }) },
+            ],
+          ],
+        },
+      };
+      return this.send("⚠️ A desktop Pi agent is currently working in this directory. Taking back may cause concurrent file writes.\n\nTake back anyway?", keyboard);
+    }
+
+    const sessionFile = handoffInfo.sessionFile;
+    if (this.gateway.state.handoffs) {
+      delete this.gateway.state.handoffs[this.key];
+      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+    }
+
+    this.resetSessionState();
+    this.pi = this.createPi();
+    await this.pi.start();
+    const result = await this.pi.request("switch_session", { sessionPath: sessionFile });
+    if (!result?.cancelled) {
+      const state = await this.pi.request("get_state").catch(() => null);
+      if (state?.model?.provider && state?.model?.id) {
+        this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+      }
+    }
+    const last = await this.pi.request("get_last_assistant_text").catch(() => null);
+    const rawText = (last?.text || "").trim();
+    const preview = rawText ? rawText.split("\n").filter(Boolean)[0] || "" : "";
+    return this.send(preview ? `✅ Back on Telegram\n\n${preview}` : "✅ Back on Telegram");
+  }
+
+  async handleNewSessionHere() {
+    if (this.gateway.state.handoffs) {
+      delete this.gateway.state.handoffs[this.key];
+      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+    }
+    this.resetSessionState();
+    this.pi = this.createPi();
+    await this.pi.start();
+    await this.pi.request("new_session");
+    const state = await this.pi.request("get_state").catch(() => null);
+    const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
+    return this.send(text);
+  }
+
+  topicSummaryLines() {
+    if (this.threadId !== null) return [];
+    const topicSessions = [...this.gateway.sessions.values()].filter((s) => s.threadId !== null);
+    if (!topicSessions.length) return ["", "Topics: (none)"];
+    const lines = ["", "Topics:"];
+    for (const ts of topicSessions) {
+      const status = ts.handoff ? "handed off" : ts.isStreaming ? "running" : ts.pi?.proc ? "idle" : "stopped";
+      const name = basename(ts.cwd) || `topic-${ts.threadId}`;
+      lines.push(`• ${name} (${status}) — ${ts.cwd}`);
+    }
+    return lines;
+  }
+
   async showSession() {
+    if (this.handoff) {
+      const lines = [
+        `State: handed off to desktop`,
+        `File: ${this.handoff.sessionFile}`,
+        `Handoff: ${new Date(this.handoff.at).toISOString()}`,
+        ...this.topicSummaryLines(),
+      ];
+      return this.send(lines.join("\n"));
+    }
     const [state, stats] = await Promise.all([this.pi.request("get_state"), this.pi.request("get_session_stats")]);
     const model = state.model ? `${state.model.provider}/${state.model.id}` : "none";
     const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "n/a";
@@ -1877,20 +2179,8 @@ class ChatSession {
       `Name: ${state.sessionName || "(unnamed)"}`, `Model: ${model}`, `Thinking: ${state.thinkingLevel}`,
       `State: ${state.isStreaming ? "working" : "idle"}`, `Messages: ${stats.totalMessages}`, `Context: ${context}`,
       `Cost: $${Number(stats.cost || 0).toFixed(4)}`, `Session: ${state.sessionId}`, `File: ${state.sessionFile || "not persisted"}`,
+      ...this.topicSummaryLines(),
     ];
-    if (this.threadId === null) {
-      const topicSessions = [...this.gateway.sessions.values()].filter((s) => s.threadId !== null);
-      if (topicSessions.length) {
-        lines.push("", "Topics:");
-        for (const ts of topicSessions) {
-          const status = ts.isStreaming ? "running" : ts.pi?.proc ? "idle" : "stopped";
-          const name = basename(ts.cwd) || `topic-${ts.threadId}`;
-          lines.push(`• ${name} (${status}) — ${ts.cwd}`);
-        }
-      } else {
-        lines.push("", "Topics: (none)");
-      }
-    }
     await this.send(lines.join("\n"));
   }
 
@@ -1912,7 +2202,23 @@ class ChatSession {
     } else if (action.type === "thinking") {
       await this.pi.request("set_thinking_level", { level: action.level });
       await this.send(`✅ thinking: ${action.level}`);
+    } else if (action.type === "take_back") {
+      await this.handleTakeBack(action.confirmed);
+    } else if (action.type === "take_back_cancel") {
+      await this.send("Take back cancelled");
+    } else if (action.type === "new_session_here") {
+      await this.handleNewSessionHere();
+    } else if (action.type === "desktop_sessions") {
+      await this.showDesktopSessions();
+    } else if (action.type === "pick_desktop_session") {
+      await this.confirmDesktopSession(action.path);
+    } else if (action.type === "confirm_desktop_resume") {
+      await this.handleConfirmDesktopResume(action.path, action.confirmed);
     } else if (action.type === "resume") {
+      if (this.gateway.state.handoffs?.[this.key]) {
+        delete this.gateway.state.handoffs[this.key];
+        await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+      }
       if (this.isStreaming) await this.pi.request("abort").catch(() => {});
       this.resetSessionState();
       const result = await this.pi.request("switch_session", { sessionPath: action.path });
@@ -2330,15 +2636,19 @@ class Gateway {
     this.me = me;
     try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
     catch (error) { if (!error.message.includes("chat not found")) throw error; }
-    await this.mainSession.pi.start();
-    const state = await this.mainSession.pi.request("get_state");
-    if (state?.model?.provider && state?.model?.id) {
-      this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    let state;
+    if (!this.mainSession.handoff) {
+      await this.mainSession.pi.start();
+      state = await this.mainSession.pi.request("get_state");
+      if (state?.model?.provider && state?.model?.id) {
+        this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
+      }
     }
     await this.registerBotCommands();
     this.startHerdrWatcher();
     this.startIdleStopTimer();
-    console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
+    const sessionInfo = this.mainSession.handoff ? "handed off" : (state?.sessionId ? `session ${state.sessionId}` : "ready");
+    console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi ${sessionInfo}`);
     await this.telegram.poll((update) => this.dispatchUpdate(update));
   }
 
@@ -2382,8 +2692,17 @@ class Gateway {
     if (update.message?.media_group_id && this.isAllowed(update.message.from, update.message.chat)) {
       const m = update.message;
       this.chatReady = true;
-      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
       const session = this.getOrCreateSession(m);
+      if (session.handoff) {
+        const key = `${this.chatId}:${m.media_group_id}`;
+        if (!session.mediaGroups.has(key)) {
+          session.mediaGroups.set(key, { cancelled: true, messages: [] });
+          setTimeout(() => session.mediaGroups.delete(key), 2000).unref?.();
+          return session.sendHandoffPrompt();
+        }
+        return;
+      }
+      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
       if (session.pendingUi) return;
       const key = `${this.chatId}:${m.media_group_id}`;
       let group = session.mediaGroups.get(key);
@@ -2516,6 +2835,18 @@ class Gateway {
   async handleMessage(message, session = this.getOrCreateSession(message)) {
     session.touchActivity();
 
+    if (session.handoff) {
+      const text = message.text?.trim();
+      const command = text ? parseCommand(text) : null;
+      if (command && ["status", "session", "help", "start", "agents", "commands"].includes(command.name)) {
+        // allow through to handleCommand below
+      } else if (command && ["new", "reset"].includes(command.name)) {
+        return session.handleNewSessionHere();
+      } else {
+        return session.sendHandoffPrompt();
+      }
+    }
+
     if (session.pendingUi && !message.text?.startsWith("/")) {
       const pending = session.pendingUi;
       session.pendingUi = null;
@@ -2578,9 +2909,13 @@ class Gateway {
 
   async registerBotCommands() {
     const t0 = performance.now();
-    const data = await this.mainSession.pi.request("get_commands");
+    let rpcCommands = [];
+    if (!this.mainSession.handoff) {
+      const data = await this.mainSession.pi.request("get_commands").catch(() => null);
+      rpcCommands = data?.commands || [];
+    }
     const commands = [...BOT_COMMANDS];
-    for (const command of data.commands) {
+    for (const command of rpcCommands) {
       const telegramName = telegramCommandName(command);
       if (!telegramName || commands.some((item) => item.command === telegramName)) continue;
       if (!/^[a-z0-9_]{1,32}$/.test(telegramName)) continue;
@@ -2619,7 +2954,9 @@ class Gateway {
   }
 
   startHerdrWatcher() {
-    const env = this.mainSession.pi.herdrEnv;
+    if (this.herdrWatcher) return;
+    const env = [...this.sessions.values()].find((s) => s.pi?.herdrEnv?.HERDR_BIN_PATH)?.pi?.herdrEnv
+      || this.mainSession.pi?.herdrEnv;
     if (this.config.herdr === false || !env?.HERDR_BIN_PATH || !env?.HERDR_SOCKET_PATH) return;
     this.herdrWatcher = new HerdrWatcher({
       bin: env.HERDR_BIN_PATH,
@@ -4009,6 +4346,169 @@ async function selfTest() {
 
   assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");
   assert.ok(HELP.includes("/close") && BOT_COMMANDS.some((c) => c.command === "close"), "/close registered");
+  assert.ok(HELP.includes("/handoff") && BOT_COMMANDS.some((c) => c.command === "handoff"), "/handoff registered");
+
+  // shell single-quote helper
+  {
+    assert.equal(shellQuote("/path/to/project"), "'/path/to/project'");
+    assert.equal(shellQuote("/path/to/it's project"), "'/path/to/it'\\''s project'");
+    assert.equal(shellQuote("foo'bar'baz"), "'foo'\\''bar'\\''baz'");
+  }
+
+  // handoffs persistence in loadState (keeps existing file, drops missing)
+  {
+    const tmpStateDir = join(tmpdir(), `test-handoff-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true, mode: 0o700 });
+    const existingFile = join(tmpStateDir, "existing.jsonl");
+    const missingFile = join(tmpStateDir, "missing.jsonl");
+    await writeFile(existingFile, '{"type":"session"}\n', { mode: 0o600 });
+    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
+      cwd: tmpStateDir,
+      recentProjects: [tmpStateDir],
+      topics: {},
+      handoffs: {
+        "main": { sessionFile: existingFile, at: 12345 },
+        "t:1": { sessionFile: missingFile, at: 67890 },
+      },
+    }), { mode: 0o600 });
+
+    const state = loadState(tmpStateDir);
+    assert.deepEqual(state.handoffs["main"], { sessionFile: existingFile, at: 12345 });
+    assert.equal(state.handoffs["t:1"], undefined, "missing sessionFile must be dropped");
+  }
+
+  // desktop session filter: given temp dir with encoded subdir layout (--<cwd>--), only matching cwd session is returned
+  {
+    const tmpDesktopDir = join(tmpdir(), `test-desktop-sessions-${Date.now()}`);
+    const matchDir = encodeCwdSessionDir(tmpDesktopDir, "/test/my-project");
+    const otherDir = encodeCwdSessionDir(tmpDesktopDir, "/test/other-project");
+    await mkdir(matchDir, { recursive: true, mode: 0o700 });
+    await mkdir(otherDir, { recursive: true, mode: 0o700 });
+
+    const matchFile = join(matchDir, "match.jsonl");
+    const otherFile = join(otherDir, "other.jsonl");
+
+    await writeFile(matchFile, [
+      JSON.stringify({ type: "session", version: 3, id: "s1", timestamp: "2026-10-19T00:00:00Z", cwd: "/test/my-project" }),
+      JSON.stringify({ type: "message", id: "m1", message: { role: "user", content: "Hello from matching session" } }),
+    ].join("\n") + "\n");
+
+    await writeFile(otherFile, [
+      JSON.stringify({ type: "session", version: 3, id: "s2", timestamp: "2026-10-19T00:00:00Z", cwd: "/test/other-project" }),
+      JSON.stringify({ type: "message", id: "m2", message: { role: "user", content: "Hello from other session" } }),
+    ].join("\n") + "\n");
+
+    const matched = await scanDesktopSessions(tmpDesktopDir, "/test/my-project", 10);
+    assert.equal(matched.length, 1, "Only matching cwd session should be returned");
+    assert.equal(matched[0].path, matchFile);
+    assert.equal(matched[0].id, "s1");
+    assert.equal(matched[0].title, "Hello from matching session");
+
+    const notFound = await scanDesktopSessions(tmpDesktopDir, "/test/nonexistent", 10);
+    assert.deepEqual(notFound, []);
+  }
+
+  // central handoff guard in beforeStart prevents spawning Pi
+  {
+    const tmpDir = join(tmpdir(), `test-handoff-guard-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+    const gwGuard = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir });
+    const sess = gwGuard.mainSession;
+    gwGuard.state.handoffs = { [sess.key]: { sessionFile: join(tmpDir, "s.jsonl"), at: Date.now() } };
+    assert.ok(sess.handoff, "Handoff must be active");
+    await assert.rejects(
+      () => sess.pi.request("get_state"),
+      /This session is on the desktop — tap Take back first\./
+    );
+    assert.equal(sess.pi.proc, null, "Pi process must never spawn while session is handed off");
+  }
+
+  // startHerdrWatcher idempotency & late start
+  {
+    const gwWatcher = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: tmpdir() });
+    assert.equal(gwWatcher.herdrWatcher, null);
+    gwWatcher.startHerdrWatcher();
+    assert.equal(gwWatcher.herdrWatcher, null, "Watcher must not start without herdrEnv");
+
+    gwWatcher.mainSession.pi.herdrEnv = { HERDR_BIN_PATH: "/bin/echo", HERDR_SOCKET_PATH: "/tmp/fake.sock" };
+    gwWatcher.startHerdrWatcher();
+    assert.ok(gwWatcher.herdrWatcher, "HerdrWatcher must start once env is available");
+    const watcherInstance = gwWatcher.herdrWatcher;
+    gwWatcher.startHerdrWatcher();
+    assert.equal(gwWatcher.herdrWatcher, watcherInstance, "startHerdrWatcher must be idempotent");
+    gwWatcher.herdrWatcher.stop();
+  }
+
+  // /handoff unit flow checks
+  {
+    const tmpDir = join(tmpdir(), `test-gw-handoff-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+    const fakeSessionFile = join(tmpDir, "fake-session.jsonl");
+    await writeFile(fakeSessionFile, '{"type":"session","cwd":"/fake/cwd"}\n', { mode: 0o600 });
+
+    const gwHandoff = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: "/fake/cwd" });
+    const sess = gwHandoff.mainSession;
+    let sent = [];
+    sess.send = async (text, extra) => { sent.push({ text, extra }); return {}; };
+
+    // 1. Refuse while streaming
+    sess.isStreaming = true;
+    await sess.handleHandoff();
+    assert.ok(sent[0].text.includes("/abort"), "Refuses handoff while streaming");
+    assert.equal(sess.handoff, null);
+    sess.isStreaming = false;
+
+    // 2. Successful handoff
+    sess.pi.request = async (cmd) => {
+      if (cmd === "get_session_stats") return { sessionFile: fakeSessionFile };
+      throw new Error(`Unexpected command: ${cmd}`);
+    };
+    await sess.handleHandoff();
+    assert.ok(sess.handoff, "Handoff mark must be set");
+    assert.equal(sess.handoff.sessionFile, fakeSessionFile);
+    assert.ok(sent[1].text.includes("Continue on desktop:"), "Reply must include copyable desktop command");
+    assert.ok(sent[1].text.includes(fakeSessionFile));
+
+    // 2b. /status while handed off does not restart Pi
+    await sess.showSession();
+    assert.ok(sent[2].text.includes("handed off to desktop"));
+
+    // 3. Message while handed off shows prompt and does not send to Pi
+    let promptSent = false;
+    sess.pi.request = async () => { promptSent = true; return {}; };
+    await gwHandoff.handleMessage({ text: "hello" }, sess);
+    assert.equal(promptSent, false, "Must not prompt Pi while handed off");
+    assert.ok(sent[3].text.includes("This session is on the desktop"), "Must warn that session is on desktop");
+
+    // 3b. Media group while handed off routes to sendHandoffPrompt
+    await gwHandoff.dispatchUpdate({
+      message: { message_id: 888, media_group_id: "mg-1", chat: { id: "1", type: "private" }, from: { id: 1 } },
+    });
+    assert.ok(sent[4].text.includes("This session is on the desktop"), "Media group routes to handoff prompt");
+
+    // 4. Herdr guard warns if a desktop Pi is working in cwd
+    sess.checkHerdrWorkingPi = async () => true;
+    await sess.handleTakeBack(false);
+    assert.ok(sent[5].text.includes("desktop Pi agent is currently working"), "Warns if desktop Pi working");
+    assert.ok(sess.handoff, "Handoff mark remains before confirmation");
+
+    // 5. Take back with confirmation restores session
+    let switchedPath = null;
+    sess.createPi = () => ({
+      start: async () => {},
+      request: async (cmd, params) => {
+        if (cmd === "switch_session") { switchedPath = params.sessionPath; return { cancelled: false }; }
+        if (cmd === "get_last_assistant_text") return { text: "Previous answer from desktop" };
+        if (cmd === "get_state") return { model: { provider: "anthropic", id: "claude" } };
+        return {};
+      },
+    });
+    await sess.handleTakeBack(true);
+    assert.equal(sess.handoff, null, "Handoff mark must be cleared after take back");
+    assert.equal(switchedPath, fakeSessionFile);
+    assert.ok(sent[6].text.includes("Back on Telegram"));
+    assert.ok(sent[6].text.includes("Previous answer from desktop"));
+  }
 
   console.log("self-test: ok");
 }

@@ -61,7 +61,7 @@
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
-| `/resume` | Show recently saved sessions to resume |
+| `/resume` | Show recently saved sessions to resume, with access to desktop Pi sessions in the workspace |
 | `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response) |
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
@@ -69,6 +69,7 @@
 | `/agents` | Status of every agent in Herdr, grouped by workspace (📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
 | `/fork` | Branch the session from a previous user message |
+| `/handoff` | Hand off session to desktop Pi (safely stops phone Pi, gives copyable command & Take Back button) |
 | `/abort` | Stop current agent execution immediately |
 | `/upgrade` | Self-upgrade the gateway: fast-forward git pull → npm install → offline self-test (auto-rollback on failure) → restart |
 | `/help` | Show full help menu |
@@ -249,6 +250,23 @@ When you run several Pi agents in [Herdr](https://herdr.dev), the gateway can pi
 - **Needs confirmation** (`blocked`): you get the screen tail plus buttons for the numbered options it detects (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`. Keys are only sent if the agent is still blocked.
 - **Finished** (`working → done/idle`): you get the tail of its output. **Reply** to any notification to send that agent a prompt (or, when it is blocked, to type an answer).
 - `/agents` lists all Herdr agents, including the ones that are not opted in.
+
+### Phone ↔ Desktop Handoff
+
+Two Pi processes must never write to the same session file simultaneously. The gateway keeps its sessions in `~/.local/var/remote-pi/sessions`, completely separate from your desktop Pi's default directory (`~/.pi/agent/sessions/`).
+
+- **Phone → Desktop (`/handoff`)**:
+  - Sends `/handoff` to gracefully stop the Telegram session's Pi process.
+  - Generates a copyable command to continue on desktop:
+    ```bash
+    cd '<cwd>' && pi --session '<sessionFile>'
+    ```
+  - While handed off, messages sent in Telegram are not sent to Pi. Tap `⬅️ Take back` to resume the session on Telegram (reloads the session updated on desktop, along with a 1-line preview of the latest assistant output), or tap `✨ New session here`.
+  - A best-effort guard checks Herdr before taking back, warning you if a desktop Pi is still working in that directory.
+- **Desktop → Phone (Desktop Sessions in `/resume`)**:
+  - Run `/resume`. If previous desktop Pi sessions exist for the current directory, a `🖥 Desktop sessions` button appears.
+  - Lists up to 10 newest desktop session files with relative timestamps and previews.
+  - Pick a session, confirm that the desktop Pi on that session has exited, and the gateway seamlessly loads it via `switch_session`.
 
 ---
 
