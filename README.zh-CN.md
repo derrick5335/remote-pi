@@ -70,7 +70,7 @@
 | `/get <相对路径>` | 将当前项目中的文件作为附件下载到 Telegram |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
 | `/session` 或 `/status`| 查看当前会话 ID、模型、上下文消耗统计及费用 |
-| `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📡 = 已推送到 Telegram），点按钮查看其屏幕 |
+| `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📱 = Telegram 会话，📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/export` | 通过 Pi 原生 `export_html` 将整个会话导出为 HTML 文件并发送 |
 | `/fork` | 从历史用户消息创建分支会话 |
@@ -244,34 +244,39 @@ pi-remote-gateway stop     # 停止后台服务
 }
 ```
 
-### Herdr Agent 状态推送（按 agent 手动开启）
+### Herdr 桌面联动与状态推送
 
-在 [Herdr](https://herdr.dev) 里同时跑多个 Pi agent 时，网关可以在某个 agent **完成** 或 **需要你确认** 时主动推送到 Telegram。默认不推送：需要在对应的桌面 Pi 里输入以下命令，为这个 agent 单独开启：
+当你在电脑端运行 [Herdr](https://herdr.dev) 时，网关与其 socket API 深度联动：
 
-```text
-/remote-pi          # 切换本 agent 的推送开关
-/remote-pi on|off|status
-```
-
-- `install.sh`（以及 `pi-remote-gateway upgrade`）会把 `herdr-extension.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`，由它提供该命令；已在运行的 Pi 执行一次 `/reload` 即可加载。
-- 开关作为 Herdr 原生 pane metadata token（`remote_pi=on`）存在 pane 上，该 Pi 退出时自动清除，不写任何旁路文件。
-- 网关通过 Herdr socket 订阅 `pane.agent_status_changed` 事件，并每分钟用 `herdr agent list` 全量对账兜底。
-- **需要确认**（`blocked`）：推送屏幕末尾内容，附带识别出的编号选项按钮（`1. Yes`、`2. …`）以及 `⏎ Enter` / `⎋ Esc`；仅当 agent 仍处于 blocked 时才会发送按键。
-- **完成**（`working → done/idle`）：推送输出末尾内容。直接**回复**任意一条通知，即可给该 agent 发送新指令（若它处于 blocked，则作为回答输入）。
-- `/agents` 列出 Herdr 中所有 agent，包括未开启推送的。
+1. **Telegram 会话在 Herdr 中全局可见**：
+   - 每个 Telegram 会话（主会话及各 Topic）都会在 Herdr 中拥有独立工作区，标签统一为 `📱 <basename>`（或 `📱 <basename>#<threadId>`）。
+   - 网关直接通过 socket（source `remote-pi`）向 Herdr 实时汇报状态（`working`、`idle`，或包含提问标题的 `blocked` 待确认状态），在 `herdr agent list` 中与本地 agent 一同展示。
+   - 对应窗格内启动紧凑 ANSI 观察器（`gateway.mjs --watch-session`），实时滚动展示只读会话日志（用户指令、模型回答、工具调用及报错、上下文压缩等）。
+2. **桌面 Pi Agent 状态推送（按 agent 手动开启）**：
+   - 在桌面端跑其他 Pi agent 时，可在该 Pi 中输入 `/remote-pi`（或 `/remote-pi on|off|status`）开启推送通知。
+   - `install.sh`（以及 `pi-remote-gateway upgrade`）会把 `herdr-extension.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`。
+   - 开关作为 Herdr 原生 pane metadata token（`remote_pi=on`）存在 pane 上，Pi 退出时自动清除。
+   - `/agents` 列出 Herdr 中所有 agent：`📱` 标出 Telegram 会话，`📡` 标出已开启推送的桌面 agent。
+   - **需要确认**（`blocked`）：推送屏幕末尾内容，附带识别出的编号选项按钮（`1. Yes`、`2. …`）以及 `⏎ Enter` / `⎋ Esc`。
+   - **完成**（`working → done/idle`）：推送输出末尾内容。直接**回复**任意一条通知，即可给该 agent 发送新指令。
 
 ### 手机 ↔ 桌面端会话无缝流转 (Handoff)
 
 两个 Pi 进程严禁同时写入同一个 session 文件。网关自带会话存储在 `~/.local/var/remote-pi/sessions`，与桌面端 Pi 默认目录（`~/.pi/agent/sessions/`）天然隔离。
 
 - **手机 → 桌面 (`/handoff`)**：
-  - 发送 `/handoff` 会优雅停止当前 Telegram 会话对应的 Pi 进程。
-  - 生成可直接点击复制的终端命令以便在桌面端接续：
+  - 发送 `/handoff` 会优雅停止网关端的 Pi 进程并释放 Herdr agent 权限。
+  - 若 Herdr 处于运行中，网关停止窗格观察器，并通过 `herdr agent start` 直接在该 Herdr 窗格内启动交互式桌面 Pi，由 Herdr 官方集成自动接管状态汇报。
+  - 生成备用可复制终端接续命令：
     ```bash
     cd '<cwd>' && pi --session '<sessionFile>'
     ```
-  - 移交状态下，置顶状态看板首行显示为 `🖥 On desktop since HH:MM`，向 Telegram 发送的消息不会转发给 Pi。在桌面端完成工作并退出后，点击 `⬅️ 收回` 即可切回 Telegram（自动加载桌面端最新产生的会话历史，并展示最后一条助手回复的单行预览）；或点击 `✨ 在此开启新会话`。
-  - 收回时会自动联动 Herdr 进行保护检查：若检测到同目录下仍有正在工作的桌面 Pi agent，会先提示告警确认，防止并发写冲突。
+  - 移交状态下，置顶状态看板首行显示为 `🖥 On desktop since HH:MM`，向 Telegram 发送的消息不会转发给 Pi。
+  - 点击 `⬅️ 收回` 将会话切回 Telegram：
+    - 网关先检查该 Herdr 窗格中的 agent 状态：若仍处于 `working` 或 `blocked`，为防止并发文件写入会拒绝收回并提示稍后重试。
+    - 若处于 `idle` 或 `done`，网关向该窗格发送 `/quit` 并回车，轮询等待桌面 Pi 进程退出至 Shell 后，自动在 Telegram 重启 Pi、无缝重载会话历史并重启观察器。
+    - 若桌面 Pi 在 10 秒内未退出，会告警提示并保持移交标记。
+  - 或点击 `✨ 在此开启新会话`。
 - **桌面 → 手机 (`/resume` 中的桌面会话)**：
   - 发送 `/resume`，若检测到当前工作目录下存在桌面端 Pi 历史会话，内联键盘中会出现 `🖥 Desktop sessions` 按钮。
   - 列出最近 10 条桌面会话（含相对修改时间与首条用户指令预览）。

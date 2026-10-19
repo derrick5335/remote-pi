@@ -70,7 +70,7 @@
 | `/get <filepath>` | Download a file from the current workspace to Telegram |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
 | `/session` or `/status`| Show current session ID, active model, token context usage, and cost |
-| `/agents` | Status of every agent in Herdr, grouped by workspace (📡 = pushed to Telegram); tap one to see its screen |
+| `/agents` | Status of every agent in Herdr, grouped by workspace (📱 = Telegram session, 📡 = pushed to Telegram); tap one to see its screen |
 | `/compact [focus]` | Trigger context compaction and summarization |
 | `/export` | Export the full session as an HTML file (Pi native `export_html`) and send it as a document |
 | `/fork` | Branch the session from a previous user message |
@@ -244,34 +244,39 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 }
 ```
 
-### Herdr Agent Notifications (opt-in per agent)
+### Herdr Desktop Visibility & Notifications
 
-When you run several Pi agents in [Herdr](https://herdr.dev), the gateway can ping you on Telegram when one of them **finishes** or **needs your confirmation**. Nothing is pushed by default: opt in per agent by typing this inside that desktop Pi:
+When you run [Herdr](https://herdr.dev), the gateway integrates deeply with Herdr's socket API:
 
-```text
-/remote-pi          # toggle push for this agent
-/remote-pi on|off|status
-```
-
-- `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`, which provides the command. In an already running Pi, run `/reload` once.
-- The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits. No side files.
-- The gateway subscribes to Herdr's `pane.agent_status_changed` events over its socket, and does a full `herdr agent list` reconciliation every minute.
-- **Needs confirmation** (`blocked`): you get the screen tail plus buttons for the numbered options it detects (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`. Keys are only sent if the agent is still blocked.
-- **Finished** (`working → done/idle`): you get the tail of its output. **Reply** to any notification to send that agent a prompt (or, when it is blocked, to type an answer).
-- `/agents` lists all Herdr agents, including the ones that are not opted in.
+1. **Every Telegram session is visible in Herdr**:
+   - Each Telegram chat session (main chat and each topic) gets its own dedicated Herdr workspace labeled `📱 <basename>` (or `📱 <basename>#<threadId>`).
+   - The gateway reports agent status (`working`, `idle`, `blocked` with the question title) directly to Herdr over its socket (source `remote-pi`), so Telegram sessions appear live in Herdr's agent list (`herdr agent list`).
+   - Inside the pane, a compact ANSI viewer (`gateway.mjs --watch-session`) renders a read-only live transcript of the conversation (user messages, assistant text, tool executions, errors, and compactions).
+2. **Desktop Pi Agent Notifications (opt-in per agent)**:
+   - When running other desktop Pi agents in Herdr, the gateway can ping you on Telegram when one of them **finishes** or **needs your confirmation**. Nothing is pushed by default: opt in per agent by typing `/remote-pi` (or `/remote-pi on|off|status`) inside that desktop Pi.
+   - `install.sh` (and `pi-remote-gateway upgrade`) symlinks `herdr-extension.ts` to `~/.pi/agent/extensions/remote-pi.ts`.
+   - The opt-in is stored on the Herdr pane itself as a native metadata token (`remote_pi=on`), and is cleared when that Pi quits.
+   - `/agents` lists all Herdr agents: `📱` marks Telegram sessions, while `📡` marks desktop agents opted into Telegram push notifications.
+   - **Needs confirmation** (`blocked`): you get the screen tail plus buttons for detected options (`1. Yes`, `2. …`), plus `⏎ Enter` / `⎋ Esc`.
+   - **Finished** (`working → done/idle`): you get the tail of its output. **Reply** to any notification to send that agent a prompt.
 
 ### Phone ↔ Desktop Handoff
 
 Two Pi processes must never write to the same session file simultaneously. The gateway keeps its sessions in `~/.local/var/remote-pi/sessions`, completely separate from your desktop Pi's default directory (`~/.pi/agent/sessions/`).
 
 - **Phone → Desktop (`/handoff`)**:
-  - Sends `/handoff` to gracefully stop the Telegram session's Pi process.
-  - Generates a copyable command to continue on desktop:
+  - Sends `/handoff` to gracefully stop the gateway's Pi process and release Herdr agent authority.
+  - If Herdr is running, the gateway stops the pane viewer and launches the interactive Pi directly in that same Herdr pane via `herdr agent start`, so the official Herdr Pi integration seamlessly takes over status reporting.
+  - Generates a copyable fallback command to continue on desktop:
     ```bash
     cd '<cwd>' && pi --session '<sessionFile>'
     ```
-  - While handed off, the pinned status board displays `🖥 On desktop since HH:MM`, and messages sent in Telegram are not sent to Pi. Tap `⬅️ Take back` to resume the session on Telegram (reloads the session updated on desktop, along with a 1-line preview of the latest assistant output), or tap `✨ New session here`.
-  - A best-effort guard checks Herdr before taking back, warning you if a desktop Pi is still working in that directory.
+  - While handed off, the pinned status board displays `🖥 On desktop since HH:MM`, and messages sent in Telegram are not sent to Pi.
+  - Tap `⬅️ Take back` to resume the session on Telegram:
+    - The gateway checks the Herdr pane's agent status: if it is still `working` or `blocked`, it safely refuses to take back to avoid concurrent writes.
+    - If `idle` or `done`, it sends `/quit` to that pane, waits for the desktop Pi process to exit back to the shell, and resumes the session on Telegram (reloading the latest history, restarting the pane viewer, and reporting status).
+    - If the desktop Pi does not exit within 10 seconds, it alerts you and keeps the handoff mark.
+  - Or tap `✨ New session here` to start fresh in Telegram.
 - **Desktop → Phone (Desktop Sessions in `/resume`)**:
   - Run `/resume`. If previous desktop Pi sessions exist for the current directory, a `🖥 Desktop sessions` button appears.
   - Lists up to 10 newest desktop session files with relative timestamps and previews.

@@ -15,6 +15,7 @@ import MarkdownIt from "markdown-it";
 
 const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
+let HERDR_DISABLED_FOR_TEST = false;
 const HELP = `Remote Pi
 
 Just send text to chat with Pi; messages sent while it is working act as steering.
@@ -740,7 +741,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -758,6 +759,7 @@ function loadState(stateDir) {
           handoffs[key] = {
             sessionFile: info.sessionFile,
             at: typeof info.at === "number" ? info.at : Date.now(),
+            ...(typeof info.paneId === "string" ? { paneId: info.paneId } : {}),
           };
         }
       }
@@ -770,6 +772,14 @@ function loadState(stateDir) {
         }
       }
     }
+    const herdrPanes = {};
+    if (typeof raw.herdrPanes === "object" && raw.herdrPanes !== null) {
+      for (const [key, paneId] of Object.entries(raw.herdrPanes)) {
+        if (typeof paneId === "string" && paneId) {
+          herdrPanes[key] = paneId;
+        }
+      }
+    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
@@ -778,9 +788,10 @@ function loadState(stateDir) {
       topics,
       handoffs,
       statusBoards,
+      herdrPanes,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {} };
+    return { cwd: null, recentProjects: [], topics: {}, handoffs: {}, statusBoards: {}, herdrPanes: {} };
   }
 }
 
@@ -1369,7 +1380,10 @@ class Telegram {
   }
 }
 
-function runCommand(cmd, args, options = {}) {
+function runCommand(cmd, args = [], options = {}) {
+  if (HERDR_DISABLED_FOR_TEST && (cmd.includes("herdr") || args.some((a) => String(a).includes("herdr")))) {
+    throw new Error(`Self-test must never call herdr: ${cmd} ${args.join(" ")}`);
+  }
   const { okCodes = [0], ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
     const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOptions });
@@ -1394,12 +1408,12 @@ function runCommand(cmd, args, options = {}) {
 }
 
 // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, threadId } = {}) {
-  if (disabled || piBin === "echo" || process.env.NODE_ENV === "test") return {};
+async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, threadId, persistedPaneId, runCmd = runCommand } = {}) {
+  if (disabled || piBin === "echo" || process.env.NODE_ENV === "test" || (HERDR_DISABLED_FOR_TEST && runCmd === runCommand)) return {};
 
   let herdrBin;
   try {
-    herdrBin = (await runCommand("which", ["herdr"], { timeout: 2000 })).trim();
+    herdrBin = (await runCmd("which", ["herdr"], { timeout: 2000 })).trim();
   } catch {
     const fallback = join(homedir(), ".local", "bin", "herdr");
     if (existsSync(fallback)) herdrBin = fallback;
@@ -1409,7 +1423,7 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, t
   // 1. 检查 Herdr Server 是否运行；若未运行，启动 headless server（有则进，无则建）
   let status = null;
   try {
-    const raw = await runCommand(herdrBin, ["status", "server", "--json"], { timeout: 3000 });
+    const raw = await runCmd(herdrBin, ["status", "server", "--json"], { timeout: 3000 });
     const parsed = JSON.parse(raw);
     if (parsed.running) status = parsed;
   } catch {
@@ -1424,7 +1438,7 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, t
       while (Date.now() - start < 3000) {
         await sleep(100);
         try {
-          const raw = await runCommand(herdrBin, ["status", "server", "--json"], { timeout: 1000 });
+          const raw = await runCmd(herdrBin, ["status", "server", "--json"], { timeout: 1000 });
           const parsed = JSON.parse(raw);
           if (parsed.running) {
             status = parsed;
@@ -1441,27 +1455,29 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, t
   if (!status?.socket) return {};
   const socketPath = status.socket;
 
-  // 2. 查找或创建对应 cwd 的 Workspace 与 Pane
+  // 2. 查找或创建对应 cwd 的 Workspace 与 Pane（仅复用本会话已持久化的 Pane，严禁按 cwd 匹配用户窗格）
   let workspaceId;
   let tabId;
   let paneId;
   const exclude = new Set(excludePaneIds || []);
-  try {
-    const panesRaw = await runCommand(herdrBin, ["pane", "list"], { timeout: 3000 });
-    const panesData = JSON.parse(panesRaw);
-    const existingPane = panesData.result?.panes?.find((p) => p.cwd === cwd && !exclude.has(p.pane_id));
-    if (existingPane) {
-      workspaceId = existingPane.workspace_id;
-      tabId = existingPane.tab_id;
-      paneId = existingPane.pane_id;
-    }
-  } catch {}
+  if (persistedPaneId && !exclude.has(persistedPaneId)) {
+    try {
+      const paneRaw = await runCmd(herdrBin, ["pane", "get", persistedPaneId], { timeout: 3000 });
+      const paneData = JSON.parse(paneRaw);
+      const existingPane = paneData.result?.pane;
+      if (existingPane && existingPane.pane_id) {
+        workspaceId = existingPane.workspace_id;
+        tabId = existingPane.tab_id;
+        paneId = existingPane.pane_id;
+      }
+    } catch {}
+  }
 
   if (!paneId) {
     try {
       const base = basename(cwd) || "remote-pi";
-      const label = threadId ? `${base}#${threadId}` : base;
-      const createdRaw = await runCommand(herdrBin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], { timeout: 5000 });
+      const label = threadId ? `📱 ${base}#${threadId}` : `📱 ${base}`;
+      const createdRaw = await runCmd(herdrBin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], { timeout: 5000 });
       const created = JSON.parse(createdRaw);
       workspaceId = created.result?.workspace?.workspace_id;
       tabId = created.result?.tab?.tab_id;
@@ -1481,6 +1497,281 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, t
     HERDR_TAB_ID: tabId,
     HERDR_PANE_ID: paneId,
   };
+}
+
+// ref: Herdr Socket API (https://herdr.dev/docs/integrations/ & ~/.pi/agent/extensions/herdr-agent-state.ts)
+class HerdrReporter {
+  constructor({ socketPath, paneId, source = "remote-pi", allowInTest = false } = {}) {
+    this.socketPath = socketPath;
+    this.paneId = paneId;
+    this.source = source;
+    this.allowInTest = allowInTest;
+    this.seq = Date.now() * 1000;
+    this.currentSessionPath = null;
+    this.sendInFlight = false;
+    this.queuedState = null;
+    this.lastState = null;
+    this.lastMessage = null;
+  }
+
+  nextSeq() {
+    return ++this.seq;
+  }
+
+  async sendRequestAttempt(request, timeoutMs = 500) {
+    if ((HERDR_DISABLED_FOR_TEST && !this.allowInTest) || !this.socketPath || !this.paneId) return true;
+    const socketEndpoint = process.platform === "win32" && this.socketPath ? `\\\\.\\pipe\\${this.socketPath}` : this.socketPath;
+    return new Promise((resolve) => {
+      let done = false;
+      let timer;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try { socket.destroy(); } catch {}
+        resolve(ok);
+      };
+      const socket = net.createConnection(socketEndpoint);
+      socket.on("error", () => finish(false));
+      socket.on("connect", () => {
+        try { socket.write(`${JSON.stringify(request)}\n`); }
+        catch { finish(false); }
+      });
+      socket.on("data", () => finish(true));
+      socket.on("end", () => finish(false));
+      timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+    });
+  }
+
+  async sendRequest(request) {
+    try {
+      if (await this.sendRequestAttempt(request, 500)) return;
+      await this.sendRequestAttempt(request, 1500);
+    } catch {}
+  }
+
+  async reportSession(sessionPath) {
+    if (!sessionPath) return;
+    this.currentSessionPath = sessionPath;
+    await this.sendRequest({
+      id: `${this.source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_agent_session",
+      params: {
+        pane_id: this.paneId,
+        source: this.source,
+        agent: "pi",
+        seq: this.nextSeq(),
+        agent_session_path: sessionPath,
+      },
+    });
+  }
+
+  async reportMetadata(title, displayAgent = "pi · Telegram") {
+    await this.sendRequest({
+      id: `${this.source}:meta:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_metadata",
+      params: {
+        pane_id: this.paneId,
+        source: this.source,
+        agent: "pi",
+        display_agent: displayAgent,
+        title,
+        seq: this.nextSeq(),
+      },
+    });
+  }
+
+  async sendState(state, message) {
+    const params = {
+      pane_id: this.paneId,
+      source: this.source,
+      agent: "pi",
+      state,
+      seq: this.nextSeq(),
+    };
+    if (message) params.message = message;
+    if (this.currentSessionPath) params.agent_session_path = this.currentSessionPath;
+    await this.sendRequest({
+      id: `${this.source}:state:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_agent",
+      params,
+    });
+  }
+
+  reportState(state, message = undefined) {
+    if (state === this.lastState && message === this.lastMessage) return;
+    this.lastState = state;
+    this.lastMessage = message;
+    this.queuedState = { state, message };
+    if (!this.sendInFlight) {
+      void this.drainQueue();
+    }
+  }
+
+  async drainQueue() {
+    if (this.sendInFlight) return;
+    this.sendInFlight = true;
+    try {
+      while (this.queuedState) {
+        const next = this.queuedState;
+        this.queuedState = null;
+        await this.sendState(next.state, next.message);
+      }
+    } finally {
+      this.sendInFlight = false;
+      if (this.queuedState) void this.drainQueue();
+    }
+  }
+
+  async releaseAgent() {
+    this.lastState = null;
+    this.lastMessage = null;
+    this.queuedState = null;
+    await this.sendRequest({
+      id: `${this.source}:release:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.release_agent",
+      params: {
+        pane_id: this.paneId,
+        source: this.source,
+        agent: "pi",
+        seq: this.nextSeq(),
+      },
+    });
+  }
+}
+
+// ref: Pi Session Format (docs/session-format.md)
+function renderSessionEntry(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  switch (entry.type) {
+    case "message": {
+      const msg = entry.message;
+      if (!msg) return "";
+      if (msg.role === "user") {
+        let text = "";
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          text = msg.content
+            .map((c) => (c.type === "text" ? c.text : c.type === "image" ? "[image]" : ""))
+            .filter(Boolean)
+            .join(" ");
+        }
+        return `\x1b[36m› ${text.trim()}\x1b[0m`;
+      }
+      if (msg.role === "assistant") {
+        const parts = [];
+        if (typeof msg.content === "string") {
+          if (msg.content.trim()) parts.push(msg.content);
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === "text" && block.text?.trim()) {
+              parts.push(block.text);
+            } else if (block.type === "toolCall") {
+              parts.push(`\x1b[33m⚙️ ${toolSummary(block.name, block.args)}\x1b[0m`);
+            }
+          }
+        }
+        return parts.join("\n");
+      }
+      if (msg.role === "toolResult") {
+        if (msg.isError) {
+          let errText = "";
+          if (typeof msg.content === "string") errText = msg.content;
+          else if (Array.isArray(msg.content)) errText = msg.content.map((c) => c.text || "").join(" ");
+          return `\x1b[31m❌ ${msg.toolName || "tool"} error: ${errText.trim()}\x1b[0m`;
+        }
+        return "";
+      }
+      return "";
+    }
+    case "model_change": {
+      const name = entry.provider ? `${entry.provider}/${entry.modelId}` : (entry.modelId || "model");
+      return `\x1b[2m⚡ Model changed to ${name}\x1b[0m`;
+    }
+    case "thinking_level_change": {
+      return `\x1b[2m🧠 Thinking level: ${entry.thinkingLevel}\x1b[0m`;
+    }
+    case "compaction": {
+      const tokens = entry.tokensBefore ? ` (${entry.tokensBefore} tokens)` : "";
+      return `\x1b[2m📦 Context compacted${tokens}\x1b[0m`;
+    }
+    case "branch_summary": {
+      const summary = entry.summary ? ` ${(entry.summary || "").slice(0, 80)}` : "";
+      return `\x1b[2m🌿 Branch summary:${summary}\x1b[0m`;
+    }
+    case "custom_message": {
+      if (entry.display) {
+        const text = typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content);
+        return `\x1b[35m[extension] ${text}\x1b[0m`;
+      }
+      return "";
+    }
+    default:
+      return "";
+  }
+}
+
+async function watchSessionViewer(sessionFile) {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => process.exit(0));
+  }
+  let cwd = process.cwd();
+  try {
+    const header = await parseSessionHeader(sessionFile);
+    if (header?.cwd) cwd = header.cwd;
+  } catch {}
+
+  console.log("\x1b[1m=== Telegram session — read only ===\x1b[0m");
+  console.log("\x1b[2mUse /handoff in Telegram to continue here\x1b[0m");
+  console.log(`\x1b[2mCwd:     ${cwd}\x1b[0m`);
+  console.log(`\x1b[2mSession: ${sessionFile}\x1b[0m`);
+  console.log("\x1b[2m---\x1b[0m");
+
+  let offset = 0;
+  let leftover = "";
+  async function readNew() {
+    let statInfo;
+    try {
+      statInfo = await stat(sessionFile);
+    } catch {
+      return;
+    }
+    if (statInfo.size < offset) {
+      offset = 0;
+      leftover = "";
+    }
+    if (statInfo.size === offset) return;
+
+    let fh;
+    try {
+      fh = await open(sessionFile, "r");
+      const len = statInfo.size - offset;
+      const buf = Buffer.alloc(len);
+      const { bytesRead } = await fh.read(buf, 0, len, offset);
+      offset += bytesRead;
+      const text = leftover + buf.toString("utf8", 0, bytesRead);
+      const lines = text.split("\n");
+      leftover = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          const rendered = renderSessionEntry(entry);
+          if (rendered) console.log(rendered);
+        } catch {}
+      }
+    } catch {} finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  await readNew();
+  while (true) {
+    await sleep(250);
+    await readNew();
+  }
 }
 
 const HERDR_STATUS_ICON = { working: "⏳", blocked: "✋", done: "✅", idle: "💤", unknown: "❔" };
@@ -1539,6 +1830,7 @@ class HerdrWatcher {
 
   start() {
     this.stopped = false;
+    if (HERDR_DISABLED_FOR_TEST) return;
     this.sync();
     this.reconcileTimer = setInterval(() => this.sync(), 60_000);
     this.reconcileTimer.unref?.();
@@ -1554,12 +1846,14 @@ class HerdrWatcher {
   }
 
   scheduleSync(delay) {
+    if (HERDR_DISABLED_FOR_TEST) return;
     clearTimeout(this.syncTimer);
     this.syncTimer = setTimeout(() => this.sync(), delay);
     this.syncTimer.unref?.();
   }
 
   sync() {
+    if (HERDR_DISABLED_FOR_TEST) return Promise.resolve();
     this.syncChain = this.syncChain.then(() => this.doSync()).catch((error) => {
       console.warn(`${new Date().toISOString()} [herdr] sync failed: ${error.message}`);
       if (!this.stopped) this.scheduleSync(15_000);
@@ -1603,6 +1897,7 @@ class HerdrWatcher {
 
   subscribe(paneIds) {
     this.socket?.destroy();
+    if (HERDR_DISABLED_FOR_TEST || !this.socketPath) return;
     this.subscribedKey = paneIds.join(",");
     const socket = net.connect(this.socketPath);
     this.socket = socket;
@@ -1710,6 +2005,7 @@ class PiRpc {
           piBin: this.config.piBin,
           excludePaneIds,
           threadId: this.config.threadId,
+          persistedPaneId: this.config.persistedPaneId,
         });
         if (herdrEnv.HERDR_PANE_ID) {
           console.log(`${new Date().toISOString()} [herdr] attached to pane ${herdrEnv.HERDR_PANE_ID} (workspace ${herdrEnv.HERDR_WORKSPACE_ID})`);
@@ -1732,7 +2028,7 @@ class PiRpc {
       this.proc.once("error", reject);
     });
     if (typeof this.config.onStarted === "function") {
-      this.config.onStarted();
+      this.config.onStarted(this.herdrEnv);
     }
     this.proc.stdin.on("error", () => {}); // EPIPE 竞态（kill 时在途写入）；pending 由 close 路径 reject
 
@@ -1888,6 +2184,7 @@ class ChatSession {
     this.currentThinking = null;
     this.runSnapshotPromise = null;
 
+    this.herdrReporter = null;
     this.pi = this.createPi();
   }
 
@@ -1898,14 +2195,26 @@ class ChatSession {
       cwd: this.cwd,
       sessionDir: this.sessionDir,
       threadId: this.threadId,
+      persistedPaneId: this.gateway.state.herdrPanes?.[this.key],
       beforeStart: async () => {
         if (this.handoff) {
           throw new Error("This session is on the desktop — tap Take back first.");
         }
         await this.gateway.acquireSessionSlot(this);
       },
-      onStarted: () => {
+      onStarted: async (herdrEnv) => {
         this.gateway.startHerdrWatcher();
+        if (herdrEnv?.HERDR_PANE_ID) {
+          if (this.gateway.state.herdrPanes?.[this.key] !== herdrEnv.HERDR_PANE_ID) {
+            this.gateway.state.herdrPanes = {
+              ...this.gateway.state.herdrPanes,
+              [this.key]: herdrEnv.HERDR_PANE_ID,
+            };
+            await this.gateway.saveState({ herdrPanes: this.gateway.state.herdrPanes });
+          }
+          this.initHerdrReporter(herdrEnv);
+        }
+        await this.onPiStarted();
       },
       getExcludePaneIds: () => this.gateway.getOwnedPaneIds(this),
     };
@@ -1974,7 +2283,153 @@ class ChatSession {
     }
   }
 
+  initHerdrReporter(herdrEnv) {
+    if (herdrEnv?.HERDR_SOCKET_PATH && herdrEnv?.HERDR_PANE_ID) {
+      this.herdrReporter = new HerdrReporter({
+        socketPath: herdrEnv.HERDR_SOCKET_PATH,
+        paneId: herdrEnv.HERDR_PANE_ID,
+      });
+    }
+  }
+
+  async onPiStarted() {
+    if (!this.herdrReporter) return;
+    try {
+      const stats = await this.pi.request("get_session_stats").catch(() => null);
+      if (stats?.sessionFile) {
+        await this.herdrReporter.reportSession(stats.sessionFile);
+        const title = this.threadId ? (basename(this.cwd) || `Topic #${this.threadId}`) : "Telegram";
+        await this.herdrReporter.reportMetadata(title);
+        await this.startViewer(stats.sessionFile);
+      }
+    } catch (err) {
+      console.warn(`[herdr] onPiStarted failed: ${err.message}`);
+    }
+  }
+
+  async onSessionSwitched(sessionPath = null) {
+    let file = sessionPath;
+    if (!file) {
+      const stats = await this.pi.request("get_session_stats").catch(() => null);
+      file = stats?.sessionFile;
+    }
+    if (file && this.herdrReporter) {
+      await this.herdrReporter.reportSession(file);
+      await this.startViewer(file);
+    }
+  }
+
+  async isPaneAtShell(paneId, herdrBin) {
+    if (HERDR_DISABLED_FOR_TEST) return true;
+    try {
+      const raw = await runCommand(herdrBin, ["pane", "process-info", "--pane", paneId], { timeout: 3000 });
+      const parsed = JSON.parse(raw);
+      const info = parsed.result?.process_info;
+      if (!info) return false;
+      return info.foreground_process_group_id === info.shell_pid;
+    } catch {
+      return false;
+    }
+  }
+
+  async getPaneForegroundCmdline(paneId, herdrBin) {
+    if (HERDR_DISABLED_FOR_TEST) return "";
+    try {
+      const raw = await runCommand(herdrBin, ["pane", "process-info", "--pane", paneId], { timeout: 3000 });
+      const parsed = JSON.parse(raw);
+      const info = parsed.result?.process_info;
+      if (!info?.foreground_processes) return "";
+      return info.foreground_processes.map((p) => p.cmdline || "").join(" ");
+    } catch {
+      return "";
+    }
+  }
+
+  async stopViewer(paneId = null) {
+    if (HERDR_DISABLED_FOR_TEST) return;
+    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH || process.env.HERDR_BIN_PATH || "herdr";
+    const targetPane = paneId || this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
+    if (!targetPane) return;
+    try {
+      if (await this.isPaneAtShell(targetPane, herdrBin)) return;
+      await runCommand(herdrBin, ["pane", "send-keys", targetPane, "ctrl+c"], { timeout: 2000 }).catch(() => {});
+      const start = Date.now();
+      while (Date.now() - start < 3000) {
+        await sleep(150);
+        if (await this.isPaneAtShell(targetPane, herdrBin)) return;
+      }
+    } catch (err) {
+      console.warn(`[herdr] stopViewer failed: ${err.message}`);
+    }
+  }
+
+  async startViewer(sessionFile) {
+    if (HERDR_DISABLED_FOR_TEST) return;
+    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH;
+    const paneId = this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
+    if (!herdrBin || !paneId || !sessionFile) return;
+
+    try {
+      const fgCmd = await this.getPaneForegroundCmdline(paneId, herdrBin);
+      if (fgCmd.includes("--watch-session") && fgCmd.includes(sessionFile)) {
+        return;
+      }
+      if (!(await this.isPaneAtShell(paneId, herdrBin))) {
+        await this.stopViewer(paneId);
+      }
+      const gatewayPath = fileURLToPath(import.meta.url);
+      const cmd = `${shellQuote(process.execPath)} ${shellQuote(gatewayPath)} --watch-session ${shellQuote(sessionFile)}`;
+      await runCommand(herdrBin, ["pane", "run", paneId, cmd], { timeout: 5000 });
+    } catch (err) {
+      console.warn(`[herdr] startViewer failed on pane ${paneId}: ${err.message}`);
+    }
+  }
+
+  async paneExists(paneId, herdrBin) {
+    if (!herdrBin || !paneId) return false;
+    if (HERDR_DISABLED_FOR_TEST) return true;
+    try {
+      const out = await runCommand(herdrBin, ["pane", "get", paneId], { timeout: 3000 });
+      const parsed = JSON.parse(out);
+      return Boolean(parsed.result?.pane);
+    } catch {
+      return false;
+    }
+  }
+
+  async getPaneAgentStatus(paneId, herdrBin) {
+    if (HERDR_DISABLED_FOR_TEST) return null;
+    try {
+      const out = await runCommand(herdrBin, ["pane", "get", paneId], { timeout: 3000 });
+      const parsed = JSON.parse(out);
+      return parsed.result?.pane?.agent_status ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async quitPaneAgent(paneId, herdrBin) {
+    if (HERDR_DISABLED_FOR_TEST) return true;
+    try {
+      await runCommand(herdrBin, ["pane", "send-text", paneId, "/quit"], { timeout: 3000 });
+      await runCommand(herdrBin, ["pane", "send-keys", paneId, "enter"], { timeout: 3000 });
+    } catch (err) {
+      console.warn(`[herdr] failed to send /quit to ${paneId}: ${err.message}`);
+    }
+    const startWait = Date.now();
+    let isShell = await this.isPaneAtShell(paneId, herdrBin);
+    while (!isShell && Date.now() - startWait < 10000) {
+      await sleep(150);
+      isShell = await this.isPaneAtShell(paneId, herdrBin);
+    }
+    return isShell;
+  }
+
   handlePiExit({ code, signal, expected }) {
+    if (this.herdrReporter) {
+      this.herdrReporter.releaseAgent();
+      this.herdrReporter = null;
+    }
     if (expected) return;
     const wasStreaming = this.isStreaming;
     const pendingUi = this.pendingUi;
@@ -2095,6 +2550,7 @@ class ChatSession {
           this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
+        await this.onSessionSwitched();
         this.scheduleStatusBoardUpdate();
         const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
         return this.send(text);
@@ -2110,6 +2566,7 @@ class ChatSession {
       case "fork": return this.showForks();
       case "clone": {
         const result = await this.pi.request("clone");
+        if (!result.cancelled) await this.onSessionSwitched();
         return this.send(result.cancelled ? "Clone cancelled" : "✅ Current branch cloned");
       }
       case "compact": {
@@ -2365,6 +2822,23 @@ class ChatSession {
 
     await reply("Switching");
     await this.send(`✅ Working directory switched to:\n${target}\n\nHot-restarting Pi…`);
+    const oldPaneId = this.gateway.state.herdrPanes?.[this.key] || this.pi?.herdrEnv?.HERDR_PANE_ID;
+    const oldWsId = this.pi?.herdrEnv?.HERDR_WORKSPACE_ID;
+    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH;
+    if (this.herdrReporter) {
+      await this.herdrReporter.releaseAgent();
+      this.herdrReporter = null;
+    }
+    if (oldPaneId) {
+      await this.stopViewer(oldPaneId);
+      if (this.gateway.state.herdrPanes?.[this.key]) {
+        delete this.gateway.state.herdrPanes[this.key];
+        await this.gateway.saveState({ herdrPanes: this.gateway.state.herdrPanes });
+      }
+      if (oldWsId && herdrBin && !HERDR_DISABLED_FOR_TEST) {
+        await runCommand(herdrBin, ["workspace", "close", oldWsId], { timeout: 3000 }).catch(() => {});
+      }
+    }
     this.pi.stop();
     this.cwd = target;
     await mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
@@ -2504,6 +2978,7 @@ class ChatSession {
       if (state?.thinkingLevel) {
         this.currentThinking = state.thinkingLevel;
       }
+      await this.onSessionSwitched(sessionPath);
       this.scheduleStatusBoardUpdate();
     }
     return this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
@@ -2516,18 +2991,46 @@ class ChatSession {
     if (this.handoff) {
       return this.sendHandoffPrompt();
     }
-    const stats = await this.pi.request("get_session_stats");
+    const stats = await this.pi.request("get_session_stats").catch(() => null);
     const sessionFile = stats?.sessionFile;
     if (!sessionFile) return this.send("No active session file to hand off.");
+
+    const herdrBin = this.pi?.herdrEnv?.HERDR_BIN_PATH;
+    const paneId = this.pi?.herdrEnv?.HERDR_PANE_ID || this.gateway.state.herdrPanes?.[this.key];
+    const wsLabel = this.threadId ? `📱 ${basename(this.cwd)}#${this.threadId}` : `📱 ${basename(this.cwd)}`;
+
     this.stop();
     const at = Date.now();
     this.gateway.state.handoffs = {
       ...this.gateway.state.handoffs,
-      [this.key]: { sessionFile, at },
+      [this.key]: { sessionFile, at, paneId },
     };
     await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
     this.scheduleStatusBoardUpdate();
     const cmd = `cd ${shellQuote(this.cwd)} && pi --session ${shellQuote(sessionFile)}`;
+
+    let startedInHerdr = false;
+    if (!HERDR_DISABLED_FOR_TEST && herdrBin && paneId) {
+      try {
+        await this.stopViewer(paneId);
+        const rawName = `tg-${basename(this.cwd).toLowerCase().replace(/[^a-z0-9_-]/g, "-")}`;
+        const agentName = rawName.slice(0, 32);
+        await runCommand(herdrBin, [
+          "agent", "start", agentName, "--kind", "pi", "--pane", paneId, "--", "--session", sessionFile,
+        ], { timeout: 15000 });
+        startedInHerdr = true;
+      } catch (err) {
+        console.warn(`[herdr] failed to start agent in pane ${paneId}: ${err.message}`);
+      }
+    }
+
+    if (startedInHerdr) {
+      return this.send(
+        `🖥 Continued in Herdr: workspace ${wsLabel} (pane ${paneId})\n\nFallback:\n\`\`\`\n${cmd}\n\`\`\``,
+        this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
+      );
+    }
+
     return this.send(`🖥 Continue on desktop:\n\`\`\`\n${cmd}\n\`\`\``, this.keyboard([
       { label: "⬅️ Take back", action: { type: "take_back" } },
     ]));
@@ -2540,47 +3043,43 @@ class ChatSession {
     ]));
   }
 
-  async checkHerdrWorkingPi() {
-    try {
-      let agentList;
-      if (this.gateway.herdrWatcher) {
-        agentList = await this.gateway.herdrWatcher.cliJson(["agent", "list"]);
-      } else {
-        const bin = process.env.HERDR_BIN_PATH || "herdr";
-        const out = await runCommand(bin, ["agent", "list"], { timeout: 3000 });
-        agentList = JSON.parse(out).result;
-      }
-      const agents = agentList?.agents ?? [];
-      const ownPanes = new Set(this.gateway.getOwnedPaneIds());
-      return agents.some((a) => !ownPanes.has(a.pane_id) && a.agent === "pi" && a.cwd === this.cwd && a.agent_status === "working");
-    } catch {
-      return false;
-    }
-  }
-
-  async handleTakeBack(confirmed = false) {
+  async handleTakeBack() {
     const handoffInfo = this.handoff;
     if (!handoffInfo?.sessionFile) {
       return this.send("No handoff session file found.");
     }
-    if (!confirmed && (await this.checkHerdrWorkingPi())) {
-      const keyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "Confirm", callback_data: this.action({ type: "take_back", confirmed: true }) },
-              { text: "Cancel", callback_data: this.action({ type: "take_back_cancel" }) },
-            ],
-          ],
-        },
-      };
-      return this.send("⚠️ A desktop Pi agent is currently working in this directory. Taking back may cause concurrent file writes.\n\nTake back anyway?", keyboard);
+    const sessionFile = handoffInfo.sessionFile;
+    const herdrBin = this.gateway.mainSession.pi?.herdrEnv?.HERDR_BIN_PATH || process.env.HERDR_BIN_PATH || "herdr";
+    const paneId = handoffInfo.paneId || this.gateway.state.herdrPanes?.[this.key];
+
+    if (paneId && (await this.paneExists(paneId, herdrBin))) {
+      const paneAgentStatus = await this.getPaneAgentStatus(paneId, herdrBin);
+      if (paneAgentStatus === "working" || paneAgentStatus === "blocked") {
+        return this.send(
+          `⚠️ Desktop Pi is currently ${paneAgentStatus}. Please wait until it is idle or stop it, then tap Take back again.`,
+          this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
+        );
+      }
+
+      if (paneAgentStatus === "idle" || paneAgentStatus === "done") {
+        await this.quitPaneAgent(paneId, herdrBin);
+      }
+
+      const atShell = await this.isPaneAtShell(paneId, herdrBin);
+      if (!atShell) {
+        const runningCmd = (await this.getPaneForegroundCmdline(paneId, herdrBin)).slice(0, 80).trim();
+        const what = runningCmd ? ` (\`${runningCmd}\`)` : "";
+        return this.send(
+          `⚠️ Desktop pane is still running a process${what}. Quit it before taking back.`,
+          this.keyboard([{ label: "⬅️ Take back", action: { type: "take_back" } }])
+        );
+      }
     }
 
-    const sessionFile = handoffInfo.sessionFile;
+    const hadHandoff = Boolean(this.gateway.state.handoffs?.[this.key]);
     if (this.gateway.state.handoffs) {
       delete this.gateway.state.handoffs[this.key];
-      await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
+      if (hadHandoff) await this.gateway.saveState({ handoffs: this.gateway.state.handoffs });
     }
 
     this.resetSessionState();
@@ -2596,6 +3095,7 @@ class ChatSession {
         this.currentThinking = state.thinkingLevel;
       }
     }
+    await this.onSessionSwitched(sessionFile);
     this.scheduleStatusBoardUpdate();
     const last = await this.pi.request("get_last_assistant_text").catch(() => null);
     const rawText = (last?.text || "").trim();
@@ -2619,6 +3119,7 @@ class ChatSession {
     if (state?.thinkingLevel) {
       this.currentThinking = state.thinkingLevel;
     }
+    await this.onSessionSwitched();
     this.scheduleStatusBoardUpdate();
     const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
     return this.send(text);
@@ -2698,7 +3199,7 @@ class ChatSession {
       this.scheduleStatusBoardUpdate();
       await this.send(`✅ thinking: ${action.level}`);
     } else if (action.type === "take_back") {
-      await this.handleTakeBack(action.confirmed);
+      await this.handleTakeBack();
     } else if (action.type === "take_back_cancel") {
       await this.send("Take back cancelled");
     } else if (action.type === "new_session_here") {
@@ -2725,6 +3226,7 @@ class ChatSession {
         if (state?.thinkingLevel) {
           this.currentThinking = state.thinkingLevel;
         }
+        await this.onSessionSwitched(action.path);
         this.scheduleStatusBoardUpdate();
       }
       await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
@@ -2732,6 +3234,7 @@ class ChatSession {
       if (this.isStreaming) await this.pi.request("abort").catch(() => {});
       this.resetSessionState();
       const result = await this.pi.request("fork", { entryId: action.entryId });
+      if (!result.cancelled) await this.onSessionSwitched();
       await this.send(result.cancelled ? "Fork cancelled" : `✅ Forked from "${result.text.slice(0, 80)}"`);
     } else if (action.type === "cwd") {
       await this.switchCwd(action.path, callback.id);
@@ -2833,6 +3336,7 @@ class ChatSession {
       for (const [k, v] of this.gateway.actions) {
         if (v.type === "ui" && v.requestId === action.requestId) this.gateway.actions.delete(k);
       }
+      this.herdrReporter?.reportState("working");
       this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
       if (callback.message) {
         const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
@@ -2844,6 +3348,7 @@ class ChatSession {
   async handleEvent(event) {
     this.touchActivity();
     if (event.type === "agent_start") {
+      this.herdrReporter?.reportState("working");
       const isInitialStart = !this.isStreaming;
       this.isStreaming = true;
       this.pendingUi = null;
@@ -2868,6 +3373,7 @@ class ChatSession {
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
+      this.herdrReporter?.reportState("idle");
       this.isStreaming = false;
       this.pendingUi = null;
       this.currentToolSummary = null;
@@ -3139,6 +3645,9 @@ class ChatSession {
   }
 
   async handleUiRequest(request) {
+    if (request.method !== "notify") {
+      this.herdrReporter?.reportState("blocked", request.title || request.message || "Waiting for input");
+    }
     if (["select", "confirm"].includes(request.method)) {
       const options = request.method === "confirm" ? [
         { label: "Confirm", response: { confirmed: true } }, { label: "Cancel", response: { confirmed: false } },
@@ -3402,7 +3911,11 @@ class ChatSession {
       this.statusBoardTickTimer = null;
     }
     this.resetSessionState();
-    this.pi.stop();
+    if (this.herdrReporter) {
+      this.herdrReporter.releaseAgent();
+      this.herdrReporter = null;
+    }
+    this.pi?.stop?.();
   }
 }
 
@@ -3474,13 +3987,14 @@ class Gateway {
   }
 
   getOwnedPaneIds(excludingSession = null) {
-    const panes = [];
-    for (const session of this.sessions.values()) {
-      if (session !== excludingSession && session.pi?.herdrEnv?.HERDR_PANE_ID) {
-        panes.push(session.pi.herdrEnv.HERDR_PANE_ID);
+    const panes = new Set();
+    for (const [key, session] of this.sessions.entries()) {
+      if (session !== excludingSession) {
+        if (session.pi?.herdrEnv?.HERDR_PANE_ID) panes.add(session.pi.herdrEnv.HERDR_PANE_ID);
+        if (this.state.herdrPanes?.[key]) panes.add(this.state.herdrPanes[key]);
       }
     }
-    return panes;
+    return [...panes];
   }
 
   // ref: 资源管控 — 限制全局最大并发 Pi 进程数，并在超限时挂起最久未活动的非流式 Topic
@@ -3749,6 +4263,7 @@ class Gateway {
     if (session.pendingUi && !message.text?.startsWith("/")) {
       const pending = session.pendingUi;
       session.pendingUi = null;
+      session.herdrReporter?.reportState("working");
       this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
       session.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
       await session.send("Submitted.");
@@ -3903,7 +4418,7 @@ class Gateway {
     if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available (disabled in config, or its server is not running).");
     await this.herdrWatcher.sync();
     const ownPanes = new Set(this.getOwnedPaneIds());
-    const agents = [...this.herdrWatcher.agents.values()].filter((agent) => !ownPanes.has(agent.pane_id));
+    const agents = [...this.herdrWatcher.agents.values()];
     if (!agents.length) return this.telegram.send(this.chatId, "No agents running in Herdr.");
     const byWorkspace = new Map();
     for (const agent of agents) {
@@ -3915,12 +4430,14 @@ class Gateway {
     for (const [ws, list] of byWorkspace) {
       lines.push(`**${ws}**`);
       for (const agent of list) {
+        const isOwn = ownPanes.has(agent.pane_id);
+        const badge = isOwn ? " 📱" : (herdrOptedIn(agent) ? " 📡" : "");
         const title = agent.terminal_title_stripped ? ` — ${agent.terminal_title_stripped.replace(/[`*_\[\]]/g, "")}` : "";
-        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${herdrOptedIn(agent) ? " 📡" : ""}${title}`);
+        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${badge}${title}`);
       }
       lines.push("");
     }
-    lines.push("📡 = pushed to Telegram (run /remote-pi inside that Pi to toggle). Tap an agent to see its screen.");
+    lines.push("📱 = Telegram session. 📡 = pushed to Telegram. Tap an agent to see its screen.");
     return this.telegram.send(this.chatId, lines.join("\n"), this.keyboard(agents.map((agent) => ({
       label: `${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} · ${this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.pane_id}`,
       action: { type: "herdr_peek", paneId: agent.pane_id },
@@ -3986,15 +4503,24 @@ class Gateway {
           const threadId = action.threadId;
           const sessionKey = `t:${threadId}`;
           const targetSession = this.sessions.get(sessionKey);
+          const oldWsId = targetSession?.pi?.herdrEnv?.HERDR_WORKSPACE_ID;
+          const herdrBin = targetSession?.pi?.herdrEnv?.HERDR_BIN_PATH;
           if (targetSession) {
+            await targetSession.stopViewer();
             targetSession.stop();
             this.sessions.delete(sessionKey);
+          }
+          if (oldWsId && herdrBin && !HERDR_DISABLED_FOR_TEST) {
+            await runCommand(herdrBin, ["workspace", "close", oldWsId], { timeout: 3000 }).catch(() => {});
           }
           delete this.state.topics[threadId];
           if (this.state.statusBoards) {
             delete this.state.statusBoards[sessionKey];
           }
-          await this.saveState({ topics: this.state.topics, statusBoards: this.state.statusBoards });
+          if (this.state.herdrPanes) {
+            delete this.state.herdrPanes[sessionKey];
+          }
+          await this.saveState({ topics: this.state.topics, statusBoards: this.state.statusBoards, herdrPanes: this.state.herdrPanes });
           await this.telegram.call("deleteForumTopic", {
             chat_id: this.chatId,
             message_thread_id: threadId,
@@ -4142,9 +4668,18 @@ class Gateway {
 }
 
 async function selfTest() {
+  HERDR_DISABLED_FOR_TEST = true;
   const origGlobalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     throw new Error(`self-test: unexpected network call to ${url}`);
+  };
+  const origNetConnect = net.connect;
+  net.connect = function (...args) {
+    const target = args[0];
+    if (typeof target === "string" && target === process.env.HERDR_SOCKET_PATH) {
+      throw new Error(`Self-test must never connect to real Herdr socket: ${target}`);
+    }
+    return origNetConnect.apply(this, args);
   };
   try {
   assert.deepEqual(parseCommand("/model openai/gpt-5"), { name: "model", argument: "openai/gpt-5" });
@@ -5754,16 +6289,12 @@ async function selfTest() {
     });
     assert.ok(sent[4].text.includes("This session is on the desktop"), "Media group routes to handoff prompt");
 
-    // 4. Herdr guard warns if a desktop Pi is working in cwd
-    sess.checkHerdrWorkingPi = async () => true;
-    await sess.handleTakeBack(false);
-    assert.ok(sent[5].text.includes("desktop Pi agent is currently working"), "Warns if desktop Pi working");
-    assert.ok(sess.handoff, "Handoff mark remains before confirmation");
-
-    // 5. Take back with confirmation restores session
+    // 4. Pane-based check refuses take back if pane agent is working/blocked
     let switchedPath = null;
+    sess.gateway.state.herdrPanes = { [sess.key]: "p_test" };
     sess.createPi = () => ({
       start: async () => {},
+      stop: () => {},
       request: async (cmd, params) => {
         if (cmd === "switch_session") { switchedPath = params.sessionPath; return { cancelled: false }; }
         if (cmd === "get_last_assistant_text") return { text: "Previous answer from desktop" };
@@ -5771,13 +6302,52 @@ async function selfTest() {
         return {};
       },
     });
-    await sess.handleTakeBack(true);
+
+    sess.getPaneAgentStatus = async () => "working";
+    await sess.handleTakeBack();
+    assert.ok(sent[5].text.includes("Desktop Pi is currently working"), "Refuses take back if pane agent is working");
+    assert.ok(sess.handoff, "Handoff mark remains before confirmation");
+
+    sess.getPaneAgentStatus = async () => "blocked";
+    await sess.handleTakeBack();
+    assert.ok(sent[6].text.includes("Desktop Pi is currently blocked"), "Refuses take back if pane agent is blocked");
+    assert.ok(sess.handoff, "Handoff mark remains before confirmation");
+
+    // 4c. Refuses take back if status is unknown and pane is not at shell
+    sess.getPaneAgentStatus = async () => "unknown";
+    sess.isPaneAtShell = async () => false;
+    sess.getPaneForegroundCmdline = async () => "pi --session /tmp/s.jsonl";
+    await sess.handleTakeBack();
+    assert.ok(sent[7].text.includes("still running a process (`pi --session"), "Refuses take back if status unknown and pane not at shell");
+    assert.ok(sess.handoff, "Handoff mark remains");
+
+    // 5. Take back succeeds once pane agent is idle
+    sess.getPaneAgentStatus = async () => "idle";
+    sess.isPaneAtShell = async () => true;
+    sess.quitPaneAgent = async () => true;
+    await sess.handleTakeBack();
     assert.equal(sess.handoff, null, "Handoff mark must be cleared after take back");
     assert.equal(switchedPath, fakeSessionFile);
-    assert.ok(sent[6].text.includes("Back on Telegram"));
-    assert.ok(sent[6].text.includes("Previous answer from desktop"));
+    assert.ok(sent[8].text.includes("Back on Telegram"));
+    assert.ok(sent[8].text.includes("Previous answer from desktop"));
     assert.equal(boardUpdates, 2, "Status board update scheduled on take back");
     assert.ok(!sess.renderCurrentStatusBoard().includes("On desktop"), "Board clears desktop handoff on take back");
+
+    // 5b. Exception: if pane no longer exists, take back proceeds
+    gwHandoff.state.handoffs = { [sess.key]: { sessionFile: fakeSessionFile, at: Date.now() } };
+    sess.paneExists = async () => false;
+    await sess.handleTakeBack();
+    assert.equal(sess.handoff, null, "Handoff mark must be cleared if pane no longer exists");
+    assert.ok(sent[9].text.includes("Back on Telegram"));
+    assert.equal(boardUpdates, 3, "Status board update scheduled on take back");
+
+    // 5c. Viewer persists when Pi stops (idle stop, eviction, exit); only stopped on handoff, /cwd, /close
+    let viewerStopped = false;
+    sess.stopViewer = () => { viewerStopped = true; };
+    sess.stop();
+    assert.equal(viewerStopped, false, "Viewer must not be stopped on session.stop() (idle stop / eviction)");
+    sess.handlePiExit({ code: 0, signal: null, expected: true });
+    assert.equal(viewerStopped, false, "Viewer must not be stopped on handlePiExit");
 
     // 6. New session here clears handoff and refreshes status board
     gwHandoff.state.handoffs = { [sess.key]: { sessionFile: fakeSessionFile, at: Date.now() } };
@@ -5792,19 +6362,179 @@ async function selfTest() {
     });
     await sess.handleNewSessionHere();
     assert.equal(sess.handoff, null);
-    assert.equal(boardUpdates, 3, "Status board update scheduled on new session here");
+    assert.equal(boardUpdates, 4, "Status board update scheduled on new session here");
     assert.ok(!sess.renderCurrentStatusBoard().includes("On desktop"), "Board clears desktop handoff on new session here");
+  }
+
+  // Herdr pane ownership: resolveHerdrEnvironment
+  {
+    // 1. Never picks a pane by cwd match; creates new workspace
+    const commandsRun = [];
+    const mockRunner = async (bin, args) => {
+      commandsRun.push([bin, ...args]);
+      if (args[0] === "which") return "/usr/local/bin/herdr";
+      if (args[0] === "status" && args[1] === "server") return JSON.stringify({ running: true, socket: "/tmp/mock.sock" });
+      if (args[0] === "pane" && args[1] === "list") {
+        return JSON.stringify({ result: { panes: [{ pane_id: "w1:p1", cwd: "/test/cwd", workspace_id: "w1", tab_id: "t1" }] } });
+      }
+      if (args[0] === "workspace" && args[1] === "create") {
+        return JSON.stringify({ result: { workspace: { workspace_id: "w_new" }, tab: { tab_id: "t_new" }, root_pane: { pane_id: "p_new" } } });
+      }
+      throw new Error(`Unexpected command: ${args.join(" ")}`);
+    };
+
+    const env = await resolveHerdrEnvironment("/test/cwd", { runCmd: mockRunner });
+    assert.equal(env.HERDR_PANE_ID, "p_new", "Must create new workspace, never pick from pane list by cwd");
+    assert.ok(commandsRun.some((c) => c[1] === "workspace" && c[2] === "create" && c.includes("📱 cwd")), "Workspace label must have 📱 prefix");
+    assert.ok(!commandsRun.some((c) => c[1] === "pane" && c[2] === "list"), "Must never call pane list to match cwd");
+
+    // 2. Reuses persisted pane if it still exists
+    commandsRun.length = 0;
+    const mockRunnerPersisted = async (bin, args) => {
+      commandsRun.push([bin, ...args]);
+      if (args[0] === "which") return "/usr/local/bin/herdr";
+      if (args[0] === "status" && args[1] === "server") return JSON.stringify({ running: true, socket: "/tmp/mock.sock" });
+      if (args[0] === "pane" && args[1] === "get" && args[2] === "p_saved") {
+        return JSON.stringify({ result: { pane: { pane_id: "p_saved", workspace_id: "w_saved", tab_id: "t_saved", cwd: "/test/cwd" } } });
+      }
+      throw new Error(`Unexpected command: ${args.join(" ")}`);
+    };
+    const envPersisted = await resolveHerdrEnvironment("/test/cwd", { persistedPaneId: "p_saved", runCmd: mockRunnerPersisted });
+    assert.equal(envPersisted.HERDR_PANE_ID, "p_saved", "Must reuse persisted pane if it exists");
+    assert.ok(!commandsRun.some((c) => c[1] === "workspace" && c[2] === "create"), "Must not create workspace when persisted pane is reused");
+
+    // 3. Fallback to new workspace if persisted pane is gone
+    commandsRun.length = 0;
+    const mockRunnerGone = async (bin, args) => {
+      commandsRun.push([bin, ...args]);
+      if (args[0] === "which") return "/usr/local/bin/herdr";
+      if (args[0] === "status" && args[1] === "server") return JSON.stringify({ running: true, socket: "/tmp/mock.sock" });
+      if (args[0] === "pane" && args[1] === "get") {
+        throw new Error("pane not found");
+      }
+      if (args[0] === "workspace" && args[1] === "create") {
+        return JSON.stringify({ result: { workspace: { workspace_id: "w_fallback" }, tab: { tab_id: "t_fallback" }, root_pane: { pane_id: "p_fallback" } } });
+      }
+      throw new Error(`Unexpected command: ${args.join(" ")}`);
+    };
+    const envFallback = await resolveHerdrEnvironment("/test/cwd", { persistedPaneId: "p_gone", runCmd: mockRunnerGone });
+    assert.equal(envFallback.HERDR_PANE_ID, "p_fallback", "Must create new workspace if persisted pane not found");
+  }
+
+  // HerdrReporter state transitions with mock socket server
+  {
+    const received = [];
+    const sockPath = join(tmpdir(), `test-reporter-${Date.now()}.sock`);
+    const server = net.createServer((c) => {
+      let buf = "";
+      c.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        let idx;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (line) {
+            const parsed = JSON.parse(line);
+            received.push(parsed);
+            c.write(JSON.stringify({ id: parsed.id, result: { type: "ok" } }) + "\n");
+          }
+        }
+      });
+    });
+    await new Promise((resolve) => server.listen(sockPath, resolve));
+
+    const reporter = new HerdrReporter({ socketPath: sockPath, paneId: "p1", allowInTest: true });
+    await reporter.reportSession("/tmp/session.jsonl");
+    await reporter.reportMetadata("Telegram");
+    reporter.reportState("working");
+    await sleep(50);
+    reporter.reportState("blocked", "Confirm delete?");
+    await sleep(50);
+    reporter.reportState("idle");
+    await sleep(50);
+    await reporter.releaseAgent();
+
+    server.close();
+    try { await unlink(sockPath); } catch {}
+
+    assert.equal(received.length, 6);
+    assert.equal(received[0].method, "pane.report_agent_session");
+    assert.equal(received[0].params.agent_session_path, "/tmp/session.jsonl");
+    assert.equal(received[1].method, "pane.report_metadata");
+    assert.equal(received[1].params.display_agent, "pi · Telegram");
+    assert.equal(received[1].params.title, "Telegram");
+    assert.equal(received[2].method, "pane.report_agent");
+    assert.equal(received[2].params.state, "working");
+    assert.equal(received[3].method, "pane.report_agent");
+    assert.equal(received[3].params.state, "blocked");
+    assert.equal(received[3].params.message, "Confirm delete?");
+    assert.equal(received[4].method, "pane.report_agent");
+    assert.equal(received[4].params.state, "idle");
+    assert.equal(received[5].method, "pane.release_agent");
+    for (let i = 1; i < received.length; i++) {
+      assert.ok(received[i].params.seq > received[i - 1].params.seq, "seq must monotonically increase");
+    }
+  }
+
+  // Viewer rendering test (pure render function)
+  {
+    // user message
+    const userMsg = renderSessionEntry({ type: "message", message: { role: "user", content: "list files" } });
+    assert.ok(userMsg.includes("› list files"), "Renders user message with ›");
+
+    // assistant message with text & toolCall
+    const asstMsg = renderSessionEntry({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I will check the directory." },
+          { type: "toolCall", name: "bash", args: { command: "ls -la" } },
+        ],
+      },
+    });
+    assert.ok(asstMsg.includes("I will check the directory."));
+    assert.ok(asstMsg.includes("⚙️ bash: ls -la"));
+
+    // tool error
+    const toolErr = renderSessionEntry({
+      type: "message",
+      message: { role: "toolResult", toolName: "bash", isError: true, content: "command not found" },
+    });
+    assert.ok(toolErr.includes("❌ bash error: command not found"));
+    assert.ok(toolErr.includes("\x1b[31m"), "Tool error must be in red");
+
+    // compaction
+    const comp = renderSessionEntry({ type: "compaction", tokensBefore: 12000 });
+    assert.ok(comp.includes("📦 Context compacted (12000 tokens)"));
+
+    // model change
+    const modelChange = renderSessionEntry({ type: "model_change", provider: "anthropic", modelId: "claude-sonnet-4-5" });
+    assert.ok(modelChange.includes("⚡ Model changed to anthropic/claude-sonnet-4-5"));
+
+    // unknown type ignored
+    assert.equal(renderSessionEntry({ type: "unknown_custom_future_type", foo: "bar" }), "");
   }
 
   console.log("self-test: ok");
   } finally {
     globalThis.fetch = origGlobalFetch;
+    net.connect = origNetConnect;
+    HERDR_DISABLED_FOR_TEST = false;
   }
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--self-test")) {
     await selfTest();
+  } else if (process.argv.includes("--watch-session")) {
+    const idx = process.argv.indexOf("--watch-session");
+    const sessionFile = process.argv[idx + 1];
+    if (!sessionFile) {
+      console.error("Usage: node gateway.mjs --watch-session <sessionFile>");
+      process.exit(1);
+    }
+    await watchSessionViewer(sessionFile);
   } else {
     if (process.env.REMOTE_PI_GATEWAY) {
       console.error("❌ Refusing to start: already running inside a remote-pi session.");
