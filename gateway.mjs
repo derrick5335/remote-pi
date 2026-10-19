@@ -95,6 +95,47 @@ function retryableTelegramStatus(status) {
   return status === 429 || status >= 500;
 }
 
+// ref: AWS Architecture Blog — Exponential Backoff And Jitter (https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+function pollBackoffMs(failures, random = Math.random) {
+  const f = Math.max(1, failures);
+  return Math.max(500, Math.round(random() * Math.min(60_000, 1000 * (2 ** (f - 1)))));
+}
+
+const NON_IDEMPOTENT_METHODS = new Set([
+  "sendMessage",
+  "sendDocument",
+  "sendPhoto",
+  "sendMediaGroup",
+  "copyMessage",
+  "forwardMessage",
+]);
+
+const CONNECT_PHASE_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function isConnectPhaseError(error) {
+  const code = error?.cause?.code || error?.code;
+  return Boolean(code && CONNECT_PHASE_CODES.has(code));
+}
+
+// ref: Telegram Bot API — Making requests (https://core.telegram.org/bots/api#making-requests)
+function shouldRetryTelegram(method, { status, error } = {}) {
+  const isNonIdempotent = NON_IDEMPOTENT_METHODS.has(method);
+  if (typeof status === "number") {
+    return isNonIdempotent ? status === 429 : retryableTelegramStatus(status);
+  }
+  if (error !== undefined && error !== null) {
+    return isNonIdempotent ? isConnectPhaseError(error) : true;
+  }
+  return false;
+}
+
 function telegramCommandName(command) {
   const name = command.source === "skill" ? `skill_${command.name.slice("skill:".length)}` : command.name;
   return name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
@@ -468,9 +509,14 @@ class Telegram {
     this.wakeTimer = null;
     this.wakePromise = null;
     this.currentPollAc = null;
+    this.pollSleepAc = null;
+    this.polling = false;
+    this.pollFailures = 0;
+    this.outageStart = 0;
+    this.inConflict = false;
   }
 
-  async call(method, body = {}, timeout = 35_000, maxAttempts = 3, signal = null) {
+  async call(method, body = {}, timeout = 35_000, maxAttempts = 3, signal = null, quiet = false) {
     let lastError;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let response;
@@ -488,15 +534,19 @@ class Telegram {
       } catch (error) {
         if (signal?.aborted) throw error; // 外部主动 abort（如唤醒重置），不再内部重试死等
         const ms = Math.round(performance.now() - t0);
-        console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed in ${ms}ms:`, error.message);
+        if (!quiet) console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed in ${ms}ms:`, error.message);
         lastError = error;
-        if (attempt === maxAttempts - 1) throw error;
+        const retryable = shouldRetryTelegram(method, { error });
+        if (!retryable || attempt === maxAttempts - 1) throw error;
         await sleep((attempt + 1) * 1000);
         continue;
       }
       const ms = Math.round(performance.now() - t0);
       if (response.ok && data.ok) {
-        if (method !== "getUpdates" || (Array.isArray(data.result) && data.result.length > 0) || ms > 1500) {
+        const shouldLog = method === "getUpdates"
+          ? (Array.isArray(data.result) && data.result.length > 0)
+          : true;
+        if (shouldLog) {
           console.log(`${new Date().toISOString()} [tg:call] ${method} ok in ${ms}ms${method === "getUpdates" ? ` (updates: ${data.result.length})` : ""}`);
         }
         return data.result;
@@ -506,8 +556,9 @@ class Telegram {
         this.retryNotBefore = Math.max(this.retryNotBefore, Date.now() + retrySec * 1000);
       }
       lastError = new Error(`Telegram ${method}: ${data.description || response.status}`);
-      console.error(`${new Date().toISOString()} [tg:call] ${method} HTTP ${response.status} in ${ms}ms: ${data.description || ""}`);
-      if (!retryableTelegramStatus(response.status) || attempt === maxAttempts - 1) throw lastError;
+      if (!quiet) console.error(`${new Date().toISOString()} [tg:call] ${method} HTTP ${response.status} in ${ms}ms: ${data.description || ""}`);
+      const retryable = shouldRetryTelegram(method, { status: response.status });
+      if (!retryable || attempt === maxAttempts - 1) throw lastError;
       await sleep((data.parameters?.retry_after || attempt + 1) * 1000);
     }
     throw lastError;
@@ -628,6 +679,22 @@ class Telegram {
     this.wakeTimer.unref?.();
   }
 
+  pollSleep(ms, signal) {
+    return sleep(ms, undefined, { signal });
+  }
+
+  stopPolling() {
+    this.polling = false;
+    if (this.currentPollAc) {
+      try { this.currentPollAc.abort("stop"); } catch {}
+      this.currentPollAc = null;
+    }
+    if (this.pollSleepAc) {
+      try { this.pollSleepAc.abort("stop"); } catch {}
+      this.pollSleepAc = null;
+    }
+  }
+
   stopWakeMonitor() {
     if (this.wakeTimer) {
       clearInterval(this.wakeTimer);
@@ -636,12 +703,19 @@ class Telegram {
   }
 
   handleWake(sleepSec = 0) {
-    if (this.wakePromise) return this.wakePromise;
-    console.log(`${new Date().toISOString()} [tg:wake] System wake detected (slept ~${sleepSec}s). Aborting stale poll...`);
+    this.pollFailures = 0;
+    this.outageStart = 0;
+    this.inConflict = false;
     if (this.currentPollAc) {
       try { this.currentPollAc.abort("system_wake"); } catch {}
       this.currentPollAc = null;
     }
+    if (this.pollSleepAc) {
+      try { this.pollSleepAc.abort("system_wake"); } catch {}
+      this.pollSleepAc = null;
+    }
+    if (this.wakePromise) return this.wakePromise;
+    console.log(`${new Date().toISOString()} [tg:wake] System wake detected (slept ~${sleepSec}s). Aborting stale poll...`);
     this.wakePromise = (async () => {
       const t0 = performance.now();
       let online = false;
@@ -675,15 +749,26 @@ class Telegram {
     // at-least-once：普通消息处理完才落盘 offset，崩溃后由 Telegram 重投（重复优于丢失）；p0/p1 只推进内存 offset
     let persistChain = Promise.resolve();
     this.startWakeMonitor();
-    for (;;) {
+    this.polling = true;
+    while (this.polling) {
       if (this.wakePromise) await this.wakePromise;
+      if (!this.polling) break;
       try {
         this.currentPollAc = new AbortController();
         const updates = await this.call("getUpdates", {
           offset, timeout: 50, allowed_updates: ["message", "callback_query", "stopped_message_generation"],
-        }, 60_000, 3, this.currentPollAc.signal);
+        }, 60_000, 1, this.currentPollAc.signal, true);
         this.currentPollAc = null;
+        if (!this.polling) break;
+        this.inConflict = false;
+        if (this.pollFailures > 0) {
+          const s = Math.round((Date.now() - this.outageStart) / 1000);
+          console.log(`${new Date().toISOString()} [tg:poll] back online after ${s}s (${this.pollFailures} failed polls)`);
+          this.pollFailures = 0;
+          this.outageStart = 0;
+        }
         for (const update of updates) {
+          if (!this.polling) break;
           offset = update.update_id + 1;
           const done = handler(update);
           if (done) {
@@ -700,16 +785,37 @@ class Telegram {
         }
       } catch (error) {
         this.currentPollAc = null;
+        if (!this.polling) break;
         if (this.wakePromise) {
           await this.wakePromise;
           continue;
         }
-        console.error(`${new Date().toISOString()} [tg:poll] error:`, error.message);
         if (error.message?.includes("Conflict")) {
-          await sleep(15_000);
+          if (!this.inConflict) {
+            this.inConflict = true;
+            console.error(`${new Date().toISOString()} [tg:poll] conflict: ${error.message}`);
+          }
+          try {
+            this.pollSleepAc = new AbortController();
+            await this.pollSleep(15_000, this.pollSleepAc.signal);
+          } catch {} finally {
+            this.pollSleepAc = null;
+          }
           continue;
         }
-        await sleep(3000);
+        this.inConflict = false;
+        this.pollFailures++;
+        if (this.pollFailures === 1) {
+          this.outageStart = Date.now();
+          console.error(`${new Date().toISOString()} [tg:poll] offline: ${error.message}; retrying with backoff`);
+        }
+        const backoffMs = pollBackoffMs(this.pollFailures);
+        try {
+          this.pollSleepAc = new AbortController();
+          await this.pollSleep(backoffMs, this.pollSleepAc.signal);
+        } catch {} finally {
+          this.pollSleepAc = null;
+        }
       }
     }
   }
@@ -1008,13 +1114,16 @@ class PiRpc {
     this.pending = new Map();
     this.sequence = 0;
     this.proc = null;
+    this.starting = null;
     this.pingTimer = null;
     this.missedPings = 0;
     this.stopping = false;
   }
 
   async ensureStarted() {
-    if (!this.proc) await this.start();
+    if (this.proc) return;
+    this.starting ??= this.start().finally(() => { this.starting = null; });
+    await this.starting;
   }
 
   async start() {
@@ -1145,7 +1254,13 @@ class PiRpc {
         },
         timer,
       });
-      this.write({ id, type, ...fields });
+      try {
+        this.write({ id, type, ...fields });
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
     });
   }
 
@@ -2431,6 +2546,7 @@ class Gateway {
 
   stop() {
     this.resetSessionState();
+    this.telegram?.stopPolling?.();
     this.telegram?.stopWakeMonitor?.();
     this.herdrWatcher?.stop();
     if (this.lockServer) {
@@ -3089,6 +3205,8 @@ async function selfTest() {
     await sleep(80);
     assert.deepEqual(handled, [7]);
     assert.equal(readFileSync(join(tmpOffset, "offset"), "utf8"), "8", "处理完后 offset 应为 update_id+1");
+    tg.stopPolling();
+    tg.stopWakeMonitor();
 
     // 回归：macOS 休眠唤醒自愈（秒级中止死轮询 + 快速网络探测重连）
     {
@@ -3152,6 +3270,275 @@ async function selfTest() {
   }
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
   assert.ok(BOT_COMMANDS.some((c) => c.command === "upgrade"), "BOT_COMMANDS registers upgrade");
+
+  // 1. pollBackoffMs 指数退避与全抖动
+  assert.equal(pollBackoffMs(1, () => 1), 1000);
+  assert.equal(pollBackoffMs(1, () => 0), 500); // 最小不低于 500ms
+  assert.equal(pollBackoffMs(1, () => 0.8), 800);
+  assert.equal(pollBackoffMs(2, () => 1), 2000);
+  assert.equal(pollBackoffMs(2, () => 0.1), 500); // 2000 * 0.1 = 200 -> 500
+  assert.equal(pollBackoffMs(3, () => 0.5), 2000); // 4000 * 0.5 = 2000
+  assert.equal(pollBackoffMs(7, () => 1), 60_000); // 64_000 封顶 60_000
+  assert.equal(pollBackoffMs(10, () => 1), 60_000);
+  assert.equal(pollBackoffMs(0, () => 1), 1000);
+
+  // 1. Telegram.call quiet 选项抑制重试与 HTTP 错误日志
+  {
+    const tg = new Telegram("fake-token", "/tmp/fake");
+    const origFetch = globalThis.fetch;
+    const origError = console.error;
+    const loggedErrors = [];
+    console.error = (...args) => loggedErrors.push(args.join(" "));
+
+    globalThis.fetch = async () => { throw new Error("connection dropped"); };
+    await assert.rejects(() => tg.call("getUpdates", {}, 1000, 1, null, true), /connection dropped/);
+    assert.equal(loggedErrors.filter((l) => l.includes("[tg:call]")).length, 0, "quiet=true 时应抑制 [tg:call] 错误日志");
+
+    await assert.rejects(() => tg.call("getUpdates", {}, 1000, 1, null, false), /connection dropped/);
+    assert.ok(loggedErrors.some((l) => l.includes("[tg:call] getUpdates attempt 1/1 failed")), "quiet=false 时应输出错误日志");
+
+    console.error = origError;
+    globalThis.fetch = origFetch;
+  }
+
+  // 1. poll() 退避睡眠可被 handleWake 中断并重置失败计数
+  {
+    const tg = new Telegram("123456:fake-token", join(tmpdir(), `test-offset-${Date.now()}`));
+    tg.pollFailures = 4;
+    tg.outageStart = Date.now() - 5000;
+    let sleepAborted = false;
+    tg.pollSleepAc = new AbortController();
+    tg.pollSleepAc.signal.addEventListener("abort", () => { sleepAborted = true; });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true }) });
+    const wakePromise = tg.handleWake(10);
+    assert.equal(sleepAborted, true, "handleWake 应立即 abort 退避等待");
+    assert.equal(tg.pollFailures, 0, "handleWake 应重置连续失败计数");
+    await wakePromise;
+    globalThis.fetch = origFetch;
+  }
+
+  // 1. poll() 断网与恢复日志：断网仅首见打 1 行 offline，期间静默，恢复打 1 行 back online
+  {
+    const tmpOffset = join(tmpdir(), `test-poll-${Date.now()}`);
+    const tg = new Telegram("fake-token", tmpOffset);
+    const origError = console.error;
+    const origLog = console.log;
+    const errors = [];
+    const logs = [];
+    const sleptMs = [];
+    console.error = (...args) => errors.push(args.join(" "));
+    console.log = (...args) => logs.push(args.join(" "));
+
+    tg.pollSleep = async (ms) => {
+      sleptMs.push(ms);
+    };
+
+    let pollStep = 0;
+    let pollPromise;
+    const donePromise = new Promise((resolve) => {
+      tg.call = async () => {
+        pollStep++;
+        if (pollStep === 1) throw new Error("poll outage 1");
+        if (pollStep === 2) throw new Error("poll outage 2");
+        if (pollStep === 3) return [{ update_id: 10 }];
+        throw new Error("unexpected poll");
+      };
+      pollPromise = tg.poll(() => { resolve(); return Promise.resolve(); });
+    });
+
+    await donePromise;
+    tg.stopPolling();
+    tg.stopWakeMonitor();
+    await pollPromise;
+    console.error = origError;
+    console.log = origLog;
+
+    assert.equal(errors.filter((l) => l.includes("[tg:poll] offline:")).length, 1, "断网期间 offline 仅应记录 1 行");
+    assert.ok(errors.some((l) => l.includes("[tg:poll] offline: poll outage 1; retrying with backoff")), "offline 日志内容");
+    assert.equal(errors.filter((l) => l.includes("poll outage 2")).length, 0, "断网期间后续失败应保持静默");
+    assert.equal(logs.filter((l) => l.includes("[tg:poll] back online after")).length, 1, "恢复后应记录 1 行 back online");
+    assert.ok(logs.some((l) => l.includes("(2 failed polls)")), "恢复日志需体现连续失败次数");
+    assert.equal(sleptMs.length, 2, "断网期间应触发 2 次退避睡眠");
+    assert.ok(sleptMs[0] >= 500 && sleptMs[0] <= 1000, `failure 1 退避范围 500..1000，实际: ${sleptMs[0]}`);
+    assert.ok(sleptMs[1] >= 500 && sleptMs[1] <= 2000, `failure 2 退避范围 500..2000，实际: ${sleptMs[1]}`);
+  }
+
+  // 1. poll() Conflict 处理：记录 [tg:poll] conflict:，不计入 outage/back-online，15s 可中断休眠
+  {
+    const tmpOffset = join(tmpdir(), `test-poll-conflict-${Date.now()}`);
+    const tg = new Telegram("fake-token", tmpOffset);
+    const origError = console.error;
+    const origLog = console.log;
+    const errors = [];
+    const logs = [];
+    const sleptMs = [];
+    console.error = (...args) => errors.push(args.join(" "));
+    console.log = (...args) => logs.push(args.join(" "));
+
+    tg.pollSleep = async (ms) => {
+      sleptMs.push(ms);
+    };
+
+    let step = 0;
+    let pollPromise;
+    const donePromise = new Promise((resolve) => {
+      tg.call = async () => {
+        step++;
+        if (step === 1) throw new Error("Conflict: terminated by other getUpdates request");
+        if (step === 2) throw new Error("Conflict: duplicate");
+        if (step === 3) return [{ update_id: 20 }];
+        throw new Error("unexpected poll");
+      };
+      pollPromise = tg.poll(() => { resolve(); return Promise.resolve(); });
+    });
+
+    await donePromise;
+    tg.stopPolling();
+    tg.stopWakeMonitor();
+    await pollPromise;
+    console.error = origError;
+    console.log = origLog;
+
+    assert.equal(errors.filter((l) => l.includes("[tg:poll] conflict:")).length, 1, "Conflict 连续出现应只打 1 行日志");
+    assert.equal(errors.filter((l) => l.includes("[tg:poll] offline:")).length, 0, "Conflict 不应被当作 offline outage");
+    assert.equal(logs.filter((l) => l.includes("[tg:poll] back online")).length, 0, "Conflict 恢复不应打 back online");
+    assert.equal(tg.pollFailures, 0, "Conflict 不应计入 pollFailures");
+    assert.deepEqual(sleptMs, [15_000, 15_000], "Conflict 每次应请求 15s 休眠");
+  }
+
+  // 2. getUpdates 空轮询不打成功日志，非空或其它方法打成功日志
+  {
+    const tg = new Telegram("fake-token", "/tmp/fake");
+    const origFetch = globalThis.fetch;
+    const origLog = console.log;
+    let logged = [];
+    console.log = (...args) => logged.push(args.join(" "));
+
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: [] }) });
+    await tg.call("getUpdates", {});
+    assert.equal(logged.filter((l) => l.includes("[tg:call] getUpdates ok")).length, 0, "空轮询不应输出 [tg:call] getUpdates ok 日志");
+
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: [{ update_id: 1 }] }) });
+    await tg.call("getUpdates", {});
+    assert.ok(logged.some((l) => l.includes("[tg:call] getUpdates ok") && l.includes("(updates: 1)")), "有更新时应输出日志");
+
+    logged = [];
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: { id: 123 } }) });
+    await tg.call("getMe", {});
+    assert.ok(logged.some((l) => l.includes("[tg:call] getMe ok")), "其它方法成功应输出日志");
+
+    console.log = origLog;
+    globalThis.fetch = origFetch;
+  }
+
+  // 3. config.example.json 嵌套结构及 README 一致性
+  {
+    const exampleRaw = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "config.example.json"), "utf8");
+    const example = JSON.parse(exampleRaw);
+    assert.ok(example.telegram?.botToken, "config.example.json 需包含 telegram.botToken");
+    assert.ok(example.telegram?.allowedUserId, "config.example.json 需包含 telegram.allowedUserId");
+    assert.equal(example.botToken, undefined, "config.example.json 不应有顶层 botToken");
+    assert.equal(example.allowedUserId, undefined, "config.example.json 不应有顶层 allowedUserId");
+    assert.equal(example.devRoot, undefined, "config.example.json 不应包含无用字段 devRoot");
+    assert.ok(example.cwd, "config.example.json 需包含 cwd");
+
+    const readmeEn = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "README.md"), "utf8");
+    const readmeZh = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "README.zh-CN.md"), "utf8");
+    for (const [name, doc] of [["README.md", readmeEn], ["README.zh-CN.md", readmeZh]]) {
+      assert.ok(doc.includes('"telegram": {'), `${name} 应包含嵌套 telegram 配置示例`);
+      assert.ok(doc.includes('"botToken":'), `${name} 应包含 botToken`);
+      assert.ok(!doc.includes('"devRoot":'), `${name} 不应包含 devRoot 示例`);
+    }
+  }
+
+  // 4. 非幂等方法不盲目重试 (isConnectPhaseError / shouldRetryTelegram)
+  {
+    assert.equal(isConnectPhaseError({ cause: { code: "ECONNREFUSED" } }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "ENOTFOUND" } }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "EAI_AGAIN" } }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "ENETUNREACH" } }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "EHOSTUNREACH" } }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "UND_ERR_CONNECT_TIMEOUT" } }), true);
+    assert.equal(isConnectPhaseError({ code: "ECONNREFUSED" }), true);
+    assert.equal(isConnectPhaseError({ cause: { code: "ECONNRESET" } }), false);
+    assert.equal(isConnectPhaseError(new Error("aborted")), false);
+    assert.equal(isConnectPhaseError(null), false);
+
+    assert.equal(shouldRetryTelegram("sendMessage", { error: { cause: { code: "ECONNREFUSED" } } }), true);
+    assert.equal(shouldRetryTelegram("sendMessage", { error: { cause: { code: "ECONNRESET" } } }), false);
+    assert.equal(shouldRetryTelegram("sendMessage", { error: new Error("timeout") }), false);
+    assert.equal(shouldRetryTelegram("sendMessage", { status: 429 }), true);
+    assert.equal(shouldRetryTelegram("sendMessage", { status: 500 }), false);
+    assert.equal(shouldRetryTelegram("sendMessage", { status: 502 }), false);
+    assert.equal(shouldRetryTelegram("sendMessage", { status: 400 }), false);
+
+    for (const m of ["sendDocument", "sendPhoto", "sendMediaGroup", "copyMessage", "forwardMessage"]) {
+      assert.equal(shouldRetryTelegram(m, { status: 500 }), false, `${m} HTTP 500 不应重试`);
+      assert.equal(shouldRetryTelegram(m, { status: 429 }), true, `${m} HTTP 429 应重试`);
+      assert.equal(shouldRetryTelegram(m, { error: { cause: { code: "ECONNRESET" } } }), false, `${m} ECONNRESET 不应重试`);
+      assert.equal(shouldRetryTelegram(m, { error: { cause: { code: "ECONNREFUSED" } } }), true, `${m} ECONNREFUSED 应重试`);
+    }
+
+    for (const m of ["getUpdates", "editMessageText", "deleteMessage", "getMe"]) {
+      assert.equal(shouldRetryTelegram(m, { status: 500 }), true, `${m} HTTP 500 应重试`);
+      assert.equal(shouldRetryTelegram(m, { status: 429 }), true, `${m} HTTP 429 应重试`);
+      assert.equal(shouldRetryTelegram(m, { status: 400 }), false, `${m} HTTP 400 不应重试`);
+      assert.equal(shouldRetryTelegram(m, { error: { cause: { code: "ECONNRESET" } } }), true, `${m} ECONNRESET 应重试`);
+      assert.equal(shouldRetryTelegram(m, { error: new Error("timeout") }), true, `${m} 超时应重试`);
+    }
+
+    const tg = new Telegram("fake-token", "/tmp/fake");
+    const origFetch = globalThis.fetch;
+    let fetchCount = 0;
+
+    globalThis.fetch = async () => {
+      fetchCount++;
+      const err = new TypeError("fetch failed");
+      err.cause = { code: "ECONNRESET" };
+      throw err;
+    };
+    await assert.rejects(() => tg.call("sendMessage", { text: "hi" }, 1000, 3, null, true), /fetch failed/);
+    assert.equal(fetchCount, 1, "sendMessage 遇 ECONNRESET 仅发 1 次不重试");
+
+    fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount++;
+      return { ok: false, status: 500, json: async () => ({ ok: false, description: "Internal Server Error" }) };
+    };
+    await assert.rejects(() => tg.call("sendMessage", { text: "hi" }, 1000, 3, null, true), /Telegram sendMessage: Internal Server Error/);
+    assert.equal(fetchCount, 1, "sendMessage 遇 HTTP 500 仅发 1 次不重试");
+
+    fetchCount = 0;
+    await assert.rejects(() => tg.call("editMessageText", { text: "hi" }, 1000, 3, null, true), /Telegram editMessageText: Internal Server Error/);
+    assert.equal(fetchCount, 3, "editMessageText 遇 HTTP 500 应重试满 maxAttempts");
+
+    globalThis.fetch = origFetch;
+  }
+
+  // 5. PiRpc start race + pending leak
+  {
+    let startCalls = 0;
+    const rpc = new PiRpc({ cwd: process.cwd(), sessionDir: "/tmp" }, () => {}, () => {});
+    rpc.start = async () => {
+      startCalls++;
+      await sleep(20);
+      rpc.proc = { stdin: { writable: false, write: () => {} } };
+    };
+
+    await Promise.all([rpc.ensureStarted(), rpc.ensureStarted(), rpc.ensureStarted()]);
+    assert.equal(startCalls, 1, "ensureStarted 并发调用时 start 仅应执行一次");
+
+    rpc.write = () => { throw new Error("pipe broke"); };
+    await assert.rejects(
+      () => rpc.request("test_cmd", {}, 1000),
+      /pipe broke/,
+      "write 抛出异常时 request 应立即 reject",
+    );
+    assert.equal(rpc.pending.size, 0, "write 异常后 pending 不应泄露");
+  }
+
   console.log("self-test: ok");
 }
 

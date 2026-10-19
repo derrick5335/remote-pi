@@ -1,7 +1,7 @@
 {
-  "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
-  "allowedUserId": "123456789",
-  "cwd": "~/dev/my-project",
-  "devRoot": "~/dev"
+  "telegram": {
+    "botToken": "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ",
+    "allowedUserId": "123456789"
+  },
+  "cwd": "~/dev/my-project"
 }
-
