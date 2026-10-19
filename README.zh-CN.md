@@ -47,7 +47,6 @@
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
   - 收到消息时 Bot 仅在原消息标记一次“接收”表情（默认 `👀`），之后保持不变。完成状态由运行摘要卡片通知，不再更换表情。
 - 📊 **运行摘要卡片与快捷操作**：任务结束时自动发送包含提示音的完成卡片（`✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%`）并列出变更文件清单（`+a −d`）。提供内联快捷操作按钮：`📄 Diff`（内联查看或下载完整 unified diff）、`✅ Commit`（流式常规提交 Prompt）、`↩️ Undo run`（交互式回滚与清理新文件）。
-- 📌 **置顶状态看板**：每个会话首次运行自动创建并置顶一条状态看板（`⏳ Working / 💤 Idle / ⚠️ Pi not running`），采用 3 秒节流原地更新，流式期间每 15 秒心跳跳动耗时。清晰展示当前工具、生效模型、Thinking 等级、上下文窗口百分比、排队追问数与上次运行摘要。
 - 🔒 **单实例互斥与严格白名单**：
   - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
   - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
@@ -78,15 +77,24 @@
 | `/queue [clear]` | 查看或重置网关的队列显示；Pi 1.3.0 公开 Extension API 不支持检查或清空原生队列 |
 | `/help` | 显示操作帮助，随后列出已加载的扩展命令、提示词模板及技能命令 |
 
-### 管理命令（可手动输入，不显示在 Telegram 菜单中）
+### 管理命令
+
+`/restart` 显示在 Telegram 命令菜单中；`/name` 和 `/upgrade` 仍可手动输入，但不显示在菜单中。
 
 | 命令 | 说明 |
 | :--- | :--- |
 | `/name <name>` | 设置会话名称 |
-| `/restart` | 重启网关 |
+| `/restart` | 重启网关；启动就绪后，将原提示更新为“✅ Gateway restarted” |
 | `/upgrade` | 自升级：fast-forward git pull → npm install → 离线自检（失败自动回滚）→ 重启 |
 
-> **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。
+> **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。内部桥接命令 `/remote-pi-new`、`/remote-pi-switch`、`/remote-pi-fork` 不会出现在 Telegram 命令列表或 Pi 终端自动补全中，但网关仍可正常执行它们。
+
+### 自定义命令路由
+
+- Telegram 共享菜单从主视图发现 Pi 命令。`/help` 列出当前视图的命令，包括 Topic 独有命令；即使不在共享菜单中，也可手动输入执行。
+- 所有网关命令名均为保留名，包括隐藏命令（`/name`、`/upgrade`）和别名（`/start`、`/commands`）。自定义命令不能覆盖它们，也不能以这些名字在菜单中发布不同的描述。
+- [Telegram 命令名](https://core.telegram.org/bots/api#botcommand)只允许小写英文字母、数字和下划线，最长 32 字符。如果转换或截断后不同 Pi 命令重名，冲突的菜单项会被省略，`/help` 会标注歧义。发送歧义名称只会报错，不会执行 Pi；不自动改名，可使用无歧义的原生写法，或回 Pi 终端执行。
+- 自定义命令每次执行都查询当前 Pi 会话的命令列表，不使用主视图或旧项目的缓存别名。已移除的命令会返回“Unknown command”；即使旧菜单项在下次刷新前仍然可见，也不会继续执行。
 
 ---
 
@@ -220,7 +228,6 @@ pi-remote-gateway stop     # 停止后台服务
 | `downloadRetentionDays` | `REMOTE_PI_DOWNLOAD_RETENTION_DAYS` | `30` | 下载目录内文件与 `failed-reply-*.txt` 副本的保留天数（启动时及每 24 小时按 mtime 清理）；设 `0` 关闭清理 |
 | `fallbackModels` | `REMOTE_PI_FALLBACK_MODELS` | `[]` | 逗号分隔的 `provider/modelId` 备用模型列表，报错时提供「切换模型重试」按钮（取当前模型在列表中的下一个，循环回绕） |
 | `doneCard` | `REMOTE_PI_DONE_CARD` | `true` | 是否在每次运行结束时发送带通知的运行摘要与变更卡片（含 Diff/Commit/Undo 按钮） |
-| `statusBoard` | `REMOTE_PI_STATUS_BOARD` | `true` | 是否为每个会话维护并置顶状态看板（节流更新状态、工具、模型、上下文与追问） |
 
 > **环境变量覆盖说明**：表中环境变量优先于配置文件。模型、凭据、信任与额外扩展由 Pi 自身管理，不再由网关配置注入。
 
@@ -265,11 +272,11 @@ pi-remote-gateway stop     # 停止后台服务
 ### 同一会话，任意设备（One session, any device）
 
 - **从手机开始**：在 Telegram 对话，或通过 `/topic [路径]` 创建 Topic。网关在 Herdr 窗格中启动真正的交互式 Pi；回到桌面直接在该窗格输入即可。`/new` 重置的是双方共享的会话，不是另一份手机进程。
-- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic；请先在 @BotFather 开启 Threaded Mode。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。
+- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic；请先在 @BotFather 开启 Threaded Mode。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。桥接连接期间，Herdr 侧边栏在 agent 旁显示 `📱` 徽标；远程控制关闭或断开/重连时消失。
 - **双向同步**：手机指令原生显示在 Pi TUI；桌面输入在 Telegram 显示为 `🖥 <text>`。指令通过 socket 与 Pi 原生输入 API 传递，不使用终端按键模拟或会话日志抓取。
 - **恢复会话而不创建第二个写入者**：`/resume` 从 `~/.pi/agent/sessions`（或 Pi 原生目录环境变量指定的位置）列出当前 cwd 的会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
 - **提问与审批**：`remote_ask` 同时出现在两个视图，先回答的一端使另一端关闭。其他扩展的 TUI 对话仍留在终端；Herdr 待确认通知仅附屏幕末尾内容及 `⏎ Enter` / `⎋ Esc` 控件。
-- **生命周期**：网关重启不停止 Pi；扩展自动重连并恢复已保存的视图绑定。Pi 退出至 Shell 后，看板显示 `⚠️ Pi not running`，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。
+- **生命周期**：网关（重）启动只重新附加仍在运行的 Pi 窗格，绝不自行启动新 Pi；若没有正在运行的 Pi，第一条消息才会启动它。扩展自动重连并恢复已保存的视图绑定。Pi 退出至 Shell 后，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。
 - **可见性**：`/agents` 保留全部 Herdr agent 的只读列表及屏幕预览；Pi 通过 Herdr 原生集成汇报自身状态。
 
 **Pi 1.3.0 公开 API 限制**：不支持检查或清空原生队列，因此 `/queue clear` 只重置网关显示，不会移除 Pi 已排队的原生消息。自动重试开始/结束通知也不可用；其余原生事件（包括压缩与运行完成）正常转发。
@@ -281,7 +288,7 @@ pi-remote-gateway stop     # 停止后台服务
 ```text
 [ Telegram 客户端 ]
        ↕ HTTPS 长轮询 / 消息 / 原地编辑 / 回调
-[ gateway.mjs ] — 路由、流式渲染、状态看板、运行摘要
+[ gateway.mjs ] — 路由、流式渲染、运行摘要
        ↕ JSON lines，经 <stateDir>/bridge.sock（Unix socket，权限 0600）
 [ Herdr 窗格：交互式 Pi + remote-pi.ts ] ↔ [ 桌面终端 ]
        ↕ Pi 公开 Extension API / 原生 CLI

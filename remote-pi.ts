@@ -107,6 +107,21 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     pane_id: paneId, source: "remote-pi",
     tokens: { remote_pi: on ? "on" : null, remote_pi_session: on ? ctx.sessionManager.getSessionFile() : null },
   });
+  let agentName;
+  const badgeName = async () => {
+    if (!agentName) {
+      const list = await metadata(env, "agent.list", {}).catch(() => null);
+      agentName = list?.agents?.find((agent) => agent.pane_id === paneId)?.name || "pi";
+    }
+    return agentName;
+  };
+  // ref: Herdr pane.report_metadata display_agent — sidebar shows 📱 only while the bridge socket is connected.
+  const setBadge = async (on) => {
+    try {
+      const fields = on ? { display_agent: `📱 ${await badgeName()}` } : { clear_display_agent: true };
+      await metadata(env, "pane.report_metadata", { pane_id: paneId, source: "remote-pi", ...fields });
+    } catch { /* display-only badge; never break the bridge */ }
+  };
   const hello = () => send({
     type: "hello", paneId, cwd: ctx.cwd, sessionFile: ctx.sessionManager.getSessionFile(),
     sessionId: ctx.sessionManager.getSessionId(), pid: process.pid, version: 1,
@@ -121,6 +136,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     current?.end();
     current?.setTimeout(2000, () => current.destroy());
     setTools(false);
+    void setBadge(false);
   };
   const reconnect = () => {
     if (!enabled || disposed || retryTimer) return;
@@ -136,12 +152,14 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       retries = 0;
       setTools(true);
       hello();
+      void setBadge(true);
     });
     current.on("error", () => {});
     current.on("close", () => {
       if (socket !== current) return;
       socket = null;
       setTools(false);
+      void setBadge(false);
       for (const dialog of dialogs.values()) dialog.finish(undefined);
       reconnect();
     });
@@ -346,6 +364,18 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   pi.on("session_start", async (event, currentCtx) => {
     ctx = currentCtx;
     startEvent = event;
+    // ref: Pi examples/extensions/github-issue-autocomplete.ts — wrap completion without changing command execution.
+    if (ctx.mode === "tui") ctx.ui.addAutocompleteProvider((current) => ({
+      triggerCharacters: current.triggerCharacters,
+      async getSuggestions(...args) {
+        const result = await current.getSuggestions(...args);
+        if (!result || !result.prefix.startsWith("/")) return result;
+        const items = result.items.filter((item) => !Object.values(INTERNAL_COMMANDS).includes(item.value));
+        return items.length ? { ...result, items } : null;
+      },
+      applyCompletion: (...args) => current.applyCompletion(...args),
+      shouldTriggerFileCompletion: (...args) => current.shouldTriggerFileCompletion?.(...args) ?? true,
+    }));
     setTools(false);
     if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !paneId) return;
     const pane = await metadata(env, "pane.get", { pane_id: paneId }).catch(() => null);
@@ -357,7 +387,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   });
   pi.on("session_shutdown", async (event) => {
     disposed = true;
-    if (event.reason === "quit" && enabled) await setOn(false).catch(() => {});
+    if (event.reason === "quit" && enabled) { await setOn(false).catch(() => {}); await setBadge(false); }
     disconnect();
   });
   // Pi 1.3.0 exposes no public auto_retry_start/end hooks; retry notifications are unavailable here.

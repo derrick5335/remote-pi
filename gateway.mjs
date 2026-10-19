@@ -59,7 +59,10 @@ const BOT_COMMANDS = [
   ["abort", "Stop task (queue kept)"],
   ["queue", "View or reset queue display"],
   ["followup", "Queue a follow-up"],
+  // ref: https://core.telegram.org/bots/api#setmycommands — publish /restart in the slash menu.
+  ["restart", "Restart the gateway"],
 ].map(([command, description]) => ({ command, description }));
+const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start", "commands", "name", "upgrade"]);
 
 function parseCommand(text) {
   const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
@@ -143,6 +146,21 @@ function shouldRetryTelegram(method, { status, error } = {}) {
 function telegramCommandName(command) {
   const name = command.source === "skill" ? `skill_${command.name.slice("skill:".length)}` : command.name;
   return name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
+}
+
+// ref: https://core.telegram.org/bots/api#botcommand — normalization and the 32-character limit can collapse distinct Pi names.
+function commandRoutes(commands) {
+  const routes = new Map();
+  for (const command of commands) {
+    const names = [command.name.toLowerCase(), telegramCommandName(command)];
+    if (command.source === "skill") names.push(`skill-${command.name.slice("skill:".length).toLowerCase()}`);
+    for (const name of names) {
+      if (!name || RESERVED_COMMANDS.has(name)) continue;
+      if (!routes.has(name)) routes.set(name, new Set());
+      routes.get(name).add(command.name);
+    }
+  }
+  return routes;
 }
 
 function expandableBlockquote(text) {
@@ -602,75 +620,6 @@ function parseNumstat(text) {
   return result;
 }
 
-function formatStatusBoard(state = {}) {
-  const lines = [];
-
-  // 1. 运行状态与耗时
-  if (state.status === "working") {
-    const durMs = state.elapsedMs ?? (state.runStartedAt ? Math.max(0, Date.now() - state.runStartedAt) : null);
-    const dur = durMs != null ? formatDuration(durMs) : null;
-    lines.push(dur ? `⏳ Working · ${dur}` : "⏳ Working");
-  } else if (state.status === "stopped") {
-    lines.push("⚠️ Pi stopped");
-  } else {
-    const agoMs = state.lastRunAgoMs ?? (state.lastRunEndedAt ? Math.max(0, Date.now() - state.lastRunEndedAt) : null);
-    const ago = agoMs != null ? formatDuration(agoMs) : null;
-    lines.push(ago ? `💤 Idle · last run ${ago} ago` : "💤 Idle");
-  }
-
-  // 2. 正在执行的工具（空闲时省略）
-  if (state.status === "working" && state.tool) {
-    lines.push(`🔧 ${state.tool}`);
-  }
-
-  // 3. 目录、模型/Thinking、上下文百分比
-  const cwdName = state.cwd ? (basename(state.cwd) || state.cwd) : "unknown";
-  const midParts = [`📁 ${cwdName}`];
-
-  let modelName = "";
-  if (typeof state.model === "object" && state.model !== null) {
-    modelName = state.model.provider ? `${state.model.provider}/${state.model.id || state.model.modelId || ""}` : (state.model.id || "");
-  } else if (typeof state.model === "string" && state.model) {
-    modelName = state.model;
-  }
-  const thinking = state.thinking && state.thinking !== "off" && state.thinking !== "none" ? ` · ${state.thinking}` : "";
-  if (modelName) {
-    midParts.push(`🧠 ${modelName}${thinking}`);
-  }
-
-  if (typeof state.ctxPercent === "number" && !isNaN(state.ctxPercent)) {
-    midParts.push(`📊 ctx ${Math.round(state.ctxPercent)}%`);
-  }
-
-  lines.push(midParts.join("  "));
-
-  // 4. 排队追加信息（为 0 时省略）
-  const queued = Number(state.queuedFollowUps || 0);
-  if (queued > 0) {
-    lines.push(`↪ ${queued} queued follow-up${queued === 1 ? "" : "s"}`);
-  }
-
-  // 5. 上次运行摘要（首次运行前省略）
-  if (state.lastRun) {
-    if (typeof state.lastRun === "string") {
-      lines.push(`Last: ${state.lastRun}`);
-    } else if (typeof state.lastRun === "object") {
-      const parts = [];
-      if (state.lastRun.filesCount != null) {
-        parts.push(`✅ ${state.lastRun.filesCount} file${state.lastRun.filesCount === 1 ? "" : "s"}`);
-        if (state.lastRun.costDelta != null) {
-          parts.push(`+$${state.lastRun.costDelta.toFixed(2)}`);
-        }
-      } else {
-        parts.push(state.lastRun.costDelta != null ? `✅ +$${state.lastRun.costDelta.toFixed(2)}` : "✅ done");
-      }
-      lines.push(`Last: ${parts.join(" · ")}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
 function extensionFromMime(mime = "") {
   const map = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "video/quicktime": ".mov", "application/pdf": ".pdf" };
   return map[String(mime).toLowerCase()] || "";
@@ -734,7 +683,7 @@ function sessionKeyOf(messageOrCallbackMessage) {
 
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, statusBoards: {}, herdrPanes: {} };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {}, herdrPanes: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
     const topics = {};
@@ -742,14 +691,6 @@ function loadState(stateDir) {
       for (const [threadId, info] of Object.entries(raw.topics)) {
         if (typeof info?.cwd === "string" && existsSync(info.cwd)) {
           topics[threadId] = { cwd: info.cwd };
-        }
-      }
-    }
-    const statusBoards = {};
-    if (typeof raw.statusBoards === "object" && raw.statusBoards !== null) {
-      for (const [key, msgId] of Object.entries(raw.statusBoards)) {
-        if (typeof msgId === "number") {
-          statusBoards[key] = msgId;
         }
       }
     }
@@ -775,11 +716,12 @@ function loadState(stateDir) {
         ? raw.recentProjects.filter((p) => typeof p === "string" && existsSync(p))
         : [],
       topics,
-      statusBoards,
       herdrPanes,
+      pendingRestartMessageId: Number.isSafeInteger(raw.pendingRestartMessageId) && raw.pendingRestartMessageId > 0
+        ? raw.pendingRestartMessageId : null,
     };
   } catch {
-    return { cwd: null, recentProjects: [], topics: {}, statusBoards: {}, herdrPanes: {} };
+    return { cwd: null, recentProjects: [], topics: {}, herdrPanes: {} };
   }
 }
 
@@ -934,9 +876,6 @@ function loadConfig() {
     doneCard: process.env.REMOTE_PI_DONE_CARD !== undefined
       ? process.env.REMOTE_PI_DONE_CARD !== "false" && process.env.REMOTE_PI_DONE_CARD !== "0"
       : file.doneCard !== false,
-    statusBoard: process.env.REMOTE_PI_STATUS_BOARD !== undefined
-      ? process.env.REMOTE_PI_STATUS_BOARD !== "false" && process.env.REMOTE_PI_STATUS_BOARD !== "0"
-      : file.statusBoard !== false,
   };
   config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid telegram.botToken in ${path}`);
@@ -1101,15 +1040,6 @@ class Telegram {
     try {
       return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction }, 5000, 1);
     } catch {
-      return null;
-    }
-  }
-
-  async pinChatMessage(chatId, messageId) {
-    try {
-      return await this.call("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true }, 10_000, 1);
-    } catch (error) {
-      console.error(`[tg:call] pinChatMessage failed:`, error.message);
       return null;
     }
   }
@@ -1372,7 +1302,7 @@ async function resolveHerdrEnvironment(cwd, { excludePaneIds, threadId, persiste
   if (!paneId) {
     try {
       const base = basename(cwd) || "remote-pi";
-      const label = threadId ? `📱 ${base}#${threadId}` : `📱 ${base}`;
+      const label = threadId ? `${base}#${threadId}` : base;
       const createdRaw = await runCmd(herdrBin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus", ...Object.entries(paneEnv).flatMap(([key, value]) => ["--env", `${key}=${value}`])], { timeout: 5000 });
       const created = JSON.parse(createdRaw);
       workspaceId = created.result?.workspace?.workspace_id;
@@ -1724,7 +1654,6 @@ class PaneRpc {
     this.herdrEnv = { ...this.gateway.herdrEnvironment, HERDR_PANE_ID: connection.hello.paneId };
     this.session.binding = { ...this.session.binding, paneId: connection.hello.paneId, sessionFile: connection.hello.sessionFile, cwd: connection.hello.cwd };
     this.session.cwd = connection.hello.cwd;
-    this.session.piNotRunning = false;
     for (const [id, pending] of this.pending) {
       if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume", "fork"].includes(connection.hello.reason)) {
         clearTimeout(pending.timer);
@@ -1799,7 +1728,6 @@ class ChatSession {
     this.cwd = cwd;
     const stored = gateway.state.herdrPanes?.[this.key];
     this.binding = typeof stored === "string" ? { paneId: stored, cwd, owned: true } : { cwd, ...stored };
-    this.piNotRunning = false;
     this.chatId = gateway.chatId;
 
     this.draft = null;
@@ -1815,23 +1743,10 @@ class ChatSession {
     this.runFirstUiAt = null;
     this.lastModel = null;
     this.lastPrompt = null;
-    this.commandAliases = new Map();
     this.mediaGroups = new Map();
     this.eventChain = Promise.resolve();
     this.updateChain = Promise.resolve();
-    this.statusBoardMessageId = gateway.state.statusBoards?.[this.key] || null;
-    this.statusBoardLastText = null;
-    this.statusBoardLastEditAt = 0;
-    this.statusBoardTimer = null;
-    this.statusBoardTickTimer = null;
-    this.statusBoardUpdating = false;
-    this.statusBoardPending = false;
-    this.hasHadRun = Boolean(this.statusBoardMessageId);
-    this.lastRunSummary = null;
-    this.lastRunEndedAt = null;
-    this.currentToolSummary = null;
     this.currentCtxPercent = null;
-    this.currentThinking = null;
     this.runSnapshotPromise = null;
 
     this.pi = this.createPi();
@@ -1897,20 +1812,6 @@ class ChatSession {
     if (expected) return;
     this.stopTyping();
     this.isStreaming = false;
-    const env = this.pi.herdrEnv;
-    if (env.HERDR_BIN_PATH) {
-      // Native shell detection may lag the bridge close during Pi teardown.
-      for (let attempt = 0; attempt < 10; attempt++) {
-        if (this.pi.proc || this.pi.stopping || this.gateway.bridge.closed) return;
-        const info = await runCommand(env.HERDR_BIN_PATH, ["pane", "process-info", "--pane", this.binding.paneId], { env: { ...process.env, ...env }, timeout: 3000 })
-          .then((raw) => JSON.parse(raw).result?.process_info).catch(() => null);
-        if (this.pi.proc || this.pi.stopping || this.gateway.bridge.closed) return;
-        if (!info) break;
-        if (paneHasForegroundShell(info)) { this.piNotRunning = true; break; }
-        await sleep(200);
-      }
-    }
-    this.scheduleStatusBoardUpdate();
   }
 
   resetSessionState() {
@@ -1936,14 +1837,6 @@ class ChatSession {
     }
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     this.toolPanel = null;
-    if (this.statusBoardTimer) {
-      clearTimeout(this.statusBoardTimer);
-      this.statusBoardTimer = null;
-    }
-    if (this.statusBoardTickTimer) {
-      clearInterval(this.statusBoardTickTimer);
-      this.statusBoardTickTimer = null;
-    }
     this.runSnapshotPromise = null;
     if (this.draft) {
       if (this.draft.timer) clearTimeout(this.draft.timer);
@@ -2022,7 +1915,6 @@ class ChatSession {
         }
         const state = await this.pi.request("get_state").catch(() => null);
         await this.onSessionSwitched();
-        this.scheduleStatusBoardUpdate();
         const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
         return this.send(text);
       }
@@ -2126,7 +2018,8 @@ class ChatSession {
         return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId);
       }
       case "restart": {
-        await this.send("🔄 Restarting gateway…");
+        const message = await this.send("🔄 Restarting gateway…");
+        await this.gateway.saveState({ pendingRestartMessageId: message.message_id });
         if (updateId) {
           const receiptPath = join(this.gateway.config.stateDir, "last-restart-update");
           await writeFile(receiptPath, String(updateId), { mode: 0o600 }).catch(() => {});
@@ -2147,10 +2040,10 @@ class ChatSession {
         return this.send(`steering:\n${this.queue.steering.join("\n") || "(empty)"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "(empty)"}`);
       }
       default: {
-        const alias = this.commandAliases.get(name) || this.gateway.commandAliases.get(name);
-        if (alias) return this.prompt(`/${alias}${argument ? ` ${argument}` : ""}`);
-        const commands = await this.pi.request("get_commands");
-        if (commands.commands.some((item) => item.name.toLowerCase() === name)) return this.prompt(original);
+        const data = await this.pi.request("get_commands");
+        const targets = commandRoutes(data.commands).get(name);
+        if (targets?.size > 1) return this.send(`Ambiguous command: /${name}\nMatches: ${[...targets].map((target) => `/${target}`).join(", ")}\nUse an unambiguous native name from /help, or run it in the Pi terminal.`);
+        if (targets?.size === 1) return this.prompt(`/${[...targets][0]}${argument ? ` ${argument}` : ""}`);
         return this.send(`Unknown command: /${name}\nUse /help`);
       }
       }
@@ -2182,7 +2075,13 @@ class ChatSession {
     if (!this.pi.proc) return;
     const data = await this.pi.request("get_commands");
     if (!data.commands.length) return;
-    const text = data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n");
+    const routes = commandRoutes(data.commands);
+    const text = data.commands.map((item) => {
+      const name = telegramCommandName(item);
+      const issue = RESERVED_COMMANDS.has(name) ? `Telegram /${name} is gateway-reserved; use Pi terminal`
+        : routes.get(name)?.size > 1 ? `Telegram /${name} is ambiguous; use an unambiguous native name or Pi terminal` : "";
+      return `/${item.name}${item.description ? ` — ${item.description}` : ""}${issue ? ` [${issue}]` : ""}`;
+    }).join("\n");
     await this.send(text);
   }
 
@@ -2285,9 +2184,7 @@ class ChatSession {
     await this.pi.start();
     const state = await this.pi.request("get_state");
     if (state.model) this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-    this.currentThinking = state.thinkingLevel;
     if (this.threadId === null) await this.gateway.registerBotCommands();
-    this.scheduleStatusBoardUpdate();
     await this.send(`✅ Working directory switched to:\n${target}\nSession: ${state.sessionId}`);
   }
 
@@ -2299,7 +2196,6 @@ class ChatSession {
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
         this.lastModel = { provider: exact.provider, modelId: exact.id };
-        this.scheduleStatusBoardUpdate();
         return this.send(`✅ ${exact.provider}/${exact.id}`);
       }
     }
@@ -2318,8 +2214,6 @@ class ChatSession {
     if (argument) {
       if (!data.levels.includes(argument)) return this.send(`Available levels: ${data.levels.join(", ")}`);
       await this.pi.request("set_thinking_level", { level: argument });
-      this.currentThinking = argument;
-      this.scheduleStatusBoardUpdate();
       return this.send(`✅ thinking: ${argument}`);
     }
     return this.send("Pick a thinking level:", this.keyboard(data.levels.map((level) => ({
@@ -2394,7 +2288,6 @@ class ChatSession {
     if (action.type === "model") {
       await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
       this.lastModel = { provider: action.provider, modelId: action.modelId };
-      this.scheduleStatusBoardUpdate();
       await this.send(`✅ ${action.provider}/${action.modelId}`);
     } else if (action.type === "retry" || action.type === "retry_fallback") {
       if (!this.lastPrompt) return this.send("No prompt to retry");
@@ -2415,8 +2308,6 @@ class ChatSession {
       await this.sendGatewayLog();
     } else if (action.type === "thinking") {
       await this.pi.request("set_thinking_level", { level: action.level });
-      this.currentThinking = action.level;
-      this.scheduleStatusBoardUpdate();
       await this.send(`✅ thinking: ${action.level}`);
     } else if (action.type === "resume") {
       const paneId = await this.gateway.liveSessionPane(action.path);
@@ -2433,11 +2324,7 @@ class ChatSession {
         if (state?.model?.provider && state?.model?.id) {
           this.lastModel = { provider: state.model.provider, modelId: state.model.id };
         }
-        if (state?.thinkingLevel) {
-          this.currentThinking = state.thinkingLevel;
-        }
         await this.onSessionSwitched(action.path);
-        this.scheduleStatusBoardUpdate();
       }
       await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
     } else if (action.type === "fork") {
@@ -2570,33 +2457,19 @@ class ChatSession {
       this.pendingUi = null;
       this.repliedInRun = false;
       this.abortedRun = false;
-      this.hasHadRun = true;
       this.startTyping();
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       this.toolPanel = null;
       if (isInitialStart) {
         this.runStartedAt = this.runStartedAt || performance.now();
         this.runSnapshotPromise = this.takeRunSnapshot();
-        if (!this.statusBoardTickTimer) {
-          this.statusBoardTickTimer = setInterval(() => {
-            this.scheduleStatusBoardUpdate();
-          }, 15_000);
-          this.statusBoardTickTimer.unref?.();
-        }
       }
-      this.scheduleStatusBoardUpdate();
       const since = this.runStartedAt ? ` (+${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
       console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
       this.isStreaming = false;
       this.pendingUi = null;
-      this.currentToolSummary = null;
-      this.lastRunEndedAt = Date.now();
-      if (this.statusBoardTickTimer) {
-        clearInterval(this.statusBoardTickTimer);
-        this.statusBoardTickTimer = null;
-      }
       this.stopTyping();
       const durationMs = this.runStartedAt ? Math.round(performance.now() - this.runStartedAt) : null;
       const since = durationMs != null ? ` (total: ${durationMs}ms)` : "";
@@ -2624,7 +2497,6 @@ class ChatSession {
           console.error(`[run-card] failed to send run card:`, err.message);
         });
       }
-      this.scheduleStatusBoardUpdate();
       this.abortedRun = false;
       this.runStartedAt = null;
       this.runFirstTokenAt = null;
@@ -2633,7 +2505,6 @@ class ChatSession {
     }
     if (event.type === "queue_update") {
       this.queue = { steering: event.steering, followUp: event.followUp };
-      this.scheduleStatusBoardUpdate();
     }
     if (!this.gateway.chatReady) return;
 
@@ -2702,9 +2573,7 @@ class ChatSession {
         status: "running",
         startedAt: Date.now(),
       });
-      this.currentToolSummary = summary;
       this.scheduleToolPanelUpdate(false, false);
-      this.scheduleStatusBoardUpdate();
     }
     if (event.type === "tool_execution_end") {
       if (this.toolPanel) {
@@ -2714,9 +2583,6 @@ class ChatSession {
         console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
         this.scheduleToolPanelUpdate(false, false);
       }
-      const runningTool = this.toolPanel?.tools?.slice().reverse().find((item) => item.status === "running");
-      this.currentToolSummary = runningTool ? runningTool.summary : null;
-      this.scheduleStatusBoardUpdate();
       if (event.toolName === "remote_attach" && !event.isError) {
         // 扩展返回的 details.paths 已解析为绝对路径；旧版扩展回退 args.paths 时按会话 cwd 解析
         const rawPaths = event.result?.details?.paths || event.args?.paths || [];
@@ -2879,120 +2745,6 @@ class ChatSession {
     }
   }
 
-  scheduleStatusBoardUpdate(immediate = false) {
-    if (this.gateway.config.statusBoard === false || !this.hasHadRun) return;
-    if (immediate) {
-      if (this.statusBoardTimer) {
-        clearTimeout(this.statusBoardTimer);
-        this.statusBoardTimer = null;
-      }
-      this.flushStatusBoard();
-      return;
-    }
-    const elapsed = Date.now() - this.statusBoardLastEditAt;
-    if (elapsed >= 3000) {
-      if (this.statusBoardTimer) {
-        clearTimeout(this.statusBoardTimer);
-        this.statusBoardTimer = null;
-      }
-      this.flushStatusBoard();
-    } else if (!this.statusBoardTimer) {
-      this.statusBoardTimer = setTimeout(() => {
-        this.statusBoardTimer = null;
-        this.flushStatusBoard();
-      }, 3000 - elapsed);
-      this.statusBoardTimer.unref?.();
-    }
-  }
-
-  renderCurrentStatusBoard() {
-    let status = "idle";
-    if (!this.pi?.proc) {
-      status = "stopped";
-    } else if (this.isStreaming) {
-      status = "working";
-    }
-
-    const model = this.lastModel || (this.pi?.proc ? "pi" : "");
-    const thinking = this.currentThinking;
-
-    if (this.piNotRunning) return `⚠️ Pi not running\n📁 ${this.cwd}`;
-    if (!this.pi.proc && this.binding.sessionFile) return `⚠️ Pi bridge disconnected\n📁 ${this.cwd}`;
-    return formatStatusBoard({
-      status,
-      elapsedMs: this.runStartedAt ? Math.max(0, performance.now() - this.runStartedAt) : 0,
-      lastRunEndedAt: this.lastRunEndedAt,
-      tool: this.currentToolSummary,
-      cwd: this.cwd,
-      model,
-      thinking,
-      ctxPercent: this.currentCtxPercent,
-      queuedFollowUps: (this.queue?.followUp || []).length,
-      lastRun: this.lastRunSummary,
-    });
-  }
-
-  async flushStatusBoard() {
-    if (this.gateway.config.statusBoard === false || !this.hasHadRun) return;
-    if (this.statusBoardUpdating) {
-      this.statusBoardPending = true;
-      return;
-    }
-    this.statusBoardUpdating = true;
-    try {
-      const text = this.renderCurrentStatusBoard();
-      if (text === this.statusBoardLastText) return;
-
-      this.statusBoardLastEditAt = Date.now();
-
-      if (this.statusBoardMessageId) {
-        try {
-          await this.gateway.telegram.call("editMessageText", {
-            chat_id: this.chatId,
-            message_id: this.statusBoardMessageId,
-            text: telegramHtml(text),
-            parse_mode: "HTML",
-          }, 10_000, 1);
-          this.statusBoardLastText = text;
-          return;
-        } catch (err) {
-          const msg = String(err.message || "");
-          if (msg.includes("message is not modified")) {
-            this.statusBoardLastText = text;
-            return;
-          }
-          if (msg.includes("message to edit not found") || msg.includes("MESSAGE_ID_INVALID")) {
-            console.warn(`[status-board:${this.key}] message not found, recreating: ${err.message}`);
-            this.statusBoardMessageId = null;
-            if (this.gateway.state.statusBoards) {
-              delete this.gateway.state.statusBoards[this.key];
-              await this.gateway.saveState({ statusBoards: this.gateway.state.statusBoards });
-            }
-          } else {
-            return;
-          }
-        }
-      }
-
-      const sent = await this.sendOne(text, { disable_notification: true });
-      this.statusBoardMessageId = sent.message_id;
-      this.statusBoardLastText = text;
-      if (!this.gateway.state.statusBoards) this.gateway.state.statusBoards = {};
-      this.gateway.state.statusBoards[this.key] = sent.message_id;
-      await this.gateway.saveState({ statusBoards: this.gateway.state.statusBoards });
-
-      await this.gateway.telegram.pinChatMessage(this.chatId, sent.message_id);
-    } catch (err) {
-      console.warn(`[status-board:${this.key}] update failed: ${err.message}`);
-    } finally {
-      this.statusBoardUpdating = false;
-      if (this.statusBoardPending) {
-        this.statusBoardPending = false;
-        this.scheduleStatusBoardUpdate();
-      }
-    }
-  }
-
   async takeRunSnapshot() {
     try {
       const [statsRes, stateRes, gitRes] = await Promise.allSettled([
@@ -3027,9 +2779,6 @@ class ChatSession {
 
       if (state?.model?.provider && state?.model?.id) {
         this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-      }
-      if (state?.thinkingLevel) {
-        this.currentThinking = state.thinkingLevel;
       }
       if (stats?.contextUsage?.percent != null) {
         this.currentCtxPercent = stats.contextUsage.percent;
@@ -3107,27 +2856,12 @@ class ChatSession {
       }
 
       await this.send(text, extra);
-
-      this.lastRunSummary = {
-        filesCount: files ? files.length : null,
-        costDelta,
-      };
-      this.lastRunEndedAt = Date.now();
-      this.scheduleStatusBoardUpdate();
     } catch (error) {
       console.error(`[run-card] failed to send run card:`, error.message);
     }
   }
 
   stop() {
-    if (this.statusBoardTimer) {
-      clearTimeout(this.statusBoardTimer);
-      this.statusBoardTimer = null;
-    }
-    if (this.statusBoardTickTimer) {
-      clearInterval(this.statusBoardTickTimer);
-      this.statusBoardTickTimer = null;
-    }
     this.resetSessionState();
     this.pi?.stop?.();
   }
@@ -3144,7 +2878,6 @@ class Gateway {
     }
     this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
     this.actions = new Map();
-    this.commandAliases = new Map();
     this.als = new AsyncLocalStorage();
     this.telegramChain = Promise.resolve();
     this.uploadChain = Promise.resolve();
@@ -3206,15 +2939,16 @@ class Gateway {
       await session.send(`📡 Remote control on — ${hello.paneId}\n${hello.cwd}\nThe terminal and this topic share one Pi session.`);
     }
     for (const session of targets) {
+      const wasUnbound = !session.pi.proc;
       session.pi.bind(connection);
       const state = hello.state;
       if (state) {
         session.isStreaming = state.isStreaming;
         if (state.model) session.lastModel = { provider: state.model.provider, modelId: state.model.id };
-        session.currentThinking = state.thinkingLevel;
       }
       await this.persistPaneSession(session);
-      session.scheduleStatusBoardUpdate();
+      // Startup may register bot commands before Pi attached; refresh native aliases once the main view binds.
+      if (wasUnbound && session.threadId === null) this.registerBotCommands().catch(() => {});
     }
   }
 
@@ -3228,14 +2962,16 @@ class Gateway {
     return (data.result?.agents || data.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
   }
 
-  ensurePaneSession(rpc) {
+  ensurePaneSession(rpc, options = {}) {
     // Serialize starts, including sessions arriving concurrently from different topics.
-    const work = this.paneStartChain.then(() => this.startPaneSession(rpc));
+    const work = this.paneStartChain.then(() => this.startPaneSession(rpc, options));
     this.paneStartChain = work.catch(() => {});
     return work;
   }
 
-  async startPaneSession(rpc) {
+  // Returns true when rpc ends up bound to a live Pi pane. spawn:false attaches only —
+  // a gateway (re)start must never create workspaces or launch Pi processes by itself.
+  async startPaneSession(rpc, { spawn = true } = {}) {
     const session = rpc.session;
     if (HERDR_DISABLED_FOR_TEST && !this.bridge.server) throw new Error("Self-test must provide a fake connected pane");
     await this.bridge.start();
@@ -3243,9 +2979,8 @@ class Gateway {
     if (existing) {
       rpc.bind(existing);
       await this.persistPaneSession(session);
-      return;
+      return true;
     }
-    if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test must provide a fake connected pane");
     const file = session.binding.sessionFile;
     const livePane = file ? await this.liveSessionPane(file) : null;
     if (livePane) {
@@ -3255,9 +2990,11 @@ class Gateway {
         // A running Pi without hello is not permission to create another writer (or another workspace).
         rpc.bind(await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane));
         await this.persistPaneSession(session);
-        return;
+        return true;
       }
     }
+    if (!spawn) return false;
+    if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test must provide a fake connected pane");
     const env = await resolveHerdrEnvironment(session.cwd, {
       persistedPaneId: session.binding.paneId,
       excludePaneIds: this.getOwnedPaneIds(session), threadId: session.threadId,
@@ -3285,7 +3022,7 @@ class Gateway {
       const connection = await this.bridge.waitFor((c) => c.hello.paneId === paneId);
       rpc.bind(connection);
       await this.persistPaneSession(session);
-      return;
+      return true;
     }
     this.startHerdrWatcher();
     // ref: Herdr CLI agent start requires a foreground shell; never send an export into another application.
@@ -3298,6 +3035,7 @@ class Gateway {
     await runCommand(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--", ...(file ? ["--session", file] : [])], { ...options, timeout: 45_000 });
     rpc.bind(await waiting);
     await this.persistPaneSession(session);
+    return true;
   }
 
   async closePaneSession(session) {
@@ -3394,11 +3132,16 @@ class Gateway {
     try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
     catch (error) { if (!error.message.includes("chat not found")) throw error; }
     let state;
+    let attached = false;
     {
-      await this.mainSession.pi.start();
-      state = await this.mainSession.pi.request("get_state");
-      if (state?.model?.provider && state?.model?.id) {
-        this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
+      // Startup only re-attaches to a Pi pane that is still running; if none is, the first message
+      // spawns one via the lazy path (PaneRpc.ensureStarted → startPaneSession). Never spawn here.
+      attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
+      if (attached) {
+        state = await this.mainSession.pi.request("get_state").catch(() => null);
+        if (state?.model?.provider && state?.model?.id) {
+          this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
+        }
       }
     }
     await this.registerBotCommands();
@@ -3407,9 +3150,21 @@ class Gateway {
     this.cleanupDownloads();
     this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000);
     this.downloadCleanupTimer.unref?.();
-    const sessionInfo = state?.sessionId ? `session ${state.sessionId}` : "ready";
+    const sessionInfo = state?.sessionId ? `session ${state.sessionId}` : (attached ? "attached" : "not attached (starts on first message)");
     console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi ${sessionInfo}`);
+    await this.completeRestart();
     await this.telegram.poll((update) => this.dispatchUpdate(update));
+  }
+
+  async completeRestart() {
+    const messageId = this.state.pendingRestartMessageId;
+    if (!messageId) return;
+    try {
+      await this.telegram.edit(this.chatId, messageId, "✅ Gateway restarted");
+      await this.saveState({ pendingRestartMessageId: null });
+    } catch (error) {
+      console.warn(`[restart] failed to update restart notice: ${error.message}`);
+    }
   }
 
   async saveDownload(fileId, name, needsBase64 = false) {
@@ -3683,15 +3438,12 @@ class Gateway {
       rpcCommands = data?.commands || [];
     }
     const commands = [...BOT_COMMANDS];
+    const routes = commandRoutes(rpcCommands);
     for (const command of rpcCommands) {
       const telegramName = telegramCommandName(command);
-      if (!telegramName || commands.some((item) => item.command === telegramName)) continue;
-      if (!/^[a-z0-9_]{1,32}$/.test(telegramName)) continue;
+      if (RESERVED_COMMANDS.has(telegramName) || routes.get(telegramName)?.size !== 1) continue;
+      if (!/^[a-z0-9_]{1,32}$/.test(telegramName) || commands.some((item) => item.command === telegramName)) continue;
       commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
-      this.commandAliases.set(telegramName, command.name);
-      if (command.source === "skill") {
-        this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
-      }
     }
     const finalCommands = commands.slice(0, 100);
     await Promise.all([
@@ -3864,13 +3616,10 @@ class Gateway {
             this.sessions.delete(sessionKey);
           }
           delete this.state.topics[threadId];
-          if (this.state.statusBoards) {
-            delete this.state.statusBoards[sessionKey];
-          }
           if (this.state.herdrPanes) {
             delete this.state.herdrPanes[sessionKey];
           }
-          await this.saveState({ topics: this.state.topics, statusBoards: this.state.statusBoards, herdrPanes: this.state.herdrPanes });
+          await this.saveState({ topics: this.state.topics, herdrPanes: this.state.herdrPanes });
           await this.telegram.call("deleteForumTopic", {
             chat_id: this.chatId,
             message_thread_id: threadId,
@@ -4017,7 +3766,7 @@ async function selfTestPaneBridge() {
   const dir = join(tmpdir(), `rp-${randomBytes(4).toString("hex")}`);
   await mkdir(dir, { mode: 0o700 });
   const path = join(dir, "bridge.sock");
-  const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir, statusBoard: false, doneCard: false };
+  const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir, doneCard: false };
   let gateway = new Gateway(config);
   const outputs = [];
   const events = [];
@@ -4044,12 +3793,14 @@ async function selfTestPaneBridge() {
   let slowExec;
   let cancelledReplacement = false;
   let otherAgents = [];
+  const metadataCalls = [];
   const metadata = async (_env, method, params) => {
     if (method === "pane.get") return { pane: { tokens } };
-    if (method === "pane.report_metadata") { Object.assign(tokens, params.tokens); return {}; }
-    if (method === "agent.list") return { agents: otherAgents };
+    if (method === "pane.report_metadata") { metadataCalls.push(params); Object.assign(tokens, params.tokens); return {}; }
+    if (method === "agent.list") return { agents: [{ pane_id: "w1:p-test", agent: "pi", name: "test-agent" }, ...otherAgents] };
     assert.fail(`Unexpected Herdr call ${method}`);
   };
+  const badgeCalls = () => metadataCalls.filter((p) => "display_agent" in p || p.clear_display_agent === true);
   const until = async (predicate) => {
     for (let i = 0; i < 300; i++) { if (predicate()) return; await sleep(10); }
     assert.fail("Timed out waiting for fake bridge");
@@ -4062,6 +3813,7 @@ async function selfTestPaneBridge() {
     let active = ["read", "bash"];
     let live = true;
     let idle = true;
+    let autocompleteFactory;
     const check = () => { assert.ok(live, "replacement must not access stale Pi/ctx"); };
     const entries = [
       { id: "u1", type: "message", message: { role: "user", content: "hello" } },
@@ -4070,7 +3822,7 @@ async function selfTestPaneBridge() {
     ];
     const model = { provider: "fake", id: "m", reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "xhigh", max: null } };
     const ctx = {
-      cwd: dir, model, isIdle: () => idle, hasPendingMessages: () => false,
+      cwd: dir, model, mode: "tui", isIdle: () => idle, hasPendingMessages: () => false,
       sessionManager: {
         getSessionFile: () => { check(); return file; }, getSessionId: () => file,
         getEntries: () => entries, getBranch: () => entries,
@@ -4080,6 +3832,7 @@ async function selfTestPaneBridge() {
       abort: () => { aborted++; }, shutdown: () => { quit++; },
       compact: ({ onComplete }) => onComplete({ tokensBefore: 100, estimatedTokensAfter: 20 }),
       ui: {
+        addAutocompleteProvider: (factory) => { autocompleteFactory = factory; },
         notify: () => {},
         select: (_title, _options, { signal }) => new Promise((done) => {
           const selection = { done, cancelled: false };
@@ -4129,14 +3882,37 @@ async function selfTestPaneBridge() {
       },
     };
     const bridge = createRemoteBridge(pi, { env, metadata });
-    return { pi, ctx, tools, commands, bridge, emit, setIdle: (value) => { idle = value; } };
+    return { pi, ctx, tools, commands, bridge, emit, get autocompleteFactory() { return autocompleteFactory; }, setIdle: (value) => { idle = value; } };
   };
   try {
     await gateway.bridge.start();
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     current = runtime(initialFile);
     await current.emit("session_start", { reason: "startup" });
+    {
+      let suggestions = { prefix: "/remo", items: ["remote-pi-new", "remote-pi-switch", "remote-pi-fork", "remote-control", "restart"].map((value) => ({ value, label: value })) };
+      const args = [["/remo"], 0, 5, { signal: new AbortController().signal }];
+      const completion = { lines: ["/restart "], cursorLine: 0, cursorCol: 9 };
+      const provider = current.autocompleteFactory({
+        triggerCharacters: ["#"],
+        async getSuggestions(...received) { assert.deepEqual(received, args); return suggestions; },
+        applyCompletion: (...received) => { assert.deepEqual(received, args); return completion; },
+        shouldTriggerFileCompletion: (...received) => { assert.deepEqual(received, args); return false; },
+      });
+      assert.deepEqual((await provider.getSuggestions(...args)).items.map((item) => item.value), ["remote-control", "restart"], "only internal commands are hidden from terminal completion");
+      assert.equal(suggestions.items.length, 5, "do not mutate the underlying provider's results");
+      assert.equal(provider.applyCompletion(...args), completion);
+      assert.equal(provider.shouldTriggerFileCompletion(...args), false);
+      assert.deepEqual(provider.triggerCharacters, ["#"]);
+      suggestions = { prefix: "/remo", items: suggestions.items.slice(0, 3) };
+      assert.equal(await provider.getSuggestions(...args), null, "all hidden means no suggestions");
+      suggestions = { prefix: "remote", items: [{ value: "remote-pi-new", label: "file or argument" }] };
+      assert.equal(await provider.getSuggestions(...args), suggestions, "file and argument completions are unchanged");
+      suggestions = null;
+      assert.equal(await provider.getSuggestions(...args), null);
+    }
     await until(() => gateway.mainSession.pi.proc);
+    await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
     const session = gateway.mainSession;
     assert.ok(session.pi instanceof PaneRpc, "all ChatSessions use PaneRpc");
     assert.deepEqual(current.pi.getActiveTools(), ["read", "bash", "remote_attach", "remote_ask"]);
@@ -4219,6 +3995,7 @@ async function selfTestPaneBridge() {
     assert.equal(runtimeCount, 2);
     assert.equal((await session.pi.request("get_state")).sessionFile, join(dir, "s2.jsonl"));
     assert.equal(session.binding.sessionFile, join(dir, "s2.jsonl"));
+    await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
     const view = new ChatSession(gateway, { threadId: 321, cwd: dir });
     view.binding = { cwd: dir, sessionFile: session.binding.sessionFile };
     gateway.sessions.set(view.key, view);
@@ -4229,11 +4006,13 @@ async function selfTestPaneBridge() {
     session.pi.stop();
     await gateway.bridge.stop();
     await until(() => !current.pi.getActiveTools().includes("remote_ask"));
+    await until(() => badgeCalls().at(-1)?.clear_display_agent === true);
     gateway = new Gateway(config);
     mockGateway(gateway);
     assert.equal(gateway.mainSession.binding.sessionFile, join(dir, "s2.jsonl"), "binding persists across gateway restart");
     await gateway.bridge.start();
     await until(() => gateway.mainSession.pi.proc);
+    await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
     assert.equal((await gateway.mainSession.pi.request("get_state")).sessionFile, join(dir, "s2.jsonl"));
     assert.equal(runtimeCount, 2, "gateway restart does not start a replacement Pi");
     for (const [key, view] of gateway.sessions) {
@@ -4246,8 +4025,10 @@ async function selfTestPaneBridge() {
     await until(() => !current.pi.getActiveTools().includes("remote_ask"));
     assert.equal(quit, 0, "closing a desktop view only turns remote off");
     assert.equal(tokens.remote_pi, null);
+    await until(() => badgeCalls().at(-1)?.clear_display_agent === true);
     await current.commands.get("remote-control").handler("on", current.ctx);
     await until(() => gateway.mainSession.pi.proc);
+    await until(() => badgeCalls().at(-1)?.display_agent === "📱 test-agent");
     assert.equal(gateway.mainSession.pi.stopping, false);
     gateway.mainSession.pi.stop();
     await gateway.bridge.stop();
@@ -4277,6 +4058,38 @@ async function selfTest() {
   };
   try {
   await selfTestPaneBridge();
+
+  // Startup attach-only: a persisted main binding whose pane no longer exists must not spawn anything.
+  {
+    const dir = join(tmpdir(), `rp-attach-${randomBytes(4).toString("hex")}`);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir, doneCard: false };
+    const gwDead = new Gateway(config);
+    await gwDead.bridge.start();
+    // Persisted binding points at a closed pane; no bridge peer ever reconnects. Reaching the spawn
+    // branch here would reject ("Herdr is required") under HERDR_DISABLED_FOR_TEST, failing the assert.
+    gwDead.mainSession.binding = { paneId: "w_gone:p0", sessionFile: join(dir, "gone.jsonl"), cwd: dir, owned: true };
+    assert.equal(await gwDead.ensurePaneSession(gwDead.mainSession.pi, { spawn: false }), false, "attach-only reports unbound");
+    assert.equal(gwDead.mainSession.pi.proc, null, "main session stays unbound until a message arrives");
+    await gwDead.bridge.stop();
+
+    // A still-running Pi pane binds through the same attach-only path.
+    const gwLive = new Gateway(config);
+    await gwLive.bridge.start();
+    const fakeSocket = { destroyed: false, writable: true, write: () => true };
+    const connection = {
+      socket: fakeSocket,
+      clients: new Set(),
+      hello: { paneId: "w_live:p1", cwd: dir, sessionFile: join(dir, "live.jsonl"), sessionId: "s1", pid: 4242 },
+    };
+    gwLive.bridge.connections.set("w_live:p1", connection);
+    gwLive.mainSession.binding = { paneId: "w_live:p1", sessionFile: join(dir, "live.jsonl"), cwd: dir, owned: true };
+    assert.equal(await gwLive.ensurePaneSession(gwLive.mainSession.pi, { spawn: false }), true, "attach-only binds a live pane");
+    assert.equal(gwLive.mainSession.pi.proc, fakeSocket, "main session bound to the running Pi connection");
+    await gwLive.bridge.stop();
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+
   assert.equal(paneHasForegroundShell(undefined), false);
   assert.equal(paneHasForegroundShell({}), false);
   assert.equal(paneHasForegroundShell({ shell_pid: 0, foreground_process_group_id: 0 }), false);
@@ -4718,7 +4531,7 @@ async function selfTest() {
 
   // Receipt reactions stay unchanged; completion is delivered by the run card.
   {
-    const gwAck = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), ackEmoji: "👀", doneCard: true, statusBoard: false });
+    const gwAck = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), ackEmoji: "👀", doneCard: true });
     gwAck.chatReady = true;
     const session = gwAck.mainSession;
     const reactions = [];
@@ -4816,7 +4629,7 @@ async function selfTest() {
       gwRestart.stop = () => {};
       gwRestart.telegram.setReaction = async () => {};
       let sentMsg = "";
-      gwRestart.telegram.send = async (_c, text) => { sentMsg = text; };
+      gwRestart.telegram.send = async (_c, text) => { sentMsg = text; return { message_id: 42 }; };
       let origExit = process.exit;
       process.exit = () => {};
 
@@ -4831,6 +4644,25 @@ async function selfTest() {
       assert.equal(sentMsg, "");
       await sleep(150); // 等待 restart 的 100ms exit 定时器被空函数消耗
       process.exit = origExit;
+
+      const gwReady = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpState });
+      assert.equal(gwReady.state.pendingRestartMessageId, 42, "restart message must survive process replacement");
+      const edits = [];
+      gwReady.telegram.edit = async (...args) => { edits.push(args); };
+      await gwReady.completeRestart();
+      assert.deepEqual(edits, [["1", 42, "✅ Gateway restarted"]]);
+      assert.equal(loadState(tmpState).pendingRestartMessageId, null, "successful notice must be cleared on disk");
+      await gwReady.completeRestart();
+      assert.equal(edits.length, 1, "ordinary startup must not repeat the notice");
+
+      await gwReady.saveState({ pendingRestartMessageId: 43 });
+      gwReady.telegram.edit = async () => { throw new Error("offline"); };
+      await gwReady.completeRestart();
+      assert.equal(loadState(tmpState).pendingRestartMessageId, 43, "failed notice must remain for a later startup");
+      gwReady.telegram.edit = async (...args) => { edits.push(args); };
+      await gwReady.completeRestart();
+      assert.deepEqual(edits.at(-1), ["1", 43, "✅ Gateway restarted"]);
+      await rm(tmpState, { recursive: true, force: true });
     }
 
     // A bridge disconnect is not proof of process exit.
@@ -5060,8 +4892,9 @@ async function selfTest() {
   }
   assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
   assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "status"), { command: "status", description: "Session status, tokens & cost" });
+  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "restart"), { command: "restart", description: "Restart the gateway" });
   for (const name of ["name", "restart", "upgrade"]) {
-    assert.ok(!BOT_COMMANDS.some((c) => c.command === name), `${name} hidden from menu`);
+    if (name !== "restart") assert.ok(!BOT_COMMANDS.some((c) => c.command === name), `${name} hidden from menu`);
     assert.ok(HELP.split("\nAdmin\n")[1].includes(`/${name}`), `${name} listed under Admin`);
   }
   assert.ok(!BOT_COMMANDS.some((c) => c.command === "commands"), "command discovery folded into help");
@@ -5526,65 +5359,18 @@ async function selfTest() {
     assert.ok(cardTen.includes("…and 2 more"));
   }
 
-  // Phase 2: formatStatusBoard
+  // Legacy status-board IDs are ignored without affecting session state.
   {
-    const workingBoard = formatStatusBoard({
-      status: "working",
-      elapsedMs: 83_000,
-      tool: "bash: npm test",
-      cwd: "/Users/dev/remote-pi",
-      model: "provider/model",
-      thinking: "thinking",
-      ctxPercent: 31,
-      queuedFollowUps: 2,
-      lastRun: { filesCount: 3, costDelta: 0.04 },
-    });
-    assert.equal(workingBoard, [
-      "⏳ Working · 1m23s",
-      "🔧 bash: npm test",
-      "📁 remote-pi  🧠 provider/model · thinking  📊 ctx 31%",
-      "↪ 2 queued follow-ups",
-      "Last: ✅ 3 files · +$0.04",
-    ].join("\n"));
-
-    const idleBoard = formatStatusBoard({
-      status: "idle",
-      lastRunAgoMs: 133_000,
-      cwd: "remote-pi",
-      model: { provider: "anthropic", id: "claude" },
-      thinking: "high",
-      ctxPercent: 25,
-      queuedFollowUps: 0,
-      lastRun: { filesCount: 1, costDelta: 0.02 },
-    });
-    assert.equal(idleBoard, [
-      "💤 Idle · last run 2m13s ago",
-      "📁 remote-pi  🧠 anthropic/claude · high  📊 ctx 25%",
-      "Last: ✅ 1 file · +$0.02",
-    ].join("\n"));
-
-    const stoppedBoard = formatStatusBoard({
-      status: "stopped",
-      cwd: "remote-pi",
-      model: "openai/gpt-4o",
-    });
-    assert.equal(stoppedBoard, [
-      "⚠️ Pi stopped",
-      "📁 remote-pi  🧠 openai/gpt-4o",
-    ].join("\n"));
-
-  }
-
-  // Phase 2: statusBoards persistence in state.json
-  {
-    const tmpStateDir = join(tmpdir(), `test-status-boards-${Date.now()}`);
+    const tmpStateDir = join(tmpdir(), `test-legacy-state-${Date.now()}`);
     await mkdir(tmpStateDir, { recursive: true, mode: 0o700 });
     await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
       cwd: tmpStateDir,
       statusBoards: { main: 12345, "t:99": 67890 },
     }), { mode: 0o600 });
     const loaded = loadState(tmpStateDir);
-    assert.deepEqual(loaded.statusBoards, { main: 12345, "t:99": 67890 });
+    assert.equal(Object.hasOwn(loaded, "statusBoards"), false);
+    assert.equal(loaded.cwd, tmpStateDir);
+    await rm(tmpStateDir, { recursive: true, force: true });
   }
 
   // Phase 2 review: card computation does not block other sessions' Telegram output
@@ -5779,7 +5565,8 @@ async function selfTest() {
 
     const env = await resolveHerdrEnvironment("/test/cwd", { runCmd: mockRunner });
     assert.equal(env.HERDR_PANE_ID, "p_new", "Must create new workspace, never pick from pane list by cwd");
-    assert.ok(commandsRun.some((c) => c[1] === "workspace" && c[2] === "create" && c.includes("📱 cwd")), "Workspace label must have 📱 prefix");
+    const createCmd = commandsRun.find((c) => c[1] === "workspace" && c[2] === "create");
+    assert.equal(createCmd?.[createCmd.indexOf("--label") + 1], "cwd", "Workspace label is the bare cwd name, no 📱 prefix");
     assert.ok(!commandsRun.some((c) => c[1] === "pane" && c[2] === "list"), "Must never call pane list to match cwd");
 
     // 2. Reuses persisted pane if it still exists
@@ -5880,6 +5667,82 @@ async function selfTest() {
     assert.equal(gw.sessions.has("t:601"), true, "ChatSession MUST be created for normal topic");
     await gw.saveState({});
     await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // Command discovery and routing use the current session, never cached main-view aliases.
+  {
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const main = gw.mainSession;
+    main.pi.proc = {};
+    let commands = [
+      ...["name", "upgrade", "start", "commands", "status"].map((name) => ({ name, source: "prompt", description: `Custom ${name}` })),
+      { name: "foo-bar", source: "extension" }, { name: "foo_bar", source: "prompt" },
+      { name: `${"a".repeat(32)}-one`, source: "prompt" }, { name: `${"a".repeat(32)}-two`, source: "prompt" },
+      { name: "skill:check-a", source: "skill" }, { name: "skill_check_a", source: "extension" },
+      { name: "git-review", source: "extension", description: "Review changes" },
+    ];
+    main.pi.request = async (type) => { assert.equal(type, "get_commands"); return { commands }; };
+    const menus = [];
+    gw.telegram.call = async (method, params) => { assert.equal(method, "setMyCommands"); menus.push(params); };
+    await gw.registerBotCommands();
+    assert.equal(menus.length, 2, "register default and private-chat scopes");
+    for (const { commands: menu } of menus) {
+      for (const name of ["name", "upgrade", "start", "commands", "foo_bar", "a".repeat(32), "skill_check_a"]) {
+        assert.ok(!menu.some((c) => c.command === name), `${name} is reserved or ambiguous, not a menu command`);
+      }
+      assert.equal(menu.find((c) => c.command === "status").description, "Session status, tokens & cost");
+      assert.ok(menu.some((c) => c.command === "git_review"));
+    }
+    const handled = [...ChatSession.prototype.handleCommand.toString().matchAll(/case "([^"]+)":/g)].map((m) => m[1]);
+    assert.deepEqual([...RESERVED_COMMANDS].sort(), [...new Set(handled)].sort(), "reserve all gateway commands, including hidden commands and aliases");
+    const sent = [];
+    const prompts = [];
+    main.send = async (text) => { sent.push(text); };
+    main.prompt = async (text) => { prompts.push(text); };
+    const run = (session, text) => session.handleCommand(parseCommand(text), text);
+    for (const name of ["foo_bar", "a".repeat(32), "skill_check_a"]) {
+      await run(main, `/${name}`);
+      assert.match(sent.at(-1), /Ambiguous command/);
+    }
+    assert.deepEqual(prompts, [], "ambiguous commands never reach Pi");
+    await main.showCommands();
+    assert.match(sent.at(-1), /gateway-reserved/);
+    assert.match(sent.at(-1), /ambiguous/);
+    await run(main, "/foo-bar argument");
+    assert.equal(prompts.at(-1), "/foo-bar argument", "unambiguous native spelling still works");
+    await run(main, "/skill-check-a focus");
+    assert.equal(prompts.at(-1), "/skill:check-a focus", "legacy skill spelling still works");
+    await run(main, "/git_review@my_bot Keep CASE");
+    assert.equal(prompts.at(-1), "/git-review Keep CASE");
+    const topic = new ChatSession(gw, { threadId: 123, cwd: tmpdir() });
+    topic.pi.proc = {};
+    topic.pi.request = async (type) => { assert.equal(type, "get_commands"); return { commands: [{ name: "git_review", source: "prompt" }, { name: "skill:topic-only", source: "skill" }] }; };
+    topic.send = main.send;
+    topic.prompt = main.prompt;
+    await run(topic, "/git_review");
+    assert.equal(prompts.at(-1), "/git_review", "topic resolves its own command, not the main view's alias");
+    await run(topic, "/skill_topic_only");
+    assert.equal(prompts.at(-1), "/skill:topic-only", "topic-only skills work without main-view registration");
+    const topicCount = prompts.length;
+    await run(topic, "/foo-bar");
+    assert.match(sent.at(-1), /Unknown command/);
+    assert.equal(prompts.length, topicCount, "main-only commands do not leak into a topic");
+    commands = [{ name: "foo-bar", source: "extension" }];
+    await run(main, "/foo_bar");
+    assert.equal(prompts.at(-1), "/foo-bar", "removing one conflicting command immediately restores unambiguous routing");
+    await gw.registerBotCommands();
+    assert.ok(menus.at(-1).commands.some((c) => c.command === "foo_bar"), "resolved conflicts return to the menu on refresh");
+    commands = [{ name: "git_review", source: "prompt" }];
+    await gw.registerBotCommands();
+    await run(main, "/git_review");
+    assert.equal(prompts.at(-1), "/git_review", "refresh does not retain an obsolete alias");
+    commands = [];
+    const count = prompts.length;
+    await run(main, "/git_review");
+    assert.match(sent.at(-1), /Unknown command/);
+    assert.equal(prompts.length, count, "removed commands never become model prompts");
+    await gw.registerBotCommands();
+    assert.ok(!menus.at(-1).commands.some((c) => c.command === "git_review"), "removed commands leave the menu on refresh");
   }
 
   // Help includes native Pi commands only when available.
@@ -5983,14 +5846,12 @@ async function selfTest() {
       gwSave.saveState({ recentProjects: ["/a"] }),
       gwSave.saveState({ topics: { 1: { cwd: "/a" } } }),
       gwSave.saveState({ herdrPanes: { main: "p1" } }),
-      gwSave.saveState({ statusBoards: { main: 5 } }),
     ]);
     const final = JSON.parse(readFileSync(join(tmpStateDir, "state.json"), "utf8"));
     assert.equal(final.cwd, "/a");
     assert.deepEqual(final.recentProjects, ["/a"]);
     assert.deepEqual(final.topics, { 1: { cwd: "/a" } });
     assert.deepEqual(final.herdrPanes, { main: "p1" });
-    assert.deepEqual(final.statusBoards, { main: 5 });
     await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
   }
 
