@@ -22,6 +22,8 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 /help               Show this help
 /commands           Extension, prompt & skill commands
 /cwd [path]         Switch workspace; no argument shows recent projects
+/topic [path]       Start a new topic session (parallel task)
+/close              Close current topic session
 /sh <command>       Run a shell command directly
 /get <path>         Download a file from the workspace
 /model [query|provider/model]
@@ -44,7 +46,9 @@ Just send text to chat with Pi; messages sent while it is working act as steerin
 
 const BOT_COMMANDS = [
   ["help", "Help"], ["commands", "Extension, prompt & skill commands"],
-  ["cwd", "Switch workspace or show history"], ["sh", "Run a shell command"], ["get", "Download a file"],
+  ["cwd", "Switch workspace or show history"],
+  ["topic", "New topic session"], ["close", "Close current topic"],
+  ["sh", "Run a shell command"], ["get", "Download a file"],
   ["model", "View or switch model"], ["thinking", "View or set thinking level"],
   ["resume", "Resume a past session"], ["new", "New session"], ["name", "Set session name"],
   ["session", "Session & cost"], ["agents", "Herdr agent status"],
@@ -369,19 +373,41 @@ function resolvePath(pathStr, baseDir = process.cwd()) {
   return resolve(baseDir, expanded);
 }
 
+// pure routing: 判定消息归属的主会话 ("main") 或私聊 Topic ("t:<threadId>")
+// ref: Telegram Bot API 9.3 (2025-12-31) Topics in private chats (https://core.telegram.org/bots/api-changelog)
+function sessionKeyOf(messageOrCallbackMessage) {
+  if (!messageOrCallbackMessage) return "main";
+  const m = messageOrCallbackMessage.message || messageOrCallbackMessage;
+  const chatType = m.chat?.type;
+  if (chatType && chatType !== "private") return "main";
+  const threadId = m.message_thread_id;
+  if (!threadId) return "main";
+  if (m.is_topic_message === false) return "main";
+  return `t:${threadId}`;
+}
+
 function loadState(stateDir) {
   const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, recentProjects: [] };
+  if (!existsSync(statePath)) return { cwd: null, recentProjects: [], topics: {} };
   try {
     const raw = JSON.parse(readFileSync(statePath, "utf8"));
+    const topics = {};
+    if (typeof raw.topics === "object" && raw.topics !== null) {
+      for (const [threadId, info] of Object.entries(raw.topics)) {
+        if (typeof info?.cwd === "string" && existsSync(info.cwd)) {
+          topics[threadId] = { cwd: info.cwd };
+        }
+      }
+    }
     return {
       cwd: typeof raw.cwd === "string" ? raw.cwd : null,
       recentProjects: Array.isArray(raw.recentProjects)
         ? raw.recentProjects.filter((p) => typeof p === "string" && existsSync(p))
         : [],
+      topics,
     };
   } catch {
-    return { cwd: null, recentProjects: [] };
+    return { cwd: null, recentProjects: [], topics: {} };
   }
 }
 
@@ -393,6 +419,10 @@ function resolveSessionDir(stateDir, cwd) {
   const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
   const safeSlug = cwd.replace(/^[/\\]+/, "").replace(/[^a-zA-Z0-9_-]/g, "-");
   return join(stateDir, "sessions", `${safeSlug}_${hash}`);
+}
+
+function resolveTopicSessionDir(stateDir, cwd, threadId) {
+  return `${resolveSessionDir(stateDir, cwd)}-t${threadId}`;
 }
 
 function resolvePiBin(configured) {
@@ -489,6 +519,8 @@ function loadConfig() {
     sttCommand: file.sttCommand || "",
     ackEmoji: process.env.TELEGRAM_ACK_EMOJI || telegram.ackEmoji || "\u{1F440}",
     doneEmoji: process.env.TELEGRAM_DONE_EMOJI || telegram.doneEmoji || "\u{1FAE1}",
+    idleStopMinutes: Number(process.env.REMOTE_PI_IDLE_STOP_MINUTES || file.idleStopMinutes || 30),
+    maxSessions: Number(process.env.REMOTE_PI_MAX_SESSIONS || file.maxSessions || 4),
   };
   config.sessionDir = resolveSessionDir(config.stateDir, config.cwd);
   config.downloadsDir = join(config.stateDir, "downloads");
@@ -589,7 +621,10 @@ class Telegram {
   async send(chatId, text, extra = {}) {
     let last;
     const parts = chunks(text);
-    for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : {});
+    const threadExtra = extra?.message_thread_id ? { message_thread_id: extra.message_thread_id } : {};
+    for (let i = 0; i < parts.length; i++) {
+      last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : threadExtra);
+    }
     return last;
   }
 
@@ -613,12 +648,14 @@ class Telegram {
     return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch(console.error);
   }
 
-  async sendChatAction(chatId, action = "typing") {
+  async sendChatAction(chatId, action = "typing", extra = {}) {
     try {
+      const body = { chat_id: chatId, action };
+      if (extra?.message_thread_id) body.message_thread_id = extra.message_thread_id;
       await fetch(`${this.base}/sendChatAction`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, action }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(4_000),
       });
     } catch {
@@ -626,10 +663,11 @@ class Telegram {
     }
   }
 
-  async sendDocument(chatId, path) {
+  async sendDocument(chatId, path, extra = {}) {
     const t0 = performance.now();
     const form = new FormData();
     form.set("chat_id", String(chatId));
+    if (extra?.message_thread_id) form.set("message_thread_id", String(extra.message_thread_id));
     form.set("document", await openAsBlob(path), basename(path));
     const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
     const data = await response.json();
@@ -845,7 +883,7 @@ function runCommand(cmd, args, options = {}) {
 }
 
 // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-async function resolveHerdrEnvironment(cwd, { piBin, disabled } = {}) {
+async function resolveHerdrEnvironment(cwd, { piBin, disabled, excludePaneIds, threadId } = {}) {
   if (disabled || piBin === "echo" || process.env.NODE_ENV === "test") return {};
 
   let herdrBin;
@@ -896,10 +934,11 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled } = {}) {
   let workspaceId;
   let tabId;
   let paneId;
+  const exclude = new Set(excludePaneIds || []);
   try {
     const panesRaw = await runCommand(herdrBin, ["pane", "list"], { timeout: 3000 });
     const panesData = JSON.parse(panesRaw);
-    const existingPane = panesData.result?.panes?.find((p) => p.cwd === cwd);
+    const existingPane = panesData.result?.panes?.find((p) => p.cwd === cwd && !exclude.has(p.pane_id));
     if (existingPane) {
       workspaceId = existingPane.workspace_id;
       tabId = existingPane.tab_id;
@@ -909,7 +948,8 @@ async function resolveHerdrEnvironment(cwd, { piBin, disabled } = {}) {
 
   if (!paneId) {
     try {
-      const label = basename(cwd) || "remote-pi";
+      const base = basename(cwd) || "remote-pi";
+      const label = threadId ? `${base}#${threadId}` : base;
       const createdRaw = await runCommand(herdrBin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], { timeout: 5000 });
       const created = JSON.parse(createdRaw);
       workspaceId = created.result?.workspace?.workspace_id;
@@ -1129,6 +1169,7 @@ class PiRpc {
   async start() {
     this.stopping = false;
     this.missedPings = 0; // 新进程从零计失联，避免上个进程被杀后的余数误杀新进程
+    if (typeof this.config.beforeStart === "function") await this.config.beforeStart();
     const args = ["--mode", "rpc", "--continue", "--session-dir", this.config.sessionDir];
     if (this.config.approve) args.push("--approve");
     const companionPath = existsSync(join(dirname(fileURLToPath(import.meta.url)), "remote-extension.mjs"))
@@ -1151,7 +1192,14 @@ class PiRpc {
     let herdrEnv = {};
     if (this.config.herdr !== false) {
       try {
-        herdrEnv = await resolveHerdrEnvironment(this.config.cwd, { piBin: this.config.piBin });
+        const excludePaneIds = typeof this.config.getExcludePaneIds === "function"
+          ? this.config.getExcludePaneIds()
+          : [];
+        herdrEnv = await resolveHerdrEnvironment(this.config.cwd, {
+          piBin: this.config.piBin,
+          excludePaneIds,
+          threadId: this.config.threadId,
+        });
         if (herdrEnv.HERDR_PANE_ID) {
           console.log(`${new Date().toISOString()} [herdr] attached to pane ${herdrEnv.HERDR_PANE_ID} (workspace ${herdrEnv.HERDR_WORKSPACE_ID})`);
         }
@@ -1280,102 +1328,108 @@ class PiRpc {
   }
 }
 
-class Gateway {
-  constructor(config) {
-    this.config = config;
-    this.chatId = config.allowedUserId;
-    this.chatReady = false;
-    this.state = loadState(config.stateDir);
-    if (config.cwd && !this.state.recentProjects.includes(config.cwd)) {
-      this.state.recentProjects.unshift(config.cwd);
-    }
-    this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
-    this.pi = new PiRpc(config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
-    this.actions = new Map();
-    this.commandAliases = new Map();
+// ref: Telegram Bot API 9.3 (2025-12-31) & 9.4 (2026-02-09) Topics in private chats (https://core.telegram.org/bots/api-changelog)
+// ChatSession: 拥有独立 Pi RPC 进程、工作目录、会话存储与流式输出状态的独立会话单元
+class ChatSession {
+  constructor(gateway, { threadId = null, cwd, sessionDir }) {
+    this.gateway = gateway;
+    this.threadId = threadId;
+    this.key = threadId ? `t:${threadId}` : "main";
+    this.cwd = cwd;
+    this.sessionDir = sessionDir;
+    this.chatId = gateway.chatId;
+
+    this.draft = null;
     this.toolPanel = null;
-    this.mediaGroups = new Map();
     this.queue = { steering: [], followUp: [] };
     this.isStreaming = false;
     this.abortedRun = false;
+    this.repliedInRun = false;
     this.typingTimer = null;
-    this.als = new AsyncLocalStorage();
-    this.updateChain = Promise.resolve();
-    this.eventChain = Promise.resolve();
-    this.telegramChain = Promise.resolve();
-    this.uploadChain = Promise.resolve();
+    this.pendingUi = null;
     this.activeMessageIds = [];
     this.runStartedAt = null;
     this.runFirstTokenAt = null;
     this.runFirstUiAt = null;
     this.lastModel = null;
-    this.herdrWatcher = null;
-    this.herdrMessages = new Map();
+    this.commandAliases = new Map();
+    this.mediaGroups = new Map();
+    this.eventChain = Promise.resolve();
+    this.updateChain = Promise.resolve();
+    this.lastActiveAt = Date.now();
 
-    const origSend = this.telegram.send.bind(this.telegram);
-    this.telegram.send = (chatId, text, extra = {}) =>
-      this.queueTelegram(() => origSend(chatId, text, extra));
-
-    const origEdit = this.telegram.edit.bind(this.telegram);
-    this.telegram.edit = (chatId, messageId, text, ephemeral = false) =>
-      this.queueTelegram(() => origEdit(chatId, messageId, text, ephemeral));
+    this.pi = this.createPi();
   }
 
-  async start() {
-    const t0 = performance.now();
-    // launchd 以 O_APPEND 持有日志 fd，newsyslog 处理不了这种 fd；启动时截断 + 每小时巡检（服务极少重启，只靠启动截断等于没截）
-    const trimLog = () => stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
-    await trimLog();
-    setInterval(trimLog, 60 * 60_000).unref();
-    await Promise.all([
-      mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
-    ]);
-    await this.acquireLock();
-    await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
-    const me = await this.telegram.call("getMe");
-    try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
-    catch (error) { if (!error.message.includes("chat not found")) throw error; }
-    await this.pi.start();
-    const state = await this.pi.request("get_state");
-    if (state?.model?.provider && state?.model?.id) {
-      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-    }
-    await this.registerBotCommands();
-    this.startHerdrWatcher();
-    console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
-    await this.telegram.poll((update) => this.dispatchUpdate(update));
+  createPi() {
+    const rpcConfig = {
+      ...this.gateway.config,
+      piBin: this.gateway.config.piBin || resolvePiBin(),
+      cwd: this.cwd,
+      sessionDir: this.sessionDir,
+      threadId: this.threadId,
+      beforeStart: () => this.gateway.acquireSessionSlot(this),
+      getExcludePaneIds: () => this.gateway.getOwnedPaneIds(this),
+    };
+    return new PiRpc(
+      rpcConfig,
+      (event) => this.queueEvent(event),
+      (exit) => this.handlePiExit(exit),
+    );
   }
 
-  async saveDownload(fileId, name, needsBase64 = false) {
-    const t0 = performance.now();
-    const file = await this.telegram.call("getFile", { file_id: fileId });
-    const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
-    if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
-    const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
-    await writeFile(path, buffer);
-    console.log(`${new Date().toISOString()} [download] ${name} (${buffer.length} bytes) in ${Math.round(performance.now() - t0)}ms`);
-    return { path, data: needsBase64 ? buffer.toString("base64") : null };
+  touchActivity() {
+    this.lastActiveAt = Date.now();
+  }
+
+  threadExtra(extra = {}) {
+    return this.threadId ? { message_thread_id: this.threadId, ...extra } : extra;
+  }
+
+  send(text, extra = {}) {
+    return this.gateway.telegram.send(this.chatId, text, this.threadExtra(extra));
+  }
+
+  sendOne(text, extra = {}) {
+    return this.gateway.telegram.sendOne(this.chatId, text, this.threadExtra(extra));
+  }
+
+  sendDocument(path, extra = {}) {
+    return this.gateway.queueUpload(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra(extra)));
+  }
+
+  action(payload, ttl = 10 * 60_000) {
+    return this.gateway.action({ ...payload, sessionKey: this.key }, ttl);
+  }
+
+  keyboard(items) {
+    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } };
   }
 
   queueEvent(event) {
-    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error("Pi event:", error));
+    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error(`Pi event [${this.key}]:`, error));
   }
 
-  queueTelegram(work) {
-    if (this.als.getStore()) return work();
-    const next = this.telegramChain.then(() => this.als.run(true, work));
-    this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
-    return next;
+  startTyping() {
+    if (this.typingTimer) return;
+    this.gateway.telegram.sendChatAction(this.chatId, "typing", this.threadExtra());
+    this.typingTimer = setInterval(() => {
+      this.gateway.telegram.sendChatAction(this.chatId, "typing", this.threadExtra());
+    }, 4500);
+    this.typingTimer.unref();
   }
 
-  queueUpload(work) {
-    const next = this.uploadChain.then(work);
-    this.uploadChain = next.catch((error) => console.error("Upload output:", error));
-    return next;
+  stopTyping() {
+    if (this.typingTimer) {
+      clearInterval(this.typingTimer);
+      this.typingTimer = null;
+    }
+  }
+
+  settleActiveReactions() {
+    for (const id of this.activeMessageIds.splice(0)) {
+      this.gateway.queueTelegram(() => this.gateway.telegram.setReaction(this.chatId, id, this.gateway.config.doneEmoji));
+    }
   }
 
   handlePiExit({ code, signal, expected }) {
@@ -1385,237 +1439,8 @@ class Gateway {
     this.resetSessionState();
     this.settleActiveReactions();
     if (wasStreaming || pendingUi) {
-      console.error(`${new Date().toISOString()} [pi] process exited unexpectedly (${code ?? signal})`);
-      this.queueTelegram(() => this.telegram.send(this.chatId, `⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`));
-    }
-  }
-
-  isAllowed(from, chat) {
-    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
-  }
-
-  settleActiveReactions() {
-    for (const id of this.activeMessageIds.splice(0)) {
-      this.queueTelegram(() => this.telegram.setReaction(this.chatId, id, this.config.doneEmoji));
-    }
-  }
-
-  dispatchUpdate(update) {
-    const priority = getUpdatePriority(update);
-    if (priority === "p0" || priority === "p1") {
-      const p = this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
-      return p;
-    }
-    // 相册入站聚合：首条出现时立即在 updateChain 占位，保证后续普通消息排在相册之后 (ref: python-telegram-bot media_group)
-    if (update.message?.media_group_id && this.isAllowed(update.message.from, update.message.chat) && !this.pendingUi) {
-      const m = update.message;
-      this.chatReady = true;
-      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
-      const key = `${this.chatId}:${m.media_group_id}`;
-      let group = this.mediaGroups.get(key);
-      if (!group) {
-        let resolveReady;
-        const ready = new Promise((r) => { resolveReady = r; });
-        group = { messages: [], timer: null, ready, resolveReady, cancelled: false };
-        this.mediaGroups.set(key, group);
-        const groupTask = async () => {
-          await group.ready;
-          if (group.cancelled || !group.messages.length) return;
-          await this.handleMediaGroup(group.messages);
-        };
-        const next = this.updateChain.then(groupTask).catch((err) => {
-          console.error("Media group error:", err);
-          this.telegram.send(this.chatId, `❌ Failed to process media group: ${err.message}`);
-        });
-        this.updateChain = next;
-        group.done = next;
-      }
-      group.messages.push(m);
-      if (group.timer) clearTimeout(group.timer);
-      group.timer = setTimeout(() => {
-        this.mediaGroups.delete(key);
-        group.resolveReady();
-      }, 1200);
-      return group.done;
-    }
-    const next = this.updateChain.then(() => this.handleUpdate(update));
-    this.updateChain = next.catch((err) => console.error("Telegram update error:", err));
-    return next;
-  }
-
-  async handlePriorityUpdate(update, priority) {
-    const t0 = performance.now();
-    try {
-      if (update.stopped_message_generation) {
-        console.log(`${new Date().toISOString()} [p0] stopped_message_generation`);
-        await this.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
-        return;
-      }
-      const m = update.message;
-      if (!m || !this.isAllowed(m.from, m.chat)) return;
-      this.chatReady = true;
-      const cmd = parseCommand(m.text?.trim() || "");
-      if (!cmd) return;
-      if (cmd.name === "restart") {
-        const receiptPath = join(this.config.stateDir, "last-restart-update");
-        const lastRestart = await readFile(receiptPath, "utf8").catch(() => "");
-        if (lastRestart && String(update.update_id) === lastRestart.trim()) {
-          console.log(`${new Date().toISOString()} [p0] ignoring duplicate restart update #${update.update_id}`);
-          return;
-        }
-      }
-      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
-      console.log(`${new Date().toISOString()} [${priority}] handling /${cmd.name}`);
-      await this.handleCommand(cmd, m.text, update.update_id);
-      await this.telegram.setReaction(this.chatId, m.message_id, this.config.doneEmoji);
-    } catch (error) {
-      console.error(`[${priority}] error:`, error);
-      await this.telegram.send(this.chatId, `❌ ${error.message}`);
-    } finally {
-      console.log(`${new Date().toISOString()} [${priority}] finished in ${Math.round(performance.now() - t0)}ms`);
-    }
-  }
-
-  async handleUpdate(update) {
-    const t0 = performance.now();
-    try {
-      if (update.message) {
-        if (!this.isAllowed(update.message.from, update.message.chat)) return;
-        this.chatReady = true;
-        const m = update.message;
-        const lag = m.date ? `${Date.now() - m.date * 1000}ms` : "0ms";
-        const preview = (m.text || m.caption || (m.photo ? "[photo]" : m.voice ? "[voice]" : "[file]")).slice(0, 50).replace(/\n/g, " ");
-        console.log(`${new Date().toISOString()} [update] msg #${m.message_id} (tg lag: ${lag}): ${preview}`);
-        await this.handleMessage(update.message);
-      } else if (update.callback_query) {
-        const callback = update.callback_query;
-        if (!this.isAllowed(callback.from, callback.message?.chat)) return;
-        this.chatReady = true;
-        console.log(`${new Date().toISOString()} [update] callback #${callback.id}: ${callback.data}`);
-        await this.handleCallback(callback);
-      }
-      // stopped_message_generation 由 getUpdatePriority 判为 p0，永远走 handlePriorityUpdate，此处不可达
-    } catch (error) {
-      console.error("Telegram input:", error);
-      this.settleActiveReactions();
-      await this.telegram.send(this.chatId, `❌ ${error.message}`);
-    } finally {
-      console.log(`${new Date().toISOString()} [update] #${update.update_id} finished in ${Math.round(performance.now() - t0)}ms`);
-    }
-  }
-
-  async extractMedia(m) {
-    if (m.photo?.length) {
-      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`, true);
-      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "photo" };
-    }
-    const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
-    if (!file) return null;
-    const isImage = file.mime_type?.startsWith("image/");
-    const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
-    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`, isImage);
-    const image = isImage ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
-    const label = m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind;
-    return { saved, image, label };
-  }
-
-  async handleMessage(message) {
-    if (this.pendingUi && !message.text?.startsWith("/")) {
-      const pending = this.pendingUi;
-      this.pendingUi = null;
-      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
-      this.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
-      await this.telegram.send(this.chatId, "Submitted.");
-      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
-      return;
-    }
-
-    const herdrPane = this.herdrWatcher && this.herdrMessages.get(message.reply_to_message?.message_id);
-    if (herdrPane && message.text && !message.text.startsWith("/")) return this.replyToHerdrAgent(herdrPane, message);
-
-    const media = await this.extractMedia(message);
-    if (media) {
-      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
-      if (message.voice && this.config.sttCommand) {
-        try {
-          const tStt = performance.now();
-          const transcript = await runStt(this.config.sttCommand, media.saved.path);
-          console.log(`${new Date().toISOString()} [stt] transcribed voice in ${Math.round(performance.now() - tStt)}ms`);
-          this.activeMessageIds.push(message.message_id);
-          this.runStartedAt = performance.now();
-          this.runFirstTokenAt = null;
-          this.runFirstUiAt = null;
-          await this.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
-          return;
-        } catch (error) {
-          return this.telegram.send(this.chatId, `❌ ${error.message}`);
-        }
-      }
-      this.activeMessageIds.push(message.message_id);
-      this.runStartedAt = performance.now();
-      this.runFirstTokenAt = null;
-      this.runFirstUiAt = null;
-      await this.prompt(attachmentPrompt(message.caption || `User sent a ${media.label}.`, [media.saved]), media.image ? [media.image] : undefined);
-      return;
-    }
-
-    const text = message.text?.trim();
-    if (!text) return;
-
-    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
-
-    const command = parseCommand(text);
-    if (command) {
-      if (command.name === "followup") this.activeMessageIds.push(message.message_id);
-      await this.handleCommand(command, text);
-      if (command.name !== "followup") {
-        await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
-      }
-    } else {
-      this.activeMessageIds.push(message.message_id);
-      this.runStartedAt = performance.now();
-      this.runFirstTokenAt = null;
-      this.runFirstUiAt = null;
-      await this.prompt(text);
-    }
-  }
-
-  async handleMediaGroup(messages) {
-    const mediaList = await Promise.all(messages.map((m) => this.extractMedia(m)));
-    const files = [];
-    const images = [];
-    let caption = "";
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].caption) caption = messages[i].caption;
-      const media = mediaList[i];
-      if (!media) continue;
-      files.push(media.saved);
-      if (media.image) images.push(media.image);
-    }
-    for (const m of messages) this.activeMessageIds.push(m.message_id);
-    this.runStartedAt = performance.now();
-    this.runFirstTokenAt = null;
-    this.runFirstUiAt = null;
-    if (files.length) {
-      await this.prompt(attachmentPrompt(caption || "Please review these files.", files), images.length ? images : undefined);
-    } else if (caption) {
-      await this.prompt(caption);
-    }
-  }
-
-  startTyping() {
-    if (this.typingTimer) return;
-    this.telegram.sendChatAction(this.chatId, "typing");
-    this.typingTimer = setInterval(() => {
-      this.telegram.sendChatAction(this.chatId, "typing");
-    }, 4500);
-    this.typingTimer.unref();
-  }
-
-  stopTyping() {
-    if (this.typingTimer) {
-      clearInterval(this.typingTimer);
-      this.typingTimer = null;
+      console.error(`${new Date().toISOString()} [pi${this.threadId ? `:${this.threadId}` : ""}] process exited unexpectedly (${code ?? signal})`);
+      this.gateway.queueTelegram(() => this.send(`⚠️ Pi process exited unexpectedly (${code ?? signal}); recovered and ready.`));
     }
   }
 
@@ -1635,16 +1460,15 @@ class Gateway {
       if (group.resolveReady) group.resolveReady();
     }
     this.mediaGroups.clear();
-    for (const [key, action] of this.actions) {
-      if (action.type === "ui") this.actions.delete(key);
+    for (const [key, action] of this.gateway.actions) {
+      if (action.type === "ui" && action.sessionKey === this.key) this.gateway.actions.delete(key);
     }
     if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
     this.toolPanel = null;
     if (this.draft) {
       if (this.draft.timer) clearTimeout(this.draft.timer);
-      // ponytail: 不发空文本“清除”（协议里是 Thinking 占位）；停止更新让 30s 预览自然过期
       this.draft.closed = true;
-      if (this.draft.messageId) this.telegram.deleteMessage(this.chatId, this.draft.messageId).catch(() => {});
+      if (this.draft.messageId) this.gateway.telegram.deleteMessage(this.chatId, this.draft.messageId).catch(() => {});
     }
     this.draft = null;
     this.queue = { steering: [], followUp: [] };
@@ -1658,7 +1482,7 @@ class Gateway {
       if (images) fields.images = images;
       const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
       if (behavior) fields.streamingBehavior = behavior;
-      console.log(`${new Date().toISOString()} [prompt] sending to Pi (behavior=${behavior || "initial"}, chars=${message.length})`);
+      console.log(`${new Date().toISOString()} [prompt${this.threadId ? `:${this.threadId}` : ""}] sending to Pi (behavior=${behavior || "initial"}, chars=${message.length})`);
       try {
         await this.pi.request("prompt", fields);
       } catch (error) {
@@ -1670,8 +1494,8 @@ class Gateway {
           throw error;
         }
       }
-      console.log(`${new Date().toISOString()} [prompt] accepted by Pi in ${Math.round(performance.now() - t0)}ms`);
-      if (fields.streamingBehavior === "followUp") await this.telegram.send(this.chatId, "↪ Queued as follow-up", { disable_notification: true });
+      console.log(`${new Date().toISOString()} [prompt${this.threadId ? `:${this.threadId}` : ""}] accepted by Pi in ${Math.round(performance.now() - t0)}ms`);
+      if (fields.streamingBehavior === "followUp") await this.send("↪ Queued as follow-up", { disable_notification: true });
     } catch (error) {
       this.stopTyping();
       throw error;
@@ -1682,9 +1506,11 @@ class Gateway {
     const t0 = performance.now();
     try {
       switch (name) {
-      case "start": case "help": return this.telegram.send(this.chatId, HELP);
+      case "start": case "help": return this.send(HELP);
       case "commands": return this.showCommands();
-      case "cwd": return argument ? this.switchCwd(resolvePath(argument.trim(), this.config.cwd), null) : this.showCwds();
+      case "cwd": return argument ? this.switchCwd(resolvePath(argument.trim(), this.cwd), null) : this.showCwds();
+      case "topic": return this.gateway.handleTopicCommand(this, argument);
+      case "close": return this.gateway.handleCloseCommand(this);
       case "model": return this.showModels(argument);
       case "thinking": return this.showThinking(argument);
       case "resume": return this.showSessions();
@@ -1703,7 +1529,7 @@ class Gateway {
         this.settleActiveReactions();
         const result = await this.pi.request("new_session");
         if (result.cancelled) {
-          return this.telegram.send(this.chatId, "New session cancelled");
+          return this.send("New session cancelled");
         }
         if (targetModel) {
           await this.pi.request("set_model", targetModel).catch((err) => {
@@ -1712,29 +1538,29 @@ class Gateway {
           this.lastModel = targetModel;
         }
         const state = await this.pi.request("get_state").catch(() => null);
-        const text = formatSessionReset({ model: state?.model, cwd: this.config.cwd });
-        return this.telegram.send(this.chatId, text);
+        const text = formatSessionReset({ model: state?.model, cwd: this.cwd });
+        return this.send(text);
       }
       case "name": {
-        if (!argument) return this.telegram.send(this.chatId, "Usage: /name <name>");
+        if (!argument) return this.send("Usage: /name <name>");
         await this.pi.request("set_session_name", { name: argument });
-        return this.telegram.send(this.chatId, `✅ Session name: ${argument}`);
+        return this.send(`✅ Session name: ${argument}`);
       }
       case "session": case "status": return this.showSession();
-      case "agents": return this.showHerdrAgents();
+      case "agents": return this.gateway.showHerdrAgents();
       case "fork": return this.showForks();
       case "clone": {
         const result = await this.pi.request("clone");
-        return this.telegram.send(this.chatId, result.cancelled ? "Clone cancelled" : "✅ Current branch cloned");
+        return this.send(result.cancelled ? "Clone cancelled" : "✅ Current branch cloned");
       }
       case "compact": {
         this.startTyping();
         try {
           const result = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
-          return this.telegram.send(this.chatId, `✅ Compacted: ${result.tokensBefore} → ~${result.estimatedTokensAfter} tokens`);
+          return this.send(`✅ Compacted: ${result.tokensBefore} → ~${result.estimatedTokensAfter} tokens`);
         } catch (error) {
           if (!/abort/i.test(error.message)) {
-            return this.telegram.send(this.chatId, `❌ ${error.message}`);
+            return this.send(`❌ ${error.message}`);
           }
         } finally {
           this.stopTyping();
@@ -1742,45 +1568,45 @@ class Gateway {
       }
       case "export": {
         const result = await this.pi.request("export_html");
-        await this.telegram.sendDocument(this.chatId, result.path);
+        await this.sendDocument(result.path);
         return;
       }
       case "sh": case "bash": {
-        if (!argument) return this.telegram.send(this.chatId, "Usage: /sh <command>");
+        if (!argument) return this.send("Usage: /sh <command>");
         if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
-          return this.telegram.send(this.chatId, "❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
+          return this.send("❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
         }
         this.startTyping();
         try {
           const res = await this.pi.request("bash", { command: argument });
           const output = res.output ? res.output.trim() : "(no output)";
           if (output.split("\n").length > 3) {
-            return this.telegram.send(this.chatId, expandableBlockquote(output));
+            return this.send(expandableBlockquote(output));
           }
-          return this.telegram.send(this.chatId, output);
+          return this.send(output);
         } catch (error) {
           if (!/abort/i.test(error.message)) {
-            return this.telegram.send(this.chatId, `❌ ${error.message}`);
+            return this.send(`❌ ${error.message}`);
           }
         } finally {
           this.stopTyping();
         }
       }
       case "get": {
-        if (!argument) return this.telegram.send(this.chatId, "Usage: /get <path>");
-        const filePath = resolve(this.config.cwd, argument);
+        if (!argument) return this.send("Usage: /get <path>");
+        const filePath = resolve(this.cwd, argument);
         try {
           const s = await stat(filePath);
-          if (!s.isFile()) return this.telegram.send(this.chatId, "❌ Not a regular file");
-          if (s.size > 20 * 1024 * 1024) return this.telegram.send(this.chatId, "❌ File exceeds the 20MB limit");
-          await this.telegram.sendDocument(this.chatId, filePath);
+          if (!s.isFile()) return this.send("❌ Not a regular file");
+          if (s.size > 20 * 1024 * 1024) return this.send("❌ File exceeds the 20MB limit");
+          await this.sendDocument(filePath);
         } catch (error) {
-          return this.telegram.send(this.chatId, `❌ File missing or inaccessible: ${error.message}`);
+          return this.send(`❌ File missing or inaccessible: ${error.message}`);
         }
         return;
       }
       case "followup": {
-        if (!argument) return this.telegram.send(this.chatId, "Usage: /followup <message>");
+        if (!argument) return this.send("Usage: /followup <message>");
         return this.prompt(argument, undefined, "followUp");
       }
       case "abort": {
@@ -1797,13 +1623,9 @@ class Gateway {
         this.resetSessionState();
         if (!clear) this.queue = kept;
         this.settleActiveReactions();
-        return this.telegram.send(this.chatId, clear ? "⏹ Stopped; queue cleared" : "⏹ Stopped (queued messages kept; /abort clear to clear)");
+        return this.send(clear ? "⏹ Stopped; queue cleared" : "⏹ Stopped (queued messages kept; /abort clear to clear)");
       }
       case "upgrade": {
-        // 复用 install.sh upgrade（dirty check / ff-only pull / npm install / self-test / 自动回滚），
-        // --no-restart 防止脚本 kickstart 杀掉自身导致回复发不出去；重启复用 /restart。
-        // ref: staged self-update best practice — verify before swap, restart via supervisor
-        // (https://docs.rs/update-rs/latest/update_rs/index.html)
         this.startTyping();
         const script = join(dirname(fileURLToPath(import.meta.url)), "install.sh");
         const res = await new Promise((done) => {
@@ -1816,22 +1638,21 @@ class Gateway {
         });
         this.stopTyping();
         const text = res.buf.trim() || "(no output)";
-        if (res.code !== 0) return this.telegram.send(this.chatId, `❌ Upgrade failed\n${text}`);
-        if (text.includes("Already up to date")) return this.telegram.send(this.chatId, text);
-        await this.telegram.send(this.chatId, text);
-        return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId); // graceful restart: 回执落盘 → exit → launchd 拉起新版
+        if (res.code !== 0) return this.send(`❌ Upgrade failed\n${text}`);
+        if (text.includes("Already up to date")) return this.send(text);
+        await this.send(text);
+        return this.handleCommand({ name: "restart", argument: "" }, "/restart", updateId);
       }
       case "restart": {
-        await this.telegram.send(this.chatId, "🔄 Restarting gateway…");
-        // ref: Node.js process.exit & restart receipt (https://nodejs.org/api/process.html#processexitcode)
+        await this.send("🔄 Restarting gateway…");
         if (updateId) {
-          const receiptPath = join(this.config.stateDir, "last-restart-update");
+          const receiptPath = join(this.gateway.config.stateDir, "last-restart-update");
           await writeFile(receiptPath, String(updateId), { mode: 0o600 }).catch(() => {});
-          const tmp = `${this.telegram.offsetPath}.tmp`;
+          const tmp = `${this.gateway.telegram.offsetPath}.tmp`;
           await writeFile(tmp, String(updateId + 1), { mode: 0o600 }).catch(() => {});
-          await rename(tmp, this.telegram.offsetPath).catch(() => {});
+          await rename(tmp, this.gateway.telegram.offsetPath).catch(() => {});
         }
-        this.stop();
+        this.gateway.stop();
         setTimeout(() => process.exit(0), 100);
         return;
       }
@@ -1839,43 +1660,40 @@ class Gateway {
         if (argument === "clear") {
           const removed = this.pi.proc ? await this.pi.request("clear_queue").catch(() => ({ steering: [], followUp: [] })) : { steering: [], followUp: [] };
           this.queue = { steering: [], followUp: [] };
-          return this.telegram.send(this.chatId, `Cleared\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
+          return this.send(`Cleared\nsteering: ${removed.steering.length}\nfollow-up: ${removed.followUp.length}`);
         }
-        return this.telegram.send(this.chatId, `steering:\n${this.queue.steering.join("\n") || "(empty)"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "(empty)"}`);
+        return this.send(`steering:\n${this.queue.steering.join("\n") || "(empty)"}\n\nfollow-up:\n${this.queue.followUp.join("\n") || "(empty)"}`);
       }
       default: {
-        const alias = this.commandAliases.get(name);
+        const alias = this.commandAliases.get(name) || this.gateway.commandAliases.get(name);
         if (alias) return this.prompt(`/${alias}${argument ? ` ${argument}` : ""}`);
         const commands = await this.pi.request("get_commands");
         if (commands.commands.some((item) => item.name.toLowerCase() === name)) return this.prompt(original);
-        return this.telegram.send(this.chatId, `Unknown command: /${name}\nUse /help or /commands`);
+        return this.send(`Unknown command: /${name}\nUse /help or /commands`);
       }
-    }
+      }
     } finally {
-      console.log(`${new Date().toISOString()} [cmd] /${name} finished in ${Math.round(performance.now() - t0)}ms`);
+      console.log(`${new Date().toISOString()} [cmd${this.threadId ? `:${this.threadId}` : ""}] /${name} finished in ${Math.round(performance.now() - t0)}ms`);
     }
   }
 
-  async registerBotCommands() {
-    const t0 = performance.now();
-    const data = await this.pi.request("get_commands");
-    const commands = [...BOT_COMMANDS];
-    for (const command of data.commands) {
-      const telegramName = telegramCommandName(command);
-      if (!telegramName || commands.some((item) => item.command === telegramName)) continue;
-      if (!/^[a-z0-9_]{1,32}$/.test(telegramName)) continue;
-      commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
-      this.commandAliases.set(telegramName, command.name);
-      if (command.source === "skill") {
-        this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
-      }
+  async handleMediaGroup(messages) {
+    const mediaList = await Promise.all(messages.map((m) => this.gateway.extractMedia(m)));
+    const files = [];
+    const images = [];
+    let caption = "";
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].caption) caption = messages[i].caption;
+      const media = mediaList[i];
+      if (!media) continue;
+      files.push(media.saved);
+      if (media.image) images.push(media.image);
     }
-    const finalCommands = commands.slice(0, 100);
-    await Promise.all([
-      this.telegram.call("setMyCommands", { commands: finalCommands }),
-      this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
-    ]);
-    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length}) in ${Math.round(performance.now() - t0)}ms`);
+    if (files.length) {
+      await this.prompt(attachmentPrompt(caption || "Please review these files.", files), images.length ? images : undefined);
+    } else if (caption) {
+      await this.prompt(caption);
+    }
   }
 
   async showCommands() {
@@ -1883,157 +1701,90 @@ class Gateway {
     const text = data.commands.length
       ? data.commands.map((item) => `/${item.name}${item.description ? ` — ${item.description}` : ""}`).join("\n")
       : "No extension commands, prompt templates, or skills loaded.";
-    await this.telegram.send(this.chatId, text);
-  }
-
-  async saveState(patch) {
-    this.state = { ...this.state, ...patch };
-    const statePath = join(this.config.stateDir, "state.json");
-    const tempPath = `${statePath}.tmp.${Date.now()}`;
-    try {
-      await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
-      await rename(tempPath, statePath);
-    } catch (err) {
-      console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
-    }
+    await this.send(text);
   }
 
   async showCwds() {
     const items = new Map();
-
-    if (Array.isArray(this.state.recentProjects)) {
-      for (const p of this.state.recentProjects) {
+    if (Array.isArray(this.gateway.state.recentProjects)) {
+      for (const p of this.gateway.state.recentProjects) {
         if (!items.has(p) && existsSync(p)) {
           items.set(p, basename(p));
         }
       }
     }
-
-    if (!items.has(this.config.cwd)) {
-      items.set(this.config.cwd, basename(this.config.cwd));
+    if (!items.has(this.cwd)) {
+      items.set(this.cwd, basename(this.cwd));
     }
-
     if (items.size <= 1) {
-      await this.telegram.send(
-        this.chatId,
-        `Current directory: ${this.config.cwd}\n\nNo recent projects yet. Use /cwd <absolute-path> to switch to another project.`,
+      await this.send(
+        `Current directory: ${this.cwd}\n\nNo recent projects yet. Use /cwd <absolute-path> to switch to another project.`,
       );
       return;
     }
-
     const keyboardItems = Array.from(items.entries()).map(([path, name]) => ({
-      label: `${path === this.config.cwd ? "●" : "○"} ${name}`,
+      label: `${path === this.cwd ? "●" : "○"} ${name}`,
       action: { type: "cwd", path },
     }));
-
-    await this.telegram.send(this.chatId, `Current directory: ${this.config.cwd}\n\nPick a workspace project:`, this.keyboard(keyboardItems));
+    await this.send(`Current directory: ${this.cwd}\n\nPick a workspace project:`, this.keyboard(keyboardItems));
   }
 
-  action(payload, ttl = 10 * 60_000) {
-    const now = Date.now();
-    for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
-    const token = randomBytes(6).toString("base64url");
-    this.actions.set(token, { ...payload, expires: now + ttl });
-    return `a:${token}`;
-  }
-
-  startHerdrWatcher() {
-    const env = this.pi.herdrEnv;
-    if (this.config.herdr === false || !env?.HERDR_BIN_PATH || !env?.HERDR_SOCKET_PATH) return;
-    this.herdrWatcher = new HerdrWatcher({
-      bin: env.HERDR_BIN_PATH,
-      socketPath: env.HERDR_SOCKET_PATH,
-      // 网关自己的 Pi 已在本对话里流式输出，不再重复推送
-      isExcluded: (paneId) => paneId === this.pi.herdrEnv?.HERDR_PANE_ID,
-      onTransition: ({ paneId, status, agent }) => this.sendHerdrAgent(paneId, status, agent),
-    });
-    this.herdrWatcher.start();
-  }
-
-  async sendHerdrAgent(paneId, status, agent) {
-    const watcher = this.herdrWatcher;
-    const blocked = status === "blocked";
-    const screen = await watcher.cli(["agent", "read", paneId, "--source", blocked ? "visible" : "recent-unwrapped", "--lines", "60"]).catch(() => "");
-    const tail = herdrTail(screen);
-    const label = watcher.label(paneId);
-    const head = blocked ? `✋ ${label} needs your confirmation`
-      : status === "done" ? `✅ ${label} finished`
-      : `${HERDR_STATUS_ICON[status] || "❔"} ${label} — ${status}`;
-    const text = [
-      head,
-      agent?.terminal_title_stripped ? `\`${agent.terminal_title_stripped.replace(/`/g, "'")}\`` : "",
-      tail ? expandableBlockquote(tail) : "",
-      blocked ? "Tap a button, or reply to this message to type an answer." : "Reply to this message to send this agent a prompt.",
-    ].filter(Boolean).join("\n\n");
-
-    // 审批按钮 24h 有效（手机上可能晚些才看到）；同一条通知的按钮按 group 一次性消费
-    const ttl = 24 * 60 * 60_000;
-    const group = randomBytes(4).toString("hex");
-    const keyButton = (label, keys) => ({ text: label.slice(0, 60), callback_data: this.action({ type: "herdr_keys", paneId, keys, label, group }, ttl) });
-    const rows = [];
-    if (blocked) {
-      for (const choice of herdrChoices(tail)) rows.push([keyButton(`${choice.key}. ${choice.label}`, [choice.key])]);
-      rows.push([keyButton("⏎ Enter", ["enter"]), keyButton("⎋ Esc", ["esc"])]);
-    }
-    rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
-    const sent = await this.telegram.send(this.chatId, text, { reply_markup: { inline_keyboard: rows } });
-    if (sent?.message_id) {
-      this.herdrMessages.set(sent.message_id, paneId);
-      if (this.herdrMessages.size > 200) this.herdrMessages.delete(this.herdrMessages.keys().next().value);
-    }
-  }
-
-  async showHerdrAgents() {
-    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available (disabled in config, or its server is not running).");
-    await this.herdrWatcher.sync();
-    const ownPane = this.pi.herdrEnv?.HERDR_PANE_ID;
-    const agents = [...this.herdrWatcher.agents.values()].filter((agent) => agent.pane_id !== ownPane);
-    if (!agents.length) return this.telegram.send(this.chatId, "No agents running in Herdr.");
-    const byWorkspace = new Map();
-    for (const agent of agents) {
-      const ws = this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.workspace_id;
-      if (!byWorkspace.has(ws)) byWorkspace.set(ws, []);
-      byWorkspace.get(ws).push(agent);
-    }
-    const lines = [];
-    for (const [ws, list] of byWorkspace) {
-      lines.push(`**${ws}**`);
-      for (const agent of list) {
-        const title = agent.terminal_title_stripped ? ` — ${agent.terminal_title_stripped.replace(/[`*_[\]]/g, "")}` : "";
-        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${herdrOptedIn(agent) ? " 📡" : ""}${title}`);
-      }
-      lines.push("");
-    }
-    lines.push("📡 = pushed to Telegram (run /remote-pi inside that Pi to toggle). Tap an agent to see its screen.");
-    return this.telegram.send(this.chatId, lines.join("\n"), this.keyboard(agents.map((agent) => ({
-      label: `${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} · ${this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.pane_id}`,
-      action: { type: "herdr_peek", paneId: agent.pane_id },
-    }))));
-  }
-
-  async replyToHerdrAgent(paneId, message) {
-    const watcher = this.herdrWatcher;
-    const text = message.text.trim();
-    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+  async switchCwd(path, callbackId) {
+    const reply = callbackId
+      ? (text) => this.gateway.telegram.answer(callbackId, text)
+      : (text) => this.send(text);
+    let target, targetStat;
     try {
-      const agent = (await watcher.cliJson(["agent", "get", paneId]))?.agent;
-      if (!agent) return this.telegram.send(this.chatId, `❌ ${paneId} no longer hosts an agent`);
-      // agent prompt 会拒绝 blocked 状态（agent_blocked）；此时把文本打进提问 UI 再回车
-      if (agent.agent_status === "blocked") {
-        await watcher.cli(["pane", "send-text", paneId, text]);
-        await watcher.cli(["agent", "send-keys", paneId, "enter"]);
-      } else {
-        await watcher.cli(["agent", "prompt", paneId, text]);
-      }
-      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
-      return this.telegram.send(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, { disable_notification: true });
-    } catch (error) {
-      return this.telegram.send(this.chatId, `❌ ${error.message}`);
+      target = await realpath(path);
+      targetStat = await stat(target);
+    } catch {
+      await reply(`Directory missing or inaccessible: ${path}`);
+      return;
     }
-  }
+    if (!targetStat.isDirectory()) {
+      await reply(`Not a valid directory: ${path}`);
+      return;
+    }
+    if (target === this.cwd) {
+      await reply("Already in this directory");
+      return;
+    }
 
-  keyboard(items) {
-    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } };
+    const recentProjects = [target, ...(this.gateway.state.recentProjects || []).filter((p) => p !== target)].slice(0, 20);
+
+    if (this.threadId === null) {
+      this.gateway.config.cwd = target;
+      this.sessionDir = resolveSessionDir(this.gateway.config.stateDir, target);
+      this.gateway.config.sessionDir = this.sessionDir;
+      await this.gateway.saveState({ cwd: target, recentProjects });
+    } else {
+      this.sessionDir = resolveTopicSessionDir(this.gateway.config.stateDir, target, this.threadId);
+      this.gateway.state.topics[this.threadId] = { cwd: target };
+      await this.gateway.saveState({ topics: this.gateway.state.topics, recentProjects });
+      const topicName = (basename(target) || "topic").slice(0, 128);
+      await this.gateway.telegram.call("editForumTopic", {
+        chat_id: this.chatId,
+        message_thread_id: this.threadId,
+        name: topicName,
+      }).catch(() => {});
+    }
+
+    await reply("Switching");
+    await this.send(`✅ Working directory switched to:\n${target}\n\nHot-restarting Pi…`);
+    this.pi.stop();
+    this.cwd = target;
+    await mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
+    this.resetSessionState();
+    this.pi = this.createPi();
+    await this.pi.start();
+    if (this.threadId === null) {
+      await this.gateway.registerBotCommands();
+    }
+    const state = await this.pi.request("get_state");
+    if (state?.model?.provider && state?.model?.id) {
+      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
+    await this.send(`✅ Pi ready; Session: ${state.sessionId}`);
   }
 
   async showModels(query) {
@@ -2044,14 +1795,14 @@ class Gateway {
       if (exact) {
         await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
         this.lastModel = { provider: exact.provider, modelId: exact.id };
-        return this.telegram.send(this.chatId, `✅ ${exact.provider}/${exact.id}`);
+        return this.send(`✅ ${exact.provider}/${exact.id}`);
       }
     }
     const filtered = models.filter((model) => !query || `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query.toLowerCase()));
-    if (!filtered.length) return this.telegram.send(this.chatId, `No matching model: ${query}`);
+    if (!filtered.length) return this.send(`No matching model: ${query}`);
     const display = filtered.slice(0, 18);
     const suffix = filtered.length > 18 ? `\n\n(${filtered.length} models; showing first 18 — use /model <query> to filter)` : "";
-    return this.telegram.send(this.chatId, `Pick a model:${suffix}`, this.keyboard(display.map((model) => ({
+    return this.send(`Pick a model:${suffix}`, this.keyboard(display.map((model) => ({
       label: `${model.provider}/${model.id}`,
       action: { type: "model", provider: model.provider, modelId: model.id },
     }))));
@@ -2060,20 +1811,20 @@ class Gateway {
   async showThinking(argument) {
     const data = await this.pi.request("get_available_thinking_levels");
     if (argument) {
-      if (!data.levels.includes(argument)) return this.telegram.send(this.chatId, `Available levels: ${data.levels.join(", ")}`);
+      if (!data.levels.includes(argument)) return this.send(`Available levels: ${data.levels.join(", ")}`);
       await this.pi.request("set_thinking_level", { level: argument });
-      return this.telegram.send(this.chatId, `✅ thinking: ${argument}`);
+      return this.send(`✅ thinking: ${argument}`);
     }
-    return this.telegram.send(this.chatId, "Pick a thinking level:", this.keyboard(data.levels.map((level) => ({
+    return this.send("Pick a thinking level:", this.keyboard(data.levels.map((level) => ({
       label: level, action: { type: "thinking", level },
     }))));
   }
 
   async sessionFiles() {
-    if (!existsSync(this.config.sessionDir)) return [];
-    const names = (await readdir(this.config.sessionDir)).filter((name) => name.endsWith(".jsonl"));
+    if (!existsSync(this.sessionDir)) return [];
+    const names = (await readdir(this.sessionDir)).filter((name) => name.endsWith(".jsonl"));
     const files = await Promise.all(names.map(async (name) => {
-      const path = join(this.config.sessionDir, name);
+      const path = join(this.sessionDir, name);
       const info = await stat(path).catch(() => null);
       return info ? { path, name, mtime: info.mtimeMs } : null;
     }));
@@ -2100,7 +1851,7 @@ class Gateway {
           if (!title && entry.type === "message" && entry.message?.role === "user") title = extractText(entry.message.content).slice(0, 60);
           if (header && title) break;
         }
-        if (header?.cwd === this.config.cwd) return { path, id: header.id, title: title || name, mtime };
+        if (header?.cwd === this.cwd) return { path, id: header.id, title: title || name, mtime };
       } catch (error) {
         console.error(`Skipping session ${path}:`, error.message);
       }
@@ -2111,8 +1862,8 @@ class Gateway {
 
   async showSessions() {
     const sessions = (await this.sessionFiles()).slice(0, 12);
-    if (!sessions.length) return this.telegram.send(this.chatId, "No past sessions for this directory yet.");
-    return this.telegram.send(this.chatId, "Pick a session:", this.keyboard(sessions.map((session) => ({
+    if (!sessions.length) return this.send("No past sessions for this directory yet.");
+    return this.send("Pick a session:", this.keyboard(sessions.map((session) => ({
       label: session.title,
       action: { type: "resume", path: session.path },
     }))));
@@ -2122,144 +1873,77 @@ class Gateway {
     const [state, stats] = await Promise.all([this.pi.request("get_state"), this.pi.request("get_session_stats")]);
     const model = state.model ? `${state.model.provider}/${state.model.id}` : "none";
     const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "n/a";
-    await this.telegram.send(this.chatId, [
+    const lines = [
       `Name: ${state.sessionName || "(unnamed)"}`, `Model: ${model}`, `Thinking: ${state.thinkingLevel}`,
       `State: ${state.isStreaming ? "working" : "idle"}`, `Messages: ${stats.totalMessages}`, `Context: ${context}`,
       `Cost: $${Number(stats.cost || 0).toFixed(4)}`, `Session: ${state.sessionId}`, `File: ${state.sessionFile || "not persisted"}`,
-    ].join("\n"));
+    ];
+    if (this.threadId === null) {
+      const topicSessions = [...this.gateway.sessions.values()].filter((s) => s.threadId !== null);
+      if (topicSessions.length) {
+        lines.push("", "Topics:");
+        for (const ts of topicSessions) {
+          const status = ts.isStreaming ? "running" : ts.pi?.proc ? "idle" : "stopped";
+          const name = basename(ts.cwd) || `topic-${ts.threadId}`;
+          lines.push(`• ${name} (${status}) — ${ts.cwd}`);
+        }
+      } else {
+        lines.push("", "Topics: (none)");
+      }
+    }
+    await this.send(lines.join("\n"));
   }
 
   async showForks() {
     const data = await this.pi.request("get_fork_messages");
     const messages = data.messages.slice(-12).reverse();
-    if (!messages.length) return this.telegram.send(this.chatId, "No user messages to fork from.");
-    return this.telegram.send(this.chatId, "Fork from which message?", this.keyboard(messages.map((message) => ({
+    if (!messages.length) return this.send("No user messages to fork from.");
+    return this.send("Fork from which message?", this.keyboard(messages.map((message) => ({
       label: message.text.replaceAll("\n", " ").slice(0, 60),
       action: { type: "fork", entryId: message.entryId },
     }))));
   }
 
-  async handleCallback(callback) {
-    const t0 = performance.now();
-    const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
-    const action = this.actions.get(token);
-    this.actions.delete(token);
-    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
-    try {
-      console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
-      if (action.type === "model") {
-        await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
-        this.lastModel = { provider: action.provider, modelId: action.modelId };
-        await this.telegram.send(this.chatId, `✅ ${action.provider}/${action.modelId}`);
-      } else if (action.type === "thinking") {
-        await this.pi.request("set_thinking_level", { level: action.level });
-        await this.telegram.send(this.chatId, `✅ thinking: ${action.level}`);
-      } else if (action.type === "resume") {
-        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
-        this.resetSessionState();
-        const result = await this.pi.request("switch_session", { sessionPath: action.path });
-        if (!result.cancelled) {
-          const state = await this.pi.request("get_state").catch(() => null);
-          if (state?.model?.provider && state?.model?.id) {
-            this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-          }
-        }
-        await this.telegram.send(this.chatId, result.cancelled ? "Resume cancelled" : "✅ Session resumed");
-      } else if (action.type === "fork") {
-        if (this.isStreaming) await this.pi.request("abort").catch(() => {});
-        this.resetSessionState();
-        const result = await this.pi.request("fork", { entryId: action.entryId });
-        await this.telegram.send(this.chatId, result.cancelled ? "Fork cancelled" : `✅ Forked from "${result.text.slice(0, 80)}"`);
-      } else if (action.type === "cwd") {
-        await this.switchCwd(action.path, callback.id);
-        return;
-      } else if (action.type === "herdr_peek") {
-        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
-        if (!agent) return this.telegram.answer(callback.id, "Agent is gone");
-        await this.sendHerdrAgent(action.paneId, agent.agent_status, agent);
-      } else if (action.type === "herdr_keys") {
-        for (const [k, v] of this.actions) {
-          if (v.group === action.group) this.actions.delete(k);
-        }
-        const removeButtons = () => callback.message && this.telegram.call("editMessageReplyMarkup", {
-          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
-        }).catch(() => {});
-        // 只在仍处于 blocked 时发键，避免把「1」误打进已恢复工作的 agent
-        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
-        if (agent?.agent_status !== "blocked") {
-          await removeButtons();
-          await this.telegram.send(this.chatId, `⚠️ ${this.herdrWatcher.label(action.paneId)} is no longer waiting (${agent?.agent_status || "gone"}); nothing sent.`);
-          return this.telegram.answer(callback.id, "Not waiting");
-        }
-        await this.herdrWatcher.cli(["agent", "send-keys", action.paneId, ...action.keys]);
-        await removeButtons();
-        await sleep(1500);
-        const after = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]).catch(() => null))?.agent?.agent_status || "unknown";
-        await this.telegram.send(this.chatId, `➡️ ${action.label} → ${this.herdrWatcher.label(action.paneId)} · now ${HERDR_STATUS_ICON[after] || ""} ${after}`, { disable_notification: true });
-      } else if (action.type === "ui") {
-        // ref: Telegram Bot API callback single consumption (https://core.telegram.org/bots/api#callbackquery)
-        for (const [k, v] of this.actions) {
-          if (v.type === "ui" && v.requestId === action.requestId) this.actions.delete(k);
-        }
-        this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
-        if (callback.message) {
-          const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
-          await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
+  async handleCallbackAction(action, callback) {
+    if (action.type === "model") {
+      await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
+      this.lastModel = { provider: action.provider, modelId: action.modelId };
+      await this.send(`✅ ${action.provider}/${action.modelId}`);
+    } else if (action.type === "thinking") {
+      await this.pi.request("set_thinking_level", { level: action.level });
+      await this.send(`✅ thinking: ${action.level}`);
+    } else if (action.type === "resume") {
+      if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+      this.resetSessionState();
+      const result = await this.pi.request("switch_session", { sessionPath: action.path });
+      if (!result.cancelled) {
+        const state = await this.pi.request("get_state").catch(() => null);
+        if (state?.model?.provider && state?.model?.id) {
+          this.lastModel = { provider: state.model.provider, modelId: state.model.id };
         }
       }
-      await this.telegram.answer(callback.id, "Done");
-    } catch (error) {
-      await this.telegram.answer(callback.id, "Failed");
-      await this.telegram.send(this.chatId, `❌ ${error.message}`);
-    } finally {
-      console.log(`${new Date().toISOString()} [callback] ${action.type} finished in ${Math.round(performance.now() - t0)}ms`);
+      await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
+    } else if (action.type === "fork") {
+      if (this.isStreaming) await this.pi.request("abort").catch(() => {});
+      this.resetSessionState();
+      const result = await this.pi.request("fork", { entryId: action.entryId });
+      await this.send(result.cancelled ? "Fork cancelled" : `✅ Forked from "${result.text.slice(0, 80)}"`);
+    } else if (action.type === "cwd") {
+      await this.switchCwd(action.path, callback.id);
+    } else if (action.type === "ui") {
+      for (const [k, v] of this.gateway.actions) {
+        if (v.type === "ui" && v.requestId === action.requestId) this.gateway.actions.delete(k);
+      }
+      this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
+      if (callback.message) {
+        const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
+        await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
+      }
     }
-  }
-
-  async switchCwd(path, callbackId) {
-    const reply = callbackId
-      ? (text) => this.telegram.answer(callbackId, text)
-      : (text) => this.telegram.send(this.chatId, text);
-    let target, targetStat;
-    try {
-      target = await realpath(path);
-      targetStat = await stat(target);
-    } catch {
-      await reply(`Directory missing or inaccessible: ${path}`);
-      return;
-    }
-    if (!targetStat.isDirectory()) {
-      await reply(`Not a valid directory: ${path}`);
-      return;
-    }
-    if (target === this.config.cwd) {
-      await reply("Already in this directory");
-      return;
-    }
-
-    await this.saveState({
-      cwd: target,
-      recentProjects: [target, ...(this.state.recentProjects || []).filter((p) => p !== target)].slice(0, 20),
-    });
-
-    await reply("Switching");
-    await this.telegram.send(this.chatId, `✅ Working directory switched to:\n${target}\n\nHot-restarting Pi…`);
-    this.pi.stop();
-    this.config.cwd = target;
-    this.config.sessionDir = resolveSessionDir(this.config.stateDir, target);
-    await mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 });
-    this.resetSessionState();
-    this.pi = new PiRpc(this.config, (event) => this.queueEvent(event), (exit) => this.handlePiExit(exit));
-    await this.pi.start();
-    await this.registerBotCommands();
-    const state = await this.pi.request("get_state");
-    if (state?.model?.provider && state?.model?.id) {
-      this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-    }
-    await this.telegram.send(this.chatId, `✅ Pi ready; Session: ${state.sessionId}`);
   }
 
   async handleEvent(event) {
+    this.touchActivity();
     if (event.type === "agent_start") {
       this.isStreaming = true;
       this.pendingUi = null;
@@ -2269,14 +1953,14 @@ class Gateway {
       if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
       this.toolPanel = null;
       const since = this.runStartedAt ? ` (+${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
-      console.log(`${new Date().toISOString()} [run] agent_start${since}`);
+      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start${since}`);
     }
     if (event.type === "agent_settled") {
       this.isStreaming = false;
       this.pendingUi = null;
       this.stopTyping();
       const since = this.runStartedAt ? ` (total: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
-      console.log(`${new Date().toISOString()} [run] agent_settled${since}`);
+      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_settled${since}`);
       if (this.toolPanel && this.toolPanel.tools.length) {
         for (const tool of this.toolPanel.tools) {
           if (tool.status === "running") tool.status = "done";
@@ -2289,11 +1973,10 @@ class Gateway {
         this.draft = null;
         if (draft.timer) clearTimeout(draft.timer);
         draft.closed = true;
-        this.queueTelegram(() => this.finishDraft(draft));
+        this.gateway.queueTelegram(() => this.finishDraft(draft));
       }
-      // ref: Pi RPC settled lifecycle (https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
       if (!this.repliedInRun && !this.abortedRun) {
-        this.queueTelegram(() => this.telegram.send(this.chatId, "⚠️ The model returned no text reply. Use /model to switch models or retry."));
+        this.gateway.queueTelegram(() => this.send("⚠️ The model returned no text reply. Use /model to switch models or retry."));
       }
       this.abortedRun = false;
       this.settleActiveReactions();
@@ -2302,13 +1985,13 @@ class Gateway {
       this.runFirstUiAt = null;
     }
     if (event.type === "queue_update") this.queue = { steering: event.steering, followUp: event.followUp };
-    if (!this.chatReady) return;
+    if (!this.gateway.chatReady) return;
 
     if (event.type === "auto_retry_start") {
-      await this.telegram.send(this.chatId, `⏳ Model error; auto-retrying (${event.attempt}/${event.maxAttempts})…`);
+      await this.send(`⏳ Model error; auto-retrying (${event.attempt}/${event.maxAttempts})…`);
     }
     if (event.type === "compaction_end" && event.errorMessage) {
-      await this.telegram.send(this.chatId, `⚠️ Context compaction failed: ${event.errorMessage}`);
+      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`);
     }
 
     if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -2320,17 +2003,16 @@ class Gateway {
         if (!this.runFirstTokenAt) {
           this.runFirstTokenAt = performance.now();
           const ttft = this.runStartedAt ? ` (TTFT: ${Math.round(this.runFirstTokenAt - this.runStartedAt)}ms)` : "";
-          console.log(`${new Date().toISOString()} [run] first token received${ttft}`);
+          console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] first token received${ttft}`);
         }
         this.draft.text += update.delta;
         if (!this.draft.timer) {
           const draft = this.draft;
           draft.timer = setTimeout(() => {
             draft.timer = null;
-            // 合并：链上同一草稿最多挂一个待执行刷新，执行时读最新文本，防链阻塞时堆积
             if (draft.flushQueued) return;
             draft.flushQueued = true;
-            this.queueTelegram(() => {
+            this.gateway.queueTelegram(() => {
               draft.flushQueued = false;
               return this.flushDraft(draft);
             });
@@ -2351,17 +2033,17 @@ class Gateway {
         draft.text = draft.text ? `${draft.text}\n\n${errText}` : errText;
       }
       const outTok = event.message.usage?.output;
-      console.log(`${new Date().toISOString()} [run] message_end (${outTok ? `${outTok} tokens` : "assistant"}${event.message.stopReason ? `, reason: ${event.message.stopReason}` : ""})`);
+      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] message_end (${outTok ? `${outTok} tokens` : "assistant"}${event.message.stopReason ? `, reason: ${event.message.stopReason}` : ""})`);
       if (draft.text) {
         this.repliedInRun = true;
-        this.queueTelegram(() => this.finishDraft(draft));
+        this.gateway.queueTelegram(() => this.finishDraft(draft));
       }
     }
 
     if (event.type === "tool_execution_start") {
       if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, sending: false };
       const summary = toolSummary(event.toolName, event.args);
-      console.log(`${new Date().toISOString()} [tool] start: ${summary}`);
+      console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] start: ${summary}`);
       this.toolPanel.tools.push({
         id: event.toolCallId,
         summary,
@@ -2375,21 +2057,21 @@ class Gateway {
         const tool = this.toolPanel.tools.find((item) => item.id === event.toolCallId);
         if (tool) tool.status = event.isError ? "error" : "done";
         const dur = tool ? `${Date.now() - tool.startedAt}ms` : "?";
-        console.log(`${new Date().toISOString()} [tool] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
+        console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
         this.scheduleToolPanelUpdate(false, false);
       }
       if ((event.toolName === "remote_attach" || event.toolName === "telegram_attach") && !event.isError) {
         const paths = event.result?.details?.paths || event.args?.paths || [];
         for (const path of paths) {
-          this.queueUpload(async () => {
-            try { await this.telegram.sendDocument(this.chatId, path); }
-            catch (error) { await this.telegram.send(this.chatId, `❌ Failed to send attachment ${basename(path)}: ${error.message}`); }
+          this.gateway.queueUpload(async () => {
+            try { await this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra()); }
+            catch (error) { await this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`); }
           });
         }
       }
     }
     if (event.type === "extension_ui_request") await this.handleUiRequest(event);
-    if (event.type === "extension_error") await this.telegram.send(this.chatId, `❌ Extension ${event.extensionPath}: ${event.error}`);
+    if (event.type === "extension_error") await this.send(`❌ Extension ${event.extensionPath}: ${event.error}`);
   }
 
   scheduleToolPanelUpdate(force = false, isSettled = false) {
@@ -2399,19 +2081,19 @@ class Gateway {
         clearTimeout(this.toolPanel.timer);
         this.toolPanel.timer = null;
       }
-      this.queueTelegram(() => this.flushToolPanel(isSettled));
+      this.gateway.queueTelegram(() => this.flushToolPanel(isSettled));
       return;
     }
     if (!this.toolPanel.messageId && !this.toolPanel.sending) {
       this.toolPanel.sending = true;
-      this.queueTelegram(() => this.flushToolPanel(false));
+      this.gateway.queueTelegram(() => this.flushToolPanel(false));
       return;
     }
     if (!this.toolPanel.timer) {
       this.toolPanel.timer = setTimeout(() => {
         if (this.toolPanel) {
           this.toolPanel.timer = null;
-          this.queueTelegram(() => this.flushToolPanel(false));
+          this.gateway.queueTelegram(() => this.flushToolPanel(false));
         }
       }, 1200);
     }
@@ -2424,13 +2106,13 @@ class Gateway {
     const t0 = performance.now();
     try {
       if (this.toolPanel.messageId) {
-        await this.telegram.edit(this.chatId, this.toolPanel.messageId, text);
+        await this.gateway.telegram.edit(this.chatId, this.toolPanel.messageId, text);
       } else {
-        const sent = await this.telegram.sendOne(this.chatId, text, { disable_notification: true });
+        const sent = await this.sendOne(text, { disable_notification: true });
         if (this.toolPanel) this.toolPanel.messageId = sent.message_id;
         if (!this.runFirstUiAt && this.runStartedAt) {
           this.runFirstUiAt = performance.now();
-          console.log(`${new Date().toISOString()} [ui] first tool panel visible (TTFE: ${Math.round(this.runFirstUiAt - this.runStartedAt)}ms, send took ${Math.round(performance.now() - t0)}ms)`);
+          console.log(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] first tool panel visible (TTFE: ${Math.round(this.runFirstUiAt - this.runStartedAt)}ms, send took ${Math.round(performance.now() - t0)}ms)`);
         }
       }
     } finally {
@@ -2438,25 +2120,24 @@ class Gateway {
     }
   }
 
-  // ref: OpenClaw PR #40013 - avoid DM duplicate flash by using sendMessage + editMessageText in-place (https://github.com/openclaw/openclaw/pull/40013)
   async flushDraft(draft) {
     if (!draft.text || draft.flushing || draft.closed) return;
-    if (this.telegram.retryNotBefore > Date.now()) return; // 429 冷却中
+    if (this.gateway.telegram.retryNotBefore > Date.now()) return;
     draft.flushing = true;
     const t0 = performance.now();
     try {
       const text = previewText(draft.text);
-      if (text === draft.sentPreview) return; // 去重：内容未变跳过更新
+      if (text === draft.sentPreview) return;
       if (draft.messageId) {
-        await this.telegram.edit(this.chatId, draft.messageId, text, true);
+        await this.gateway.telegram.edit(this.chatId, draft.messageId, text, true);
       } else {
-        const sent = await this.telegram.sendOne(this.chatId, text, { disable_notification: true });
+        const sent = await this.sendOne(text, { disable_notification: true });
         draft.messageId = sent.message_id;
       }
       draft.sentPreview = text;
       this.logFirstUi(t0, "edit");
     } catch (error) {
-      console.error(`${new Date().toISOString()} [ui] preview update failed:`, error.message);
+      console.error(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] preview update failed:`, error.message);
     } finally {
       draft.flushing = false;
     }
@@ -2467,7 +2148,7 @@ class Gateway {
       this.runFirstUiAt = performance.now();
       const ttfe = Math.round(this.runFirstUiAt - this.runStartedAt);
       const api = Math.round(performance.now() - t0);
-      console.log(`${new Date().toISOString()} [ui] first preview visible (TTFE: ${ttfe}ms, api took ${api}ms, mode: ${mode})`);
+      console.log(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] first preview visible (TTFE: ${ttfe}ms, api took ${api}ms, mode: ${mode})`);
     }
   }
 
@@ -2478,24 +2159,23 @@ class Gateway {
     try {
       const parts = chunks(draft.text);
       if (draft.messageId) {
-        // 原地更新首段为最终内容，重试保证交付；同一条消息无重复对话框与残留
-        await this.telegram.edit(this.chatId, draft.messageId, parts[0], false);
+        await this.gateway.telegram.edit(this.chatId, draft.messageId, parts[0], false);
         for (let i = 1; i < parts.length; i++) {
-          await this.telegram.sendOne(this.chatId, parts[i]);
+          await this.sendOne(parts[i]);
         }
       } else {
         for (const part of parts) {
-          await this.telegram.sendOne(this.chatId, part);
+          await this.sendOne(part);
         }
       }
       const apiMs = Math.round(performance.now() - t0);
       const turnMs = this.runStartedAt ? ` (total turn: ${Math.round(performance.now() - this.runStartedAt)}ms)` : "";
-      console.log(`${new Date().toISOString()} [ui] final reply sent (${parts.length} parts, took ${apiMs}ms)${turnMs}`);
+      console.log(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] final reply sent (${parts.length} parts, took ${apiMs}ms)${turnMs}`);
     } catch (error) {
-      console.error(`${new Date().toISOString()} [ui] final reply delivery failed:`, error.message);
-      const copy = join(this.config.stateDir, `failed-reply-${Date.now()}.txt`);
+      console.error(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] final reply delivery failed:`, error.message);
+      const copy = join(this.gateway.config.stateDir, `failed-reply-${Date.now()}.txt`);
       await writeFile(copy, draft.text).catch(() => {});
-      await this.telegram.send(this.chatId, `❌ Reply delivery failed: ${error.message}\nContent saved to: ${copy}`).catch(() => {});
+      await this.send(`❌ Reply delivery failed: ${error.message}\nContent saved to: ${copy}`).catch(() => {});
     }
   }
 
@@ -2504,15 +2184,663 @@ class Gateway {
       const options = request.method === "confirm" ? [
         { label: "Confirm", response: { confirmed: true } }, { label: "Cancel", response: { confirmed: false } },
       ] : request.options.map((value) => ({ label: value, response: { value } }));
-      await this.telegram.send(this.chatId, [request.title, request.message].filter(Boolean).join("\n"), this.keyboard(options.map((option) => ({
+      await this.send([request.title, request.message].filter(Boolean).join("\n"), this.keyboard(options.map((option) => ({
         label: option.label, action: { type: "ui", requestId: request.id, response: option.response },
       }))));
     } else if (["input", "editor"].includes(request.method)) {
       this.pendingUi = request;
-      await this.telegram.send(this.chatId, [request.title, request.placeholder || request.prefill].filter(Boolean).join("\n"));
+      await this.send([request.title, request.placeholder || request.prefill].filter(Boolean).join("\n"));
     } else if (request.method === "notify") {
-      await this.telegram.send(this.chatId, request.message);
+      await this.send(request.message);
     }
+  }
+
+  stop() {
+    this.resetSessionState();
+    this.pi.stop();
+  }
+}
+
+class Gateway {
+  constructor(config) {
+    this.config = config;
+    this.chatId = config.allowedUserId;
+    this.chatReady = false;
+    this.state = loadState(config.stateDir);
+    if (config.cwd && !this.state.recentProjects.includes(config.cwd)) {
+      this.state.recentProjects.unshift(config.cwd);
+    }
+    this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
+    this.actions = new Map();
+    this.commandAliases = new Map();
+    this.als = new AsyncLocalStorage();
+    this.telegramChain = Promise.resolve();
+    this.uploadChain = Promise.resolve();
+    this.herdrWatcher = null;
+    this.herdrMessages = new Map();
+    this.idleTimer = null;
+
+    const origSend = this.telegram.send.bind(this.telegram);
+    this.telegram.send = (chatId, text, extra = {}) =>
+      this.queueTelegram(() => origSend(chatId, text, extra));
+
+    const origEdit = this.telegram.edit.bind(this.telegram);
+    this.telegram.edit = (chatId, messageId, text, ephemeral = false) =>
+      this.queueTelegram(() => origEdit(chatId, messageId, text, ephemeral));
+
+    this.sessions = new Map();
+    this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd, sessionDir: config.sessionDir });
+    this.sessions.set("main", this.mainSession);
+
+    // 延迟初始化 state.json 中持久化的有效 topic 会话
+    for (const [threadId, info] of Object.entries(this.state.topics || {})) {
+      if (info?.cwd && existsSync(info.cwd)) {
+        const tid = Number(threadId);
+        const sDir = resolveTopicSessionDir(config.stateDir, info.cwd, tid);
+        this.sessions.set(`t:${tid}`, new ChatSession(this, { threadId: tid, cwd: info.cwd, sessionDir: sDir }));
+      }
+    }
+  }
+
+  getSession(key) {
+    return this.sessions.get(key);
+  }
+
+  getOrCreateSession(message) {
+    const key = sessionKeyOf(message);
+    let session = this.sessions.get(key);
+    if (!session) {
+      if (key.startsWith("t:")) {
+        const threadId = Number(key.slice(2));
+        const mainCwd = this.mainSession.cwd;
+        const sessionDir = resolveTopicSessionDir(this.config.stateDir, mainCwd, threadId);
+        session = new ChatSession(this, { threadId, cwd: mainCwd, sessionDir });
+        this.sessions.set(key, session);
+        this.state.topics[threadId] = { cwd: mainCwd };
+        this.saveState({ topics: this.state.topics }).catch((err) => {
+          console.warn(`[state] failed to persist new topic ${threadId}: ${err.message}`);
+        });
+        session.send(`Topic session started with workspace:\n${mainCwd}\n\nUse /cwd to switch to another project.`);
+      } else {
+        session = this.mainSession;
+      }
+    }
+    return session;
+  }
+
+  getOwnedPaneIds(excludingSession = null) {
+    const panes = [];
+    for (const session of this.sessions.values()) {
+      if (session !== excludingSession && session.pi?.herdrEnv?.HERDR_PANE_ID) {
+        panes.push(session.pi.herdrEnv.HERDR_PANE_ID);
+      }
+    }
+    return panes;
+  }
+
+  // ref: 资源管控 — 限制全局最大并发 Pi 进程数，并在超限时挂起最久未活动的非流式 Topic
+  async acquireSessionSlot(requestingSession) {
+    if (requestingSession.pi?.proc) return;
+    const running = [...this.sessions.values()].filter((s) => Boolean(s.pi?.proc));
+    if (running.length >= this.config.maxSessions) {
+      const candidates = running.filter((s) => s.threadId !== null && !s.isStreaming && s !== requestingSession);
+      if (!candidates.length) {
+        throw new Error(`Maximum concurrent sessions (${this.config.maxSessions}) reached and all are busy.`);
+      }
+      candidates.sort((a, b) => a.lastActiveAt - b.lastActiveAt);
+      console.log(`${new Date().toISOString()} [session] stopping least recently active topic t:${candidates[0].threadId} to free a session slot`);
+      candidates[0].stop();
+    }
+  }
+
+  checkIdleSessions() {
+    const maxIdleMs = (this.config.idleStopMinutes || 30) * 60_000;
+    const now = Date.now();
+    for (const session of this.sessions.values()) {
+      if (session.threadId === null) continue; // 主会话永不空闲停止
+      if (session.pi?.proc && !session.isStreaming && !session.pendingUi) {
+        if (now - session.lastActiveAt >= maxIdleMs) {
+          console.log(`${new Date().toISOString()} [session] idle stopping topic session t:${session.threadId} (idle for ${Math.round((now - session.lastActiveAt) / 60000)}m)`);
+          session.stop();
+        }
+      }
+    }
+  }
+
+  startIdleStopTimer() {
+    if (this.idleTimer) return;
+    this.idleTimer = setInterval(() => this.checkIdleSessions(), 30_000);
+    this.idleTimer.unref?.();
+  }
+
+  async start() {
+    const t0 = performance.now();
+    // launchd 以 O_APPEND 持有日志 fd，newsyslog 处理不了这种 fd；启动时截断 + 每小时巡检（服务极少重启，只靠启动截断等于没截）
+    const trimLog = () => stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
+    await trimLog();
+    setInterval(trimLog, 60 * 60_000).unref();
+    await Promise.all([
+      mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
+      mkdir(this.config.sessionDir, { recursive: true, mode: 0o700 }),
+      mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
+    ]);
+    await this.acquireLock();
+    await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
+    const me = await this.telegram.call("getMe");
+    this.me = me;
+    try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
+    catch (error) { if (!error.message.includes("chat not found")) throw error; }
+    await this.mainSession.pi.start();
+    const state = await this.mainSession.pi.request("get_state");
+    if (state?.model?.provider && state?.model?.id) {
+      this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
+    }
+    await this.registerBotCommands();
+    this.startHerdrWatcher();
+    this.startIdleStopTimer();
+    console.log(`${new Date().toISOString()} @${me.username} ready in ${Math.round(performance.now() - t0)}ms; Pi session ${state.sessionId}`);
+    await this.telegram.poll((update) => this.dispatchUpdate(update));
+  }
+
+  async saveDownload(fileId, name, needsBase64 = false) {
+    const t0 = performance.now();
+    const file = await this.telegram.call("getFile", { file_id: fileId });
+    const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
+    if (!response.ok) throw new Error(`Telegram download: ${response.status}`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
+    const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
+    await writeFile(path, buffer);
+    console.log(`${new Date().toISOString()} [download] ${name} (${buffer.length} bytes) in ${Math.round(performance.now() - t0)}ms`);
+    return { path, data: needsBase64 ? buffer.toString("base64") : null };
+  }
+
+  queueTelegram(work) {
+    if (this.als.getStore()) return work();
+    const next = this.telegramChain.then(() => this.als.run(true, work));
+    this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
+    return next;
+  }
+
+  queueUpload(work) {
+    const next = this.uploadChain.then(work);
+    this.uploadChain = next.catch((error) => console.error("Upload output:", error));
+    return next;
+  }
+
+  isAllowed(from, chat) {
+    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
+  }
+
+  dispatchUpdate(update) {
+    const priority = getUpdatePriority(update);
+    if (priority === "p0" || priority === "p1") {
+      const p = this.handlePriorityUpdate(update, priority).catch((err) => console.error(`[${priority}] error:`, err));
+      return p;
+    }
+    // 相册入站聚合：首条出现时立即在对应 session.updateChain 占位，保证后续普通消息排在相册之后 (ref: python-telegram-bot media_group)
+    if (update.message?.media_group_id && this.isAllowed(update.message.from, update.message.chat)) {
+      const m = update.message;
+      this.chatReady = true;
+      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
+      const session = this.getOrCreateSession(m);
+      if (session.pendingUi) return;
+      const key = `${this.chatId}:${m.media_group_id}`;
+      let group = session.mediaGroups.get(key);
+      if (!group) {
+        let resolveReady;
+        const ready = new Promise((r) => { resolveReady = r; });
+        group = { messages: [], timer: null, ready, resolveReady, cancelled: false };
+        session.mediaGroups.set(key, group);
+        const groupTask = async () => {
+          await group.ready;
+          if (group.cancelled || !group.messages.length) return;
+          session.activeMessageIds.push(...group.messages.map((item) => item.message_id));
+          session.runStartedAt = performance.now();
+          session.runFirstTokenAt = null;
+          session.runFirstUiAt = null;
+          await session.handleMediaGroup(group.messages);
+        };
+        const next = session.updateChain.then(groupTask).catch((err) => {
+          console.error("Media group error:", err);
+          session.send(`❌ Failed to process media group: ${err.message}`);
+        });
+        session.updateChain = next;
+        group.done = next;
+      }
+      group.messages.push(m);
+      if (group.timer) clearTimeout(group.timer);
+      group.timer = setTimeout(() => {
+        session.mediaGroups.delete(key);
+        group.resolveReady();
+      }, 1200);
+      return group.done;
+    }
+    if (update.message) {
+      const session = this.getOrCreateSession(update.message);
+      const next = session.updateChain.then(() => this.handleUpdate(update, session));
+      session.updateChain = next.catch((err) => console.error("Telegram update error:", err));
+      return next;
+    }
+    if (update.callback_query) {
+      const token = update.callback_query.data?.startsWith("a:") ? update.callback_query.data.slice(2) : "";
+      const action = token ? this.actions.get(token) : null;
+      const sessionKey = (!action?.type?.startsWith("herdr_") && action?.sessionKey) ? action.sessionKey : null;
+      const session = sessionKey ? (this.sessions.get(sessionKey) || this.mainSession) : this.mainSession;
+      const next = session.updateChain.then(() => this.handleUpdate(update, session));
+      session.updateChain = next.catch((err) => console.error("Telegram update error:", err));
+      return next;
+    }
+    return Promise.resolve();
+  }
+
+  async handlePriorityUpdate(update, priority) {
+    const t0 = performance.now();
+    try {
+      if (update.stopped_message_generation) {
+        console.log(`${new Date().toISOString()} [p0] stopped_message_generation`);
+        const streamingSession = [...this.sessions.values()].find((s) => s.isStreaming) || this.mainSession;
+        await streamingSession.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
+        return;
+      }
+      const m = update.message;
+      if (!m || !this.isAllowed(m.from, m.chat)) return;
+      this.chatReady = true;
+      const cmd = parseCommand(m.text?.trim() || "");
+      if (!cmd) return;
+      if (cmd.name === "restart") {
+        const receiptPath = join(this.config.stateDir, "last-restart-update");
+        const lastRestart = await readFile(receiptPath, "utf8").catch(() => "");
+        if (lastRestart && String(update.update_id) === lastRestart.trim()) {
+          console.log(`${new Date().toISOString()} [p0] ignoring duplicate restart update #${update.update_id}`);
+          return;
+        }
+      }
+      this.telegram.setReaction(this.chatId, m.message_id, this.config.ackEmoji);
+      console.log(`${new Date().toISOString()} [${priority}] handling /${cmd.name}`);
+      const session = this.getOrCreateSession(m);
+      session.touchActivity();
+      await session.handleCommand(cmd, m.text, update.update_id);
+      await this.telegram.setReaction(this.chatId, m.message_id, this.config.doneEmoji);
+    } catch (error) {
+      console.error(`[${priority}] error:`, error);
+      const session = update.message ? this.getOrCreateSession(update.message) : this.mainSession;
+      await session.send(`❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [${priority}] finished in ${Math.round(performance.now() - t0)}ms`);
+    }
+  }
+
+  async handleUpdate(update, session = this.mainSession) {
+    const t0 = performance.now();
+    try {
+      if (update.message) {
+        if (!this.isAllowed(update.message.from, update.message.chat)) return;
+        this.chatReady = true;
+        const m = update.message;
+        const lag = m.date ? `${Date.now() - m.date * 1000}ms` : "0ms";
+        const preview = (m.text || m.caption || (m.photo ? "[photo]" : m.voice ? "[voice]" : "[file]")).slice(0, 50).replace(/\n/g, " ");
+        console.log(`${new Date().toISOString()} [update] msg #${m.message_id} (tg lag: ${lag}): ${preview}`);
+        await this.handleMessage(update.message, session);
+      } else if (update.callback_query) {
+        const callback = update.callback_query;
+        if (!this.isAllowed(callback.from, callback.message?.chat)) return;
+        this.chatReady = true;
+        console.log(`${new Date().toISOString()} [update] callback #${callback.id}: ${callback.data}`);
+        await this.handleCallback(callback, session);
+      }
+    } catch (error) {
+      console.error("Telegram input:", error);
+      session.settleActiveReactions();
+      await session.send(`❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [update] #${update.update_id} finished in ${Math.round(performance.now() - t0)}ms`);
+    }
+  }
+
+  async extractMedia(m) {
+    if (m.photo?.length) {
+      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`, true);
+      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "photo" };
+    }
+    const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
+    if (!file) return null;
+    const isImage = file.mime_type?.startsWith("image/");
+    const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
+    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`, isImage);
+    const image = isImage ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
+    const label = m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind;
+    return { saved, image, label };
+  }
+
+  async handleMessage(message, session = this.getOrCreateSession(message)) {
+    session.touchActivity();
+
+    if (session.pendingUi && !message.text?.startsWith("/")) {
+      const pending = session.pendingUi;
+      session.pendingUi = null;
+      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+      session.pi.write({ type: "extension_ui_response", id: pending.id, value: message.text || message.caption || "" });
+      await session.send("Submitted.");
+      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
+      return;
+    }
+
+    const herdrPane = this.herdrWatcher && this.herdrMessages.get(message.reply_to_message?.message_id);
+    if (herdrPane && message.text && !message.text.startsWith("/")) return this.replyToHerdrAgent(herdrPane, message);
+
+    const media = await this.extractMedia(message);
+    if (media) {
+      this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+      if (message.voice && this.config.sttCommand) {
+        try {
+          const tStt = performance.now();
+          const transcript = await runStt(this.config.sttCommand, media.saved.path);
+          console.log(`${new Date().toISOString()} [stt] transcribed voice in ${Math.round(performance.now() - tStt)}ms`);
+          session.activeMessageIds.push(message.message_id);
+          session.runStartedAt = performance.now();
+          session.runFirstTokenAt = null;
+          session.runFirstUiAt = null;
+          await session.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
+          return;
+        } catch (error) {
+          return session.send(`❌ ${error.message}`);
+        }
+      }
+      session.activeMessageIds.push(message.message_id);
+      session.runStartedAt = performance.now();
+      session.runFirstTokenAt = null;
+      session.runFirstUiAt = null;
+      await session.prompt(attachmentPrompt(message.caption || `User sent a ${media.label}.`, [media.saved]), media.image ? [media.image] : undefined);
+      return;
+    }
+
+    const text = message.text?.trim();
+    if (!text) return;
+
+    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+
+    const command = parseCommand(text);
+    if (command) {
+      if (command.name === "followup") session.activeMessageIds.push(message.message_id);
+      await session.handleCommand(command, text);
+      if (command.name !== "followup") {
+        await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
+      }
+    } else {
+      session.activeMessageIds.push(message.message_id);
+      session.runStartedAt = performance.now();
+      session.runFirstTokenAt = null;
+      session.runFirstUiAt = null;
+      await session.prompt(text);
+    }
+  }
+
+  async registerBotCommands() {
+    const t0 = performance.now();
+    const data = await this.mainSession.pi.request("get_commands");
+    const commands = [...BOT_COMMANDS];
+    for (const command of data.commands) {
+      const telegramName = telegramCommandName(command);
+      if (!telegramName || commands.some((item) => item.command === telegramName)) continue;
+      if (!/^[a-z0-9_]{1,32}$/.test(telegramName)) continue;
+      commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
+      this.commandAliases.set(telegramName, command.name);
+      if (command.source === "skill") {
+        this.commandAliases.set(`skill-${command.name.slice("skill:".length).toLowerCase()}`, command.name);
+      }
+    }
+    const finalCommands = commands.slice(0, 100);
+    await Promise.all([
+      this.telegram.call("setMyCommands", { commands: finalCommands }),
+      this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
+    ]);
+    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length}) in ${Math.round(performance.now() - t0)}ms`);
+  }
+
+  async saveState(patch) {
+    this.state = { ...this.state, ...patch };
+    const statePath = join(this.config.stateDir, "state.json");
+    const tempPath = `${statePath}.tmp.${Date.now()}`;
+    try {
+      await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+      await rename(tempPath, statePath);
+    } catch (err) {
+      console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
+    }
+  }
+
+  action(payload, ttl = 10 * 60_000) {
+    const now = Date.now();
+    for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
+    const token = randomBytes(6).toString("base64url");
+    this.actions.set(token, { ...payload, expires: now + ttl });
+    return `a:${token}`;
+  }
+
+  startHerdrWatcher() {
+    const env = this.mainSession.pi.herdrEnv;
+    if (this.config.herdr === false || !env?.HERDR_BIN_PATH || !env?.HERDR_SOCKET_PATH) return;
+    this.herdrWatcher = new HerdrWatcher({
+      bin: env.HERDR_BIN_PATH,
+      socketPath: env.HERDR_SOCKET_PATH,
+      // 网关自身的所有 Pi 均已在对应的对话/Topic 内流式输出，从推送中排除
+      isExcluded: (paneId) => [...this.sessions.values()].some((s) => s.pi?.herdrEnv?.HERDR_PANE_ID === paneId),
+      onTransition: ({ paneId, status, agent }) => this.sendHerdrAgent(paneId, status, agent),
+    });
+    this.herdrWatcher.start();
+  }
+
+  async sendHerdrAgent(paneId, status, agent) {
+    const watcher = this.herdrWatcher;
+    const blocked = status === "blocked";
+    const screen = await watcher.cli(["agent", "read", paneId, "--source", blocked ? "visible" : "recent-unwrapped", "--lines", "60"]).catch(() => "");
+    const tail = herdrTail(screen);
+    const label = watcher.label(paneId);
+    const head = blocked ? `✋ ${label} needs your confirmation`
+      : status === "done" ? `✅ ${label} finished`
+      : `${HERDR_STATUS_ICON[status] || "❔"} ${label} — ${status}`;
+    const text = [
+      head,
+      agent?.terminal_title_stripped ? `\`${agent.terminal_title_stripped.replace(/`/g, "'")}\`` : "",
+      tail ? expandableBlockquote(tail) : "",
+      blocked ? "Tap a button, or reply to this message to type an answer." : "Reply to this message to send this agent a prompt.",
+    ].filter(Boolean).join("\n\n");
+
+    const ttl = 24 * 60 * 60_000;
+    const group = randomBytes(4).toString("hex");
+    const keyButton = (label, keys) => ({ text: label.slice(0, 60), callback_data: this.action({ type: "herdr_keys", paneId, keys, label, group }, ttl) });
+    const rows = [];
+    if (blocked) {
+      for (const choice of herdrChoices(tail)) rows.push([keyButton(`${choice.key}. ${choice.label}`, [choice.key])]);
+      rows.push([keyButton("⏎ Enter", ["enter"]), keyButton("⎋ Esc", ["esc"])]);
+    }
+    rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
+    const sent = await this.telegram.send(this.chatId, text, { reply_markup: { inline_keyboard: rows } });
+    if (sent?.message_id) {
+      this.herdrMessages.set(sent.message_id, paneId);
+      if (this.herdrMessages.size > 200) this.herdrMessages.delete(this.herdrMessages.keys().next().value);
+    }
+  }
+
+  async showHerdrAgents() {
+    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available (disabled in config, or its server is not running).");
+    await this.herdrWatcher.sync();
+    const ownPanes = new Set(this.getOwnedPaneIds());
+    const agents = [...this.herdrWatcher.agents.values()].filter((agent) => !ownPanes.has(agent.pane_id));
+    if (!agents.length) return this.telegram.send(this.chatId, "No agents running in Herdr.");
+    const byWorkspace = new Map();
+    for (const agent of agents) {
+      const ws = this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.workspace_id;
+      if (!byWorkspace.has(ws)) byWorkspace.set(ws, []);
+      byWorkspace.get(ws).push(agent);
+    }
+    const lines = [];
+    for (const [ws, list] of byWorkspace) {
+      lines.push(`**${ws}**`);
+      for (const agent of list) {
+        const title = agent.terminal_title_stripped ? ` — ${agent.terminal_title_stripped.replace(/[`*_\[\]]/g, "")}` : "";
+        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${herdrOptedIn(agent) ? " 📡" : ""}${title}`);
+      }
+      lines.push("");
+    }
+    lines.push("📡 = pushed to Telegram (run /remote-pi inside that Pi to toggle). Tap an agent to see its screen.");
+    return this.telegram.send(this.chatId, lines.join("\n"), this.keyboard(agents.map((agent) => ({
+      label: `${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} · ${this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.pane_id}`,
+      action: { type: "herdr_peek", paneId: agent.pane_id },
+    }))));
+  }
+
+  async replyToHerdrAgent(paneId, message) {
+    const watcher = this.herdrWatcher;
+    const text = message.text.trim();
+    this.telegram.setReaction(this.chatId, message.message_id, this.config.ackEmoji);
+    try {
+      const agent = (await watcher.cliJson(["agent", "get", paneId]))?.agent;
+      if (!agent) return this.telegram.send(this.chatId, `❌ ${paneId} no longer hosts an agent`);
+      if (agent.agent_status === "blocked") {
+        await watcher.cli(["pane", "send-text", paneId, text]);
+        await watcher.cli(["agent", "send-keys", paneId, "enter"]);
+      } else {
+        await watcher.cli(["agent", "prompt", paneId, text]);
+      }
+      await this.telegram.setReaction(this.chatId, message.message_id, this.config.doneEmoji);
+      return this.telegram.send(this.chatId, `📨 Sent to ${watcher.label(paneId)}`, { disable_notification: true });
+    } catch (error) {
+      return this.telegram.send(this.chatId, `❌ ${error.message}`);
+    }
+  }
+
+  keyboard(items) {
+    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } };
+  }
+
+  async handleCallback(callback, session = this.mainSession) {
+    const t0 = performance.now();
+    const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
+    const action = this.actions.get(token);
+    this.actions.delete(token);
+    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
+    try {
+      console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
+      if (action.type === "herdr_peek") {
+        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
+        if (!agent) return this.telegram.answer(callback.id, "Agent is gone");
+        await this.sendHerdrAgent(action.paneId, agent.agent_status, agent);
+      } else if (action.type === "herdr_keys") {
+        for (const [k, v] of this.actions) {
+          if (v.group === action.group) this.actions.delete(k);
+        }
+        const removeButtons = () => callback.message && this.telegram.call("editMessageReplyMarkup", {
+          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
+        if (agent?.agent_status !== "blocked") {
+          await removeButtons();
+          await this.telegram.send(this.chatId, `⚠️ ${this.herdrWatcher.label(action.paneId)} is no longer waiting (${agent?.agent_status || "gone"}); nothing sent.`);
+          return this.telegram.answer(callback.id, "Not waiting");
+        }
+        await this.herdrWatcher.cli(["agent", "send-keys", action.paneId, ...action.keys]);
+        await removeButtons();
+        await sleep(1500);
+        const after = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]).catch(() => null))?.agent?.agent_status || "unknown";
+        await this.telegram.send(this.chatId, `➡️ ${action.label} → ${this.herdrWatcher.label(action.paneId)} · now ${HERDR_STATUS_ICON[after] || ""} ${after}`, { disable_notification: true });
+      } else if (action.type === "close_topic") {
+        if (action.confirmed) {
+          const threadId = action.threadId;
+          const sessionKey = `t:${threadId}`;
+          const targetSession = this.sessions.get(sessionKey);
+          if (targetSession) {
+            targetSession.stop();
+            this.sessions.delete(sessionKey);
+          }
+          delete this.state.topics[threadId];
+          await this.saveState({ topics: this.state.topics });
+          await this.telegram.call("deleteForumTopic", {
+            chat_id: this.chatId,
+            message_thread_id: threadId,
+          }).catch(() => {});
+          if (callback.message) {
+            await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Topic closed.").catch(() => {});
+          }
+          await this.telegram.answer(callback.id, "Topic closed");
+          return;
+        } else {
+          if (callback.message) {
+            await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Close cancelled.").catch(() => {});
+          }
+          await this.telegram.answer(callback.id, "Cancelled");
+          return;
+        }
+      } else {
+        const sessionKey = action.sessionKey || sessionKeyOf(callback);
+        const targetSession = sessionKey ? (this.sessions.get(sessionKey) || this.mainSession) : (session || this.mainSession);
+        targetSession.touchActivity();
+        await targetSession.handleCallbackAction(action, callback);
+      }
+      await this.telegram.answer(callback.id, "Done");
+    } catch (error) {
+      await this.telegram.answer(callback.id, "Failed");
+      const targetSession = this.sessions.get(action?.sessionKey) || session || this.mainSession;
+      await targetSession.send(`❌ ${error.message}`);
+    } finally {
+      console.log(`${new Date().toISOString()} [callback] ${action.type} finished in ${Math.round(performance.now() - t0)}ms`);
+    }
+  }
+
+  // ref: Telegram Bot API 9.3 & 9.4 (2026-02-09): createForumTopic in private chats
+  async handleTopicCommand(session, argument) {
+    const me = await this.telegram.call("getMe");
+    if (!me?.has_topics_enabled) {
+      return session.send("Topics are not enabled for this bot. Please enable topic mode in @BotFather:\n/mybots → select your bot → Bot Settings → Topics → Turn on.");
+    }
+    const target = argument ? resolvePath(argument.trim(), session.cwd) : session.cwd;
+    let realTarget, targetStat;
+    try {
+      realTarget = await realpath(target);
+      targetStat = await stat(realTarget);
+    } catch {
+      return session.send(`Directory missing or inaccessible: ${target}`);
+    }
+    if (!targetStat.isDirectory()) {
+      return session.send(`Not a valid directory: ${target}`);
+    }
+    const name = (basename(realTarget) || "topic").slice(0, 128);
+    const created = await this.telegram.call("createForumTopic", {
+      chat_id: this.chatId,
+      name,
+    });
+    const threadId = created.message_thread_id;
+    const sessionDir = resolveTopicSessionDir(this.config.stateDir, realTarget, threadId);
+    await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+    const newSession = new ChatSession(this, { threadId, cwd: realTarget, sessionDir });
+    this.sessions.set(`t:${threadId}`, newSession);
+    this.state.topics[threadId] = { cwd: realTarget };
+    await this.saveState({ topics: this.state.topics });
+
+    const text = formatSessionReset({ model: null, cwd: realTarget });
+    await newSession.send(text);
+    if (session.threadId !== threadId) {
+      await session.send(`✅ Created topic "${name}" (thread #${threadId})`);
+    }
+  }
+
+  // ref: Telegram Bot API 9.3 deleteForumTopic in private chats
+  async handleCloseCommand(session) {
+    if (session.threadId === null) {
+      return session.send("/close only works inside a topic.");
+    }
+    const keyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Confirm", callback_data: this.action({ type: "close_topic", threadId: session.threadId, confirmed: true }) },
+            { text: "Cancel", callback_data: this.action({ type: "close_topic", threadId: session.threadId, confirmed: false }) },
+          ],
+        ],
+      },
+    };
+    return session.send(`Close topic "${basename(session.cwd)}"? This will stop its Pi process and remove the topic.`, keyboard);
   }
 
   async acquireLock() {
@@ -2545,7 +2873,10 @@ class Gateway {
   }
 
   stop() {
-    this.resetSessionState();
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
     this.telegram?.stopPolling?.();
     this.telegram?.stopWakeMonitor?.();
     this.herdrWatcher?.stop();
@@ -2561,7 +2892,13 @@ class Gateway {
         unlinkSync(this.pidFile);
       }
     } catch {}
-    this.pi.stop();
+    if (this.sessions) {
+      for (const session of this.sessions.values()) {
+        session.stop();
+      }
+    } else {
+      this.pi?.stop?.();
+    }
   }
 }
 
@@ -2653,7 +2990,7 @@ async function selfTest() {
 
     // 1. 初次流式刷新发送静音消息
     const draft = { text: "hello", flushing: false, messageId: null, sentPreview: "" };
-    await gw.flushDraft(draft);
+    await gw.mainSession.flushDraft(draft);
     assert.equal(draft.messageId, 123);
     assert.equal(sendOneCalls.length, 1);
     assert.equal(sendOneCalls[0].extra.disable_notification, true);
@@ -2661,18 +2998,18 @@ async function selfTest() {
 
     // 2. 后续流式刷新原地编辑同一消息
     draft.text = "hello world";
-    await gw.flushDraft(draft);
+    await gw.mainSession.flushDraft(draft);
     assert.equal(editCalls.length, 1);
     assert.equal(editCalls[0].messageId, 123);
     assert.equal(editCalls[0].text, "hello world");
     assert.equal(editCalls[0].ephemeral, true);
 
     // 3. 预览内容不变时跳过重复编辑
-    await gw.flushDraft(draft);
+    await gw.mainSession.flushDraft(draft);
     assert.equal(editCalls.length, 1);
 
     // 4. 原地交付最终回复：首段 edit，无多余 sendOne
-    await gw.finishDraft(draft);
+    await gw.mainSession.finishDraft(draft);
     assert.equal(editCalls.length, 2);
     assert.equal(editCalls[1].messageId, 123);
     assert.equal(editCalls[1].text, "hello world");
@@ -2680,12 +3017,12 @@ async function selfTest() {
     assert.equal(sendOneCalls.length, 1);
 
     // 5. closed 拦截过期刷新
-    await gw.flushDraft({ text: "stale", closed: true });
+    await gw.mainSession.flushDraft({ text: "stale", closed: true });
     assert.equal(editCalls.length, 2);
 
     // 6. 未曾触发流式（无 messageId），finishDraft 直接 sendOne 交付
     const unstreamed = { text: "direct send", messageId: null };
-    await gw.finishDraft(unstreamed);
+    await gw.mainSession.finishDraft(unstreamed);
     assert.equal(sendOneCalls.length, 2);
     assert.equal(sendOneCalls[1].text, "direct send");
 
@@ -2695,7 +3032,7 @@ async function selfTest() {
       await mkdir(tmpUi, { recursive: true, mode: 0o700 });
       const gwFail = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpUi });
       gwFail.telegram.sendOne = async () => { throw new Error("network down"); };
-      await gwFail.finishDraft({ text: "recover me", messageId: null, draftId: null });
+      await gwFail.mainSession.finishDraft({ text: "recover me", messageId: null, draftId: null });
       const copies = (await readdir(tmpUi)).filter((f) => f.startsWith("failed-reply-"));
       assert.equal(copies.length, 1);
       assert.equal(await readFile(join(tmpUi, copies[0]), "utf8"), "recover me");
@@ -2705,14 +3042,14 @@ async function selfTest() {
     gw.chatReady = true;
     const docs = [];
     gw.telegram.sendDocument = async (_chat, path) => docs.push(path);
-    await gw.handleEvent({
+    await gw.mainSession.handleEvent({
       type: "tool_execution_end",
       toolCallId: "call-1",
       toolName: "remote_attach",
       isError: false,
       result: { details: { paths: ["/tmp/file1.png", "/tmp/file2.pdf"] } },
     });
-    await gw.handleEvent({
+    await gw.mainSession.handleEvent({
       type: "tool_execution_end",
       toolCallId: "call-2",
       toolName: "telegram_attach",
@@ -2760,7 +3097,7 @@ async function selfTest() {
     assert.equal(p0Executed, true);
     assert.equal(p2Finished, false);
 
-    await gw.updateChain;
+    await gw.mainSession.updateChain;
     assert.equal(p2Finished, true);
 
     // Test outbound queue re-entrancy and serialization
@@ -2791,7 +3128,7 @@ async function selfTest() {
       console.error = (...a) => errs.push(a.map(String).join(" "));
       const prevSendOne = gw.telegram.sendOne;
       gw.telegram.sendOne = async () => { throw new Error("preview boom"); };
-      await gw.flushDraft({ text: "boom draft", flushing: false, messageId: null });
+      await gw.mainSession.flushDraft({ text: "boom draft", flushing: false, messageId: null });
       console.error = origError;
       gw.telegram.sendOne = prevSendOne;
       assert.ok(errs.some((e) => e.includes("preview update failed")), "flushDraft 失败应留日志");
@@ -2800,18 +3137,18 @@ async function selfTest() {
     // 回归（审计修复 L4）：handleUpdate 不再含 stopped_message_generation 死分支（p0 必然先拦截）
     {
       const calls = [];
-      gw.pi.proc = {};
-      gw.pi.request = async (type) => { calls.push(type); return {}; };
+      gw.mainSession.pi.proc = {};
+      gw.mainSession.pi.request = async (type) => { calls.push(type); return {}; };
       await gw.handleUpdate({ stopped_message_generation: true, update_id: 424242 });
       assert.deepEqual(calls, [], "handleUpdate 不应再处理 stopped_message_generation");
-      gw.pi.proc = undefined;
+      gw.mainSession.pi.proc = undefined;
     }
 
     // Test /new preserves last effective model
     let mockModel = { provider: "openai", id: "gpt-4o" };
     const mockRequests = [];
-    gw.pi.proc = {};
-    gw.pi.request = async (command, params) => {
+    gw.mainSession.pi.proc = {};
+    gw.mainSession.pi.request = async (command, params) => {
       mockRequests.push({ command, params });
       if (command === "get_state") return { model: mockModel };
       if (command === "new_session") {
@@ -2826,13 +3163,13 @@ async function selfTest() {
     };
     let newSessionSent = "";
     gw.telegram.send = async (_chat, text) => { newSessionSent = text; };
-    await gw.handleCommand({ name: "new", argument: "" });
+    await gw.mainSession.handleCommand({ name: "new", argument: "" });
     assert.deepEqual(mockRequests.find((r) => r.command === "set_model"), {
       command: "set_model",
       params: { provider: "openai", modelId: "gpt-4o" },
     });
     assert.ok(newSessionSent.includes("◆ Model: gpt-4o"));
-    assert.deepEqual(gw.lastModel, { provider: "openai", modelId: "gpt-4o" });
+    assert.deepEqual(gw.mainSession.lastModel, { provider: "openai", modelId: "gpt-4o" });
   }
 
   assert.equal(
@@ -2935,14 +3272,14 @@ async function selfTest() {
     const gwNoHistory = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
     let sentMsg = "";
     gwNoHistory.telegram.send = async (_chat, text) => { sentMsg = text; };
-    await gwNoHistory.showCwds();
+    await gwNoHistory.mainSession.showCwds();
     assert.ok(sentMsg.includes("No recent projects yet"), "showCwds should guide usage when history is empty");
 
     // verify switchCwd reports error for nonexistent dir and keeps cwd
     const gwSwitch = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
     let switchMsg = "";
     gwSwitch.telegram.send = async (_chat, text) => { switchMsg = text; };
-    await gwSwitch.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
+    await gwSwitch.mainSession.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
     assert.ok(switchMsg.includes("Directory missing"), "switchCwd should report error for missing dir");
     assert.equal(gwSwitch.config.cwd, tmpCfgDir);
 
@@ -3071,11 +3408,11 @@ async function selfTest() {
       assert.equal(exitedInfo.expected, false);
 
       const gwExit = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-      gwExit.isStreaming = true;
+      gwExit.mainSession.isStreaming = true;
       let exitNotice = "";
       gwExit.telegram.send = async (_c, text) => { exitNotice = text; };
-      gwExit.handlePiExit({ code: 1, signal: null, expected: false });
-      assert.equal(gwExit.isStreaming, false, "异常退出后 isStreaming 必须重置为 false");
+      gwExit.mainSession.handlePiExit({ code: 1, signal: null, expected: false });
+      assert.equal(gwExit.mainSession.isStreaming, false, "异常退出后 isStreaming 必须重置为 false");
       await gwExit.telegramChain;
       assert.ok(exitNotice.includes("exited unexpectedly"), "异常退出必须向用户告警");
     }
@@ -3104,7 +3441,7 @@ async function selfTest() {
       gwMedia.telegram.setReaction = async () => {};
       gwMedia.saveDownload = async (_id, name) => ({ path: `/tmp/${name}`, data: null });
       const prompts = [];
-      gwMedia.prompt = async (text) => { prompts.push(text); };
+      gwMedia.mainSession.prompt = async (text) => { prompts.push(text); };
 
       // 发送 2 张图片组成 media_group
       gwMedia.dispatchUpdate({
@@ -3137,7 +3474,7 @@ async function selfTest() {
 
       // 等待 media_group timer 触发并完成排队处理
       await sleep(1300);
-      await gwMedia.updateChain;
+      await gwMedia.mainSession.updateChain;
 
       assert.equal(prompts.length, 2);
       assert.ok(prompts[0].includes("photo-101.jpg"), "相册应首先被处理并 prompt 给 Pi");
@@ -3155,9 +3492,9 @@ async function selfTest() {
       };
 
       // 模拟用户触发 abort
-      await gwAbort.handleCommand({ name: "abort", argument: "" }, "/abort");
+      await gwAbort.mainSession.handleCommand({ name: "abort", argument: "" }, "/abort");
       // Pi RPC 随后响应 agent_settled
-      await gwAbort.handleEvent({ type: "agent_settled" });
+      await gwAbort.mainSession.handleEvent({ type: "agent_settled" });
       await gwAbort.telegramChain;
       assert.equal(sentWarning, false, "/abort 后 agent_settled 不应误报未返回文本回复");
     }
@@ -3165,7 +3502,7 @@ async function selfTest() {
     // 回归（架构审查 Issue 6）：UI 选项点击时同一 requestId 的所有 token 立即作废
     {
       const gwUi = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-      gwUi.pi.write = () => {};
+      gwUi.mainSession.pi.write = () => {};
       gwUi.telegram.answer = async () => {};
       gwUi.telegram.edit = async () => {};
 
@@ -3194,7 +3531,7 @@ async function selfTest() {
       let sendCalled = false;
       gwRate.telegram.sendOne = async () => { sendCalled = true; };
       gwRate.telegram.edit = async () => { editCalled = true; };
-      await gwRate.flushDraft({ text: "test rate limit", flushing: false, closed: false, messageId: null });
+      await gwRate.mainSession.flushDraft({ text: "test rate limit", flushing: false, closed: false, messageId: null });
       assert.equal(sendCalled, false, "429 冷却期内 flushDraft 应跳过发送");
       assert.equal(editCalled, false);
     }
@@ -3538,6 +3875,140 @@ async function selfTest() {
     );
     assert.equal(rpc.pending.size, 0, "write 异常后 pending 不应泄露");
   }
+
+  // Multi-session & Topics in private chats (ref: Telegram Bot API 9.3 & 9.4)
+  assert.equal(sessionKeyOf({ message_id: 1, text: "main msg", chat: { type: "private" } }), "main");
+  assert.equal(sessionKeyOf({ message_id: 2, message_thread_id: 99, is_topic_message: true, chat: { type: "private" } }), "t:99");
+  assert.equal(sessionKeyOf({ message_id: 2, message_thread_id: 99 }), "t:99");
+  assert.equal(sessionKeyOf({ id: "cb1", message: { message_id: 3, message_thread_id: 99, is_topic_message: true, chat: { type: "private" } } }), "t:99");
+  assert.equal(sessionKeyOf({ id: "cb2", message: { message_id: 4, chat: { type: "private" } } }), "main");
+  assert.equal(sessionKeyOf(null), "main");
+
+  const testMainSessionDir = resolveSessionDir(tmpdir(), "/test/multi-project");
+  const testTopicSessionDir = resolveTopicSessionDir(tmpdir(), "/test/multi-project", 77);
+  assert.equal(testTopicSessionDir, `${testMainSessionDir}-t77`);
+  assert.notEqual(testMainSessionDir, testTopicSessionDir);
+
+  // loadState keeps valid topics and drops ones whose cwd is missing
+  {
+    const tmpStateDir = join(tmpdir(), `test-topics-state-${Date.now()}`);
+    await mkdir(tmpStateDir, { recursive: true, mode: 0o700 });
+    const validDir = join(tmpStateDir, "valid-proj");
+    await mkdir(validDir, { recursive: true, mode: 0o700 });
+    const missingDir = join(tmpStateDir, "nonexistent-proj");
+    await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
+      cwd: validDir,
+      recentProjects: [validDir],
+      topics: {
+        "10": { cwd: validDir },
+        "20": { cwd: missingDir },
+      },
+    }), { mode: 0o600 });
+    const stateWithTopics = loadState(tmpStateDir);
+    assert.deepEqual(stateWithTopics.topics["10"], { cwd: validDir });
+    assert.equal(stateWithTopics.topics["20"], undefined);
+  }
+
+  // maxSessions & resource management
+  {
+    const tmpCfg = { allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: tmpdir(), maxSessions: 2, idleStopMinutes: 10 };
+    const gwLim = new Gateway(tmpCfg);
+    gwLim.mainSession.pi.proc = { kill: () => {} };
+    const t1 = new ChatSession(gwLim, { threadId: 101, cwd: tmpdir(), sessionDir: join(tmpdir(), "t1") });
+    t1.pi.proc = { kill: () => {} };
+    t1.lastActiveAt = Date.now() - 5000;
+    gwLim.sessions.set("t:101", t1);
+
+    let stoppedT1 = false;
+    t1.stop = () => { stoppedT1 = true; t1.pi.proc = null; };
+    const t2 = new ChatSession(gwLim, { threadId: 102, cwd: tmpdir(), sessionDir: join(tmpdir(), "t2") });
+    await gwLim.acquireSessionSlot(t2);
+    assert.equal(stoppedT1, true, "maxSessions 超限时应 idle-stop 最久未活动的非流式 Topic");
+
+    gwLim.mainSession.isStreaming = true;
+    gwLim.sessions.set("t:102", t2);
+    t2.pi.proc = { kill: () => {} };
+    t2.isStreaming = true;
+    const t3 = new ChatSession(gwLim, { threadId: 103, cwd: tmpdir(), sessionDir: join(tmpdir(), "t3") });
+    await assert.rejects(() => gwLim.acquireSessionSlot(t3), /Maximum concurrent sessions \(2\) reached/);
+  }
+
+  // Session updateChain concurrency & ordering (ref: review issue 3 & 6)
+  {
+    const gwChains = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    gwChains.chatReady = true;
+    const sessionA = gwChains.mainSession;
+    const sessionB = new ChatSession(gwChains, { threadId: 200, cwd: tmpdir(), sessionDir: join(tmpdir(), "sB") });
+    gwChains.sessions.set("t:200", sessionB);
+
+    const log = [];
+    let releaseA;
+    const hangingPromise = new Promise((resolve) => { releaseA = resolve; });
+
+    sessionA.updateChain = sessionA.updateChain.then(async () => {
+      log.push("A1:start");
+      await hangingPromise;
+      log.push("A1:end");
+    });
+
+    sessionA.updateChain = sessionA.updateChain.then(async () => {
+      log.push("A2");
+    });
+
+    sessionB.updateChain = sessionB.updateChain.then(async () => {
+      log.push("B1");
+    });
+
+    await sleep(20);
+    assert.deepEqual(log, ["A1:start", "B1"], "Session B must not be blocked by hanging task in Session A");
+
+    releaseA();
+    await sessionA.updateChain;
+    assert.deepEqual(log, ["A1:start", "B1", "A1:end", "A2"], "Tasks within Session A must execute in order");
+  }
+
+  // close_topic callback single answer (ref: review issue 5)
+  {
+    const gwClose = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const answers = [];
+    gwClose.telegram.answer = async (_id, text) => { answers.push(text); };
+    gwClose.telegram.edit = async () => {};
+    gwClose.telegram.call = async () => ({});
+    const tid = 789;
+    gwClose.state.topics[tid] = { cwd: tmpdir() };
+    const closeSession = new ChatSession(gwClose, { threadId: tid, cwd: tmpdir(), sessionDir: join(tmpdir(), "sClose") });
+    gwClose.sessions.set(`t:${tid}`, closeSession);
+
+    const token = gwClose.action({ type: "close_topic", threadId: tid, confirmed: true });
+    await gwClose.handleCallback({ id: "cb-close", data: token, message: { chat: { id: 1 }, message_id: 10 } });
+    assert.deepEqual(answers, ["Topic closed"], "close_topic 应只回复一次 answerCallbackQuery");
+    assert.equal(gwClose.sessions.has(`t:${tid}`), false);
+  }
+
+  // Topic cwd switch adds to recentProjects (ref: review issue 2)
+  {
+    const tmpDir = join(tmpdir(), `test-topic-recent-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true });
+    const p1 = join(tmpDir, "p1");
+    const p2 = join(tmpDir, "p2");
+    await mkdir(p1, { recursive: true });
+    await mkdir(p2, { recursive: true });
+    const gwTopCwd = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: p1 });
+    const topSession = new ChatSession(gwTopCwd, { threadId: 55, cwd: p1, sessionDir: join(tmpDir, "s55") });
+    gwTopCwd.sessions.set("t:55", topSession);
+    topSession.send = async () => {};
+    topSession.createPi = () => ({
+      stop: () => {},
+      start: async () => {},
+      request: async () => ({ sessionId: "s1" }),
+    });
+    await topSession.switchCwd(p2, null);
+    const realP2 = await realpath(p2);
+    assert.ok(gwTopCwd.state.recentProjects.includes(realP2), "Topic cwd 切换应将目标加入 recentProjects");
+  }
+
+  assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");
+  assert.ok(HELP.includes("/close") && BOT_COMMANDS.some((c) => c.command === "close"), "/close registered");
 
   console.log("self-test: ok");
 }

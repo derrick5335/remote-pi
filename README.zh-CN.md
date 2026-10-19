@@ -56,6 +56,8 @@
 | :--- | :--- |
 | 直接发送文字 | 与 Pi 对话；任务执行中发送的文字会作为实时干预（Steer） |
 | `/cwd [路径]` | 切换工作目录（支持 `~/` 与相对路径，目录无效会报错）；不带参数则弹出最近 20 个历史项目的选择键盘 |
+| `/topic [路径]` | 创建新的 Topic 会话用于并行任务；不带参数则使用当前工作目录 |
+| `/close` | 关闭当前 Topic 会话（弹出确认按钮，确认后停止其 Pi 进程并删除该 Topic） |
 | `/model [关键词]` | 弹出内联键盘选择模型，或直接按关键词/完整 ID 快速切换 |
 | `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
 | `/new` | 开启新会话，重置上下文并以卡片汇报当前模型、环境与工作目录 |
@@ -187,6 +189,8 @@ pi-remote-gateway stop     # 停止后台服务
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
 | `stateDir` | - | `~/.local/var/remote-pi` | 运行时状态、会话文件、下载附件与套接字锁的存放目录 |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
+| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | 非流式 Topic 会话无活动的空闲分钟数，达到后自动停止其 Pi 进程（下次消息自动恢复；主会话永不休眠） |
+| `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | 所有会话中允许同时运行的最大 Pi 进程数（超限时自动挂起最近最少使用的非流式 Topic） |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | 收到消息时贴上的 Reaction 表情 |
 | `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | 任务完成时替换的 Reaction 表情 |
 
@@ -195,6 +199,22 @@ pi-remote-gateway stop     # 停止后台服务
 ---
 
 ## 进阶玩法
+
+### Topics / 并行多会话
+
+网关支持通过 Telegram 私聊 Topics（Telegram Bot API 9.3+）同时运行多个相互独立的 Pi 会话，实现手机端多项目并行开发。
+
+1. **在 @BotFather 中开启 Topic 模式**：
+   - 在 Telegram 打开 [@BotFather](https://t.me/BotFather)。
+   - 发送 `/mybots` → 选择你的 Bot → **Bot Settings** → **Topics** → **Turn on**。
+2. **创建 Topic 会话**：
+   - 发送 `/topic [路径]` 为指定项目目录创建独立 Topic；不带参数则复用当前会话的工作目录。
+   - 每个 Topic 拥有完全独立的 Pi 进程、工作区和会话历史（存储在 `sessionDir + "-t<threadId>"`，多 Topic 访问同一项目也不冲突）。
+3. **会话管理**：
+   - 在 Topic 内执行 `/cwd <路径>` 仅切换当前 Topic 的工作目录，并自动重命名 Topic 标签。
+   - 在 Topic 内执行 `/close` 弹出确认按钮，确认后停止该 Topic 的 Pi 进程并删除该 Topic。
+   - 在主会话中执行 `/status` 可一览所有 Topic 会话的状态（running / idle / stopped）与路径。
+   - 超出 `idleStopMinutes`（默认 30 分钟）无活动的 Topic 会被自动停止释放内存，下次发送消息时自动通过 `--continue` 恢复。
 
 ### 语音转写（STT）配置
 

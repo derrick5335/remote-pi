@@ -56,6 +56,8 @@
 | :--- | :--- |
 | *Plain Text* | Chat with Pi. Messages sent while Pi is working act as live steering instructions |
 | `/cwd [path]` | Switch workspace directory (absolute path or `~`-relative; errors if invalid). Without argument, show inline keyboard of up to 20 recently used projects |
+| `/topic [path]` | Start a new topic (thread) session for parallel tasks; without argument, uses current workspace |
+| `/close` | Close the current topic session (confirm dialog → stop its Pi process and delete the topic) |
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
 | `/new` | Start a fresh session, reset context, and display environment details |
@@ -187,6 +189,8 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 | `sttCommand` | - | `""` | Shell command executed for voice note transcription |
 | `stateDir` | - | `~/.local/var/remote-pi` | Directory for runtime state, session files, downloads, and lock socket |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | Gateway output log file |
+| `idleStopMinutes` | `REMOTE_PI_IDLE_STOP_MINUTES` | `30` | Inactivity minutes before a non-streaming topic session's Pi process is stopped (restarts on next message; main session never idle-stopped) |
+| `maxSessions` | `REMOTE_PI_MAX_SESSIONS` | `4` | Maximum concurrently running Pi processes across all sessions (stops least recently active non-streaming topic when limit is reached) |
 | `telegram.ackEmoji` | `TELEGRAM_ACK_EMOJI` | `"👀"` | Emoji reaction placed on message upon receipt |
 | `telegram.doneEmoji` | `TELEGRAM_DONE_EMOJI` | `"🫡"` | Emoji reaction replacing ack emoji when task finishes |
 
@@ -195,6 +199,22 @@ Configuration is loaded from `~/.config/remote-pi/config.json` by default (can b
 ---
 
 ## Advanced Usage
+
+### Topics / Parallel Sessions
+
+The gateway supports running multiple independent Pi sessions in parallel using Telegram private-chat topics (Telegram Bot API 9.3+).
+
+1. **Enable Topics in @BotFather**:
+   - Open [@BotFather](https://t.me/BotFather) on Telegram.
+   - Send `/mybots` → select your bot → **Bot Settings** → **Topics** → **Turn on**.
+2. **Create a Topic Session**:
+   - Send `/topic [path]` to spin up an independent topic for a project directory. Without an argument, it uses the current session's workspace.
+   - Each topic gets its own isolated Pi process, workspace, and session history (`sessionDir + "-t<threadId>"`).
+3. **Manage Topics**:
+   - Inside a topic, `/cwd <path>` switches the workspace for that topic only and renames the topic tab.
+   - `/close` inside a topic prompts for confirmation, stops that topic's Pi process, and deletes the topic.
+   - In the main chat, `/status` lists all running/idle/stopped topic sessions.
+   - Inactive topic sessions are automatically idle-stopped after `idleStopMinutes` (default 30) and seamlessly resumed upon your next message.
 
 ### Voice Transcription (STT)
 
