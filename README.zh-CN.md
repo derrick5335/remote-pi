@@ -20,7 +20,7 @@
 
 ## 平台与定位说明
 
-- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessage` + `editMessageText` 原地消息流式实时呈现、内联按钮、消息接收 Reaction 表情、多模态附件解析与可折叠引用块）。
+- **聊天平台**：**当前仅支持 Telegram**。网关针对 Telegram Bot API 进行了深度优化（充分利用 `sendMessageDraft` 临时草稿预览、`sendMessage` 持久回复、内联按钮、状态 Reaction 表情、多模态附件解析与可折叠引用块）。
 - **运行环境**：
   - **macOS**：提供开箱即用的 `./install.sh` 脚本，将网关注册为 launchd 用户守护进程，配合 `caffeinate` 保持接电状态下常驻防睡眠。
   - **Linux**：支持直接前台运行或由用户编写 systemd 服务常驻。
@@ -32,8 +32,7 @@
 - ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
 - 🔒 **配置与状态严格解耦（12-Factor 原则）**：`config.json` 保持只读；运行期工作区与 pane/session 绑定持久化于 `state.json`；会话使用 Pi 原生目录。
 - 🎯 **100% 基于 Pi 原生状态与能力**：仅使用 Pi 1.3.0 公开 Extension API、Pi CLI 与 Herdr socket API。每个会话由一个交互式 Pi 进程持有，Telegram 和终端只是该进程的不同视图；无私有补丁或旁路通信文件。
-- 🌊 **原生流式输出**：通过静音消息创建与原地实时编辑（`sendMessage` + `editMessageText`）呈现思考过程与回复，从根源上杜绝跨接口草稿转换导致的幽灵气泡、残留与重复闪烁。
-- 🛠️ **原生可折叠工具卡片**：Agent 连续调用工具（Bash、读写文件、Grep 等）时，自动生成原生可折叠引用块（`<blockquote expandable>`），保持手机端信息整洁不刷屏。
+- 🌊 **实时草稿**：`sendMessageDraft` 显示临时文本和当前工具进度，各 Topic 独立更新；更新间隔至少 1.5 秒，每 20 秒保活，最终回复作为持久文本消息发送。草稿失败时仅停用本轮预览，不回退到编辑消息。
 - 🔁 **错误重试**：助手错误回复仅附一个 `🔁 Retry` 按钮，重发上一次 Prompt。超长回复直接分段发送文本。
 - 🎮 **统一远程控制扩展**：
   - `remote-pi.ts` 提供 `remote_attach`（发送本地文件）与 `remote_ask`（同时在 Telegram 和终端提问，先回答者生效）；工具仅在连接期间启用。
@@ -44,12 +43,14 @@
   - **视觉与附件**：直接向 Bot 发送图片（模型原生视觉上下文）或代码/文档/音视频文件（自动下载至本地供 Pi 处理分析）。
 - 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
-  - 收到消息时 Bot 在原消息标记固定的 `👀` 接收表情，之后保持不变。
+  - 在触发任务的用户消息上显示：`👀` 已接收 → `👨‍💻` 工作中 → `👌` 已回复、`💔` 出错或 `🤷` 无文本回复；中止会清除表情。终端发起的任务不设置表情。
 - 🔒 **单实例互斥与严格白名单**：
   - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
   - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
 
 ---
+
+**通知规则**：仅 Telegram 发起且用户不在桌前的最终助手回复响铃；工具调用阶段的回复及终端发起的回复均静音。`remote_ask` 提问和 blocked 提醒在桌面在线标记不存在时响铃；压缩失败提示始终静音。
 
 ## 常用命令
 
@@ -65,7 +66,6 @@
 | `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应。注意：此处对服务重启/停止命令的拦截仅为误操作防护，并非安全边界 —— 持有 Bot 者本就拥有完整 Shell 权限 |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
 | `/status` | 查看当前会话 ID、模型、上下文消耗统计及费用 |
-| `/agents` | 按工作区列出 Herdr 中所有 agent 的状态（📱 = Telegram 会话，📡 = 已推送到 Telegram），点按钮查看其屏幕 |
 | `/compact [要求]` | 主动触发上下文压缩与精简 |
 | `/abort` | 立即中断当前正在运行的任务，保留排队消息 |
 | `/help` | 显示操作帮助，随后列出已加载的扩展命令、提示词模板及技能命令 |
@@ -79,7 +79,7 @@
 | `/name <name>` | 设置会话名称 |
 | `/restart` | 重启网关；启动就绪后，将原提示更新为“✅ Gateway restarted” |
 
-> **提示**：安装到 Pi 的 Skills 会在 Telegram 中自动映射为可执行指令（如 `/skill_name`）。内部桥接命令 `/remote-pi-new`、`/remote-pi-switch`、`/remote-pi-fork` 不会出现在 Telegram 命令列表或 Pi 终端自动补全中，但网关仍可正常执行它们。
+> **提示**：已安装的 Pi 技能及自定义命令统一走原生命令路由。内部 `/remote-pi-new` 与 `/remote-pi-switch` 桥接命令不出现在 Telegram 命令发现中；不修改终端自动补全。
 
 ### 自定义命令路由
 
@@ -126,7 +126,7 @@ npm test
 # 输出 "self-test: ok" 即表示全部核心逻辑正常
 ```
 
-Lint（ESLint，仅安全规则）：
+Lint（ESLint 安全与可读性规则）：
 
 ```bash
 npm run lint
@@ -214,7 +214,7 @@ pi-remote-gateway stop     # 停止后台服务
 | `sttCommand` | - | `""` | 语音转写命令（详见下方语音转写示例） |
 | `stateDir` | - | `~/.local/var/remote-pi` | 网关状态、下载附件、实例锁与 `bridge.sock` 的存放目录；Pi 会话仍使用原生目录 |
 | `logFile` | `REMOTE_PI_LOG_FILE` | `~/.local/var/log/remote-pi.log` | 网关运行日志输出路径 |
-| `presenceFile` | - | `""` | 桌面在线状态标记文件路径；存在时 Herdr blocked 提醒静音推送（`disable_notification: true`）。可通过屏幕锁屏/解锁钩子（如 sleepwatcher 或 hammerspoon）管理。支持 `~/` |
+| `presenceFile` | - | `""` | 桌面在线标记文件；存在时最终回复、提问及 blocked 提醒均静音。支持 `~/`，可由屏幕锁屏/解锁钩子管理 |
 
 下载文件固定保留 30 天，启动时及每 24 小时清理。Telegram 使用 25 秒长轮询、35 秒请求超时，失败后采用带抖动的指数退避。
 
@@ -261,12 +261,12 @@ pi-remote-gateway stop     # 停止后台服务
 ### 同一会话，任意设备（One session, any device）
 
 - **从手机开始**：在 Telegram 对话，或通过 `/topic [路径]` 创建 Topic。网关在 Herdr 窗格中启动真正的交互式 Pi；回到桌面直接在该窗格输入即可。`/new` 重置的是双方共享的会话，不是另一份手机进程。
-- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic，以 Pi 会话名称命名（`📡 <session_name>`，回退至首条用户指令或目录名）；请先在 @BotFather 开启 Threaded Mode。首条静音消息会自动回填最近一轮对话预览（`👤 …` / `🤖 …`），通过 `/name` 或在 Pi 内重命名会话会自动同步至 Topic 标题（`editForumTopic`）。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。桥接连接期间，Herdr 侧边栏显示 `📱` 徽标，Pi TUI 底部状态栏显示 `📱 remote`（断线重连中显示 `📱 reconnecting…`）。从 Telegram 关闭桌面 Topic 仅断开远程控制并提示终端用户，绝不终止 Pi 进程。
-- **双向同步**：手机指令原生显示在 Pi TUI；桌面输入在 Telegram 显示为 `🖥 <text>`。指令通过 socket 与 Pi 原生输入 API 传递，不使用终端按键模拟或会话日志抓取。桌面发起的运行完成卡片与空回复提示均静音发送，人在电脑前不打扰手机。
-- **恢复会话而不创建第二个写入者**：`/resume` 从 `~/.pi/agent/sessions`（或 Pi 原生目录环境变量指定的位置）列出当前 cwd 的会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
+- **从桌面开始**：在任意 Pi 窗格运行 `/remote-control`（或 `/remote-control on|off|status`）。未知窗格会获得专属 Telegram Topic，以 Pi 会话名称命名（`📡 <session_name>`，回退至首条用户指令或目录名）；请先在 @BotFather 开启 Threaded Mode。首条静音消息会自动回填最近一轮对话预览（`👤 …` / `🤖 …`），通过 `/name` 或在 Pi 内重命名会话会自动同步至 Topic 标题（`editForumTopic`）。Herdr 原生 metadata token `remote_pi=on` 在扩展/会话重载期间保留开关，Pi 退出时清除。桥接连接期间，Pi TUI 底部状态栏显示 `📱 remote`（断线重连中显示 `📱 reconnecting…`）。从 Telegram 关闭桌面 Topic 仅断开远程控制并提示终端用户，绝不终止 Pi 进程。
+- **双向同步**：手机指令原生显示在 Pi TUI；桌面输入在 Telegram 显示为 `🖥 <text>`。指令通过 socket 与 Pi 原生输入 API 传递，不使用终端按键模拟或会话日志抓取。终端发起的回复始终静音；没有文本回复时不额外发送占位消息。
+- **恢复会话而不创建第二个写入者**：`/resume` 经连接的 Pi 调用公开 `SessionManager.list`，使用 Pi 当前原生会话目录，列出当前 cwd 最近修改的 12 个会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
 - **提问与审批**：`remote_ask` 同时出现在两个视图，先回答的一端使另一端关闭。其他扩展的 TUI 对话仍留在终端；Herdr 待确认通知仅附屏幕末尾内容及 `⏎ Enter` / `⎋ Esc` 控件。
 - **生命周期**：网关（重）启动只重新附加仍在运行的 Pi 窗格，绝不自行启动新 Pi；若没有正在运行的 Pi，第一条消息才会启动它。扩展自动重连并恢复已保存的视图绑定。Pi 退出至 Shell 后，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。
-- **可见性**：`/agents` 保留全部 Herdr agent 的只读列表及屏幕预览；Pi 通过 Herdr 原生集成汇报自身状态。
+- **待确认提示**：绑定会话工作期间每 3 秒轮询 Herdr 原生 agent 状态；仅为进入 blocked 状态的绑定窗格发送屏幕末尾预览及 Enter/Esc 按钮，已有 `remote_ask` 对话时不重复提醒。发送按键前会重新检查 blocked 状态。
 
 **Pi 1.3.0 公开 API 限制**：不支持检查或清空原生队列，也不支持自动重试开始/结束通知。压缩及 agent 生命周期事件正常转发。
 
@@ -276,7 +276,7 @@ pi-remote-gateway stop     # 停止后台服务
 
 ```text
 [ Telegram 客户端 ]
-       ↕ HTTPS 长轮询 / 消息 / 原地编辑 / 回调
+       ↕ HTTPS 长轮询 / 草稿 / 最终消息 / 状态表情 / 回调
 [ gateway.mjs ] — 路由与流式渲染
        ↕ JSON lines，经 <stateDir>/bridge.sock（Unix socket，权限 0600）
 [ Herdr 窗格：交互式 Pi + remote-pi.ts ] ↔ [ 桌面终端 ]

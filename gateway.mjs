@@ -16,9 +16,7 @@ const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 let HERDR_DISABLED_FOR_TEST = false;
 
-function setTestMode(on) {
-  HERDR_DISABLED_FOR_TEST = Boolean(on);
-}
+const setTestMode = (on) => { HERDR_DISABLED_FOR_TEST = Boolean(on); };
 let stateWriteCounter = 0;
 const BOT_COMMANDS = [
   { command: "help", description: "Show help and Pi native commands" },
@@ -34,8 +32,8 @@ const BOT_COMMANDS = [
   { command: "followup", description: "Queue message after current turn finishes" },
   { command: "name", description: "Rename current session / topic" },
   { command: "sh", description: "Run a shell command directly" },
+  // ref: https://core.telegram.org/bots/api#setmycommands — publish /restart in the slash menu.
   { command: "restart", description: "Restart the gateway service" },
-  { command: "agents", description: "Status of all Herdr agents" },
 ];
 const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start"]);
 const HELP = `Remote Pi\n\nJust send text to chat with Pi; messages sent while it is working act as steering.\n\n` + BOT_COMMANDS.map((c) => `/${c.command.padEnd(19)} ${c.description}`).join("\n");
@@ -53,9 +51,7 @@ function buildDevPath(basePath = process.env.PATH) {
 
 process.env.PATH = buildDevPath(process.env.PATH);
 
-function retryableTelegramStatus(status) {
-  return status === 429 || status >= 500;
-}
+const retryableTelegramStatus = (status) => status === 429 || status >= 500;
 
 // ref: AWS Architecture Blog — Exponential Backoff And Jitter (https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
 function pollBackoffMs(failures, random = Math.random) {
@@ -65,10 +61,7 @@ function pollBackoffMs(failures, random = Math.random) {
 
 const NON_IDEMPOTENT_METHODS = new Set(["sendMessage", "sendDocument", "sendPhoto", "sendMediaGroup", "copyMessage", "forwardMessage"]);
 const CONNECT_PHASE_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
-function isConnectPhaseError(error) {
-  const code = error?.cause?.code || error?.code;
-  return Boolean(code && CONNECT_PHASE_CODES.has(code));
-}
+const isConnectPhaseError = (error) => CONNECT_PHASE_CODES.has(error?.cause?.code || error?.code);
 // ref: https://core.telegram.org/bots/api#making-requests — avoid replaying non-idempotent requests after ambiguous failures.
 function shouldRetryTelegram(method, { status, error } = {}) {
   const nonIdempotent = NON_IDEMPOTENT_METHODS.has(method);
@@ -129,10 +122,17 @@ rules.blockquote_close = () => "</blockquote>\n\n";
 
 // 列表：去掉 ul/ol 包装；有序序号自计数；嵌套按层级缩进（render 同步执行，模块级栈安全）
 let listStack = [];
-rules.bullet_list_open = () => { listStack.push(null); return listStack.length >= 2 ? "\n" : ""; };
-rules.ordered_list_open = () => { listStack.push(0); return listStack.length >= 2 ? "\n" : ""; };
-rules.bullet_list_close = () => { listStack.pop(); return listStack.length ? "" : "\n"; };
-rules.ordered_list_close = () => { listStack.pop(); return listStack.length ? "" : "\n"; };
+// ref: https://markdown-it.github.io/markdown-it/#Renderer.rules — share rendering for equivalent token types.
+for (const [type, initial] of [["bullet", null], ["ordered", 0]]) {
+  rules[`${type}_list_open`] = () => {
+    listStack.push(initial);
+    return listStack.length >= 2 ? "\n" : "";
+  };
+}
+rules.bullet_list_close = rules.ordered_list_close = () => {
+  listStack.pop();
+  return listStack.length ? "" : "\n";
+};
 rules.list_item_open = () => {
   const depth = listStack.length;
   const top = listStack[depth - 1];
@@ -179,9 +179,7 @@ md.renderer.render = (tokens, options, env) => {
   }
 };
 
-function telegramHtml(text) {
-  return md.render(String(text || ""));
-}
+const telegramHtml = (text) => md.render(String(text || ""));
 
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
@@ -189,13 +187,9 @@ function scanFence(text) {
   let open = null;
   for (const line of text.split("\n")) {
     const m = FENCE_RE.exec(line);
-    if (m) {
-      if (!open) {
-        if (m[1][0] === "~" || !m[2].includes("`")) open = { marker: m[1], info: m[2].trim() };
-      } else if (m[1][0] === open.marker[0] && m[1].length >= open.marker.length && m[2].trim() === "") {
-        open = null;
-      }
-    }
+    if (!m) continue;
+    if (!open && (m[1][0] === "~" || !m[2].includes("`"))) open = { marker: m[1], info: m[2].trim() };
+    else if (open && m[1][0] === open.marker[0] && m[1].length >= open.marker.length && !m[2].trim()) open = null;
   }
   return open;
 }
@@ -214,11 +208,7 @@ function chunks(text, limit = MAX_MESSAGE) {
   if (str.length <= limit) return [str];
   const parts = [];
   let from = 0;
-  while (from < str.length) {
-    if (str.length - from <= limit) {
-      parts.push(renderChunk(str, from, str.length));
-      break;
-    }
+  while (str.length - from > limit) {
     const target = from + limit;
     let cut = str.lastIndexOf("\n\n", target);
     if (cut <= from || cut < target - 500) cut = str.lastIndexOf("\n", target);
@@ -226,36 +216,18 @@ function chunks(text, limit = MAX_MESSAGE) {
     parts.push(renderChunk(str, from, cut));
     from = cut + (str[cut] === "\n" ? 1 : 0);
   }
+  if (from < str.length) parts.push(renderChunk(str, from, str.length));
   return parts;
 }
 
-function extractText(content) {
-  if (typeof content === "string") return content;
-  return Array.isArray(content) ? content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : "";
-}
+const extractText = (content) => typeof content === "string" ? content
+  : Array.isArray(content) ? content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : "";
 
 function toolSummary(name, args = {}) {
   const val = args?.command || args?.path || args?.pattern || args?.query || (Array.isArray(args?.queries) && args.queries.join(", ")) || args?.url || Object.values(args || {}).find((v) => typeof v === "string");
   if (val) return `${name}: ${val}`;
   const json = JSON.stringify(args || {});
   return json && json !== "{}" ? `${name} ${json}` : name;
-}
-
-function renderToolPanel(tools, isSettled = false) {
-  if (!tools.length) return "";
-  const total = tools.length;
-  const done = tools.filter((t) => t.status !== "running").length;
-  const header = isSettled ? `✅ ${total} tool call(s) done` : `⚙️ Running tools (${done}/${total})…`;
-  const recent = tools.slice(-6).map((t) => {
-    const icon = t.status === "running" ? "⏳" : t.status === "error" ? "❌" : "✅";
-    const summary = t.summary.length > 80 ? `${t.summary.slice(0, 77)}…` : t.summary;
-    return `• ${icon} ${summary}`;
-  });
-  const hidden = tools.length - recent.length;
-  const prefix = hidden > 0 ? [`… ${hidden} earlier call(s) done`] : [];
-  const body = [...prefix, ...recent].join("\n");
-  // ponytail: 面板是同一条消息反复 edit，实体结构必须首帧即定（官方 entities 不跨 edit 保留），避免中途跳变
-  return `${header}\n${expandableBlockquote(body)}`;
 }
 
 function formatContextTokens(count) {
@@ -266,19 +238,12 @@ function formatContextTokens(count) {
 }
 
 function formatSessionReset({ model, cwd }) {
-  const modelId = model?.id || "unknown";
-  const provider = model?.provider || "unknown";
-  const contextTokens = formatContextTokens(model?.contextWindow);
-  const context = contextTokens ? `${contextTokens} tokens (detected)` : "unknown";
-  const endpoint = model?.baseUrl || "unknown";
+  const context = formatContextTokens(model?.contextWindow);
   return [
-    "✨ Session reset! Starting fresh.",
-    "",
-    `◆ Model: ${modelId}`,
-    `◆ Provider: ${provider}`,
-    `◆ Context: ${context}`,
-    `◆ Endpoint: ${endpoint}`,
-    `◆ CWD: ${cwd}`,
+    "✨ Session reset! Starting fresh.\n",
+    `◆ Model: ${model?.id || "unknown"}`, `◆ Provider: ${model?.provider || "unknown"}`,
+    `◆ Context: ${context ? `${context} tokens (detected)` : "unknown"}`,
+    `◆ Endpoint: ${model?.baseUrl || "unknown"}`, `◆ CWD: ${cwd}`,
   ].join("\n");
 }
 
@@ -287,41 +252,22 @@ function extensionFromMime(mime = "") {
   return map[String(mime).toLowerCase()] || "";
 }
 
-function attachmentPrompt(caption, files) {
-  return `${caption}\n\nAttachments saved locally:\n${files.map((file) => `- ${file.path}`).join("\n")}`;
-}
-
-function previewText(text) {
-  return text.length > MAX_MESSAGE ? `${text.slice(0, MAX_MESSAGE)}\n\n*(output truncated, still streaming…)*` : text;
-}
+const attachmentPrompt = (caption, files) => `${caption}\n\nAttachments saved locally:\n${files.map((file) => `- ${file.path}`).join("\n")}`;
 
 function formatAssistantError(errorMessage) {
   const message = String(errorMessage || "Model call failed");
-  if (/usage limit|quota|balance|credit|insufficient|budget/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 Tip: the current model's usage quota is exhausted. Use /model to switch to another available model (e.g. Gemini or Claude).`;
-  }
-  if (/rate limit|too many requests|429/i.test(message)) {
-    return `⚠️ ${message}\n\n💡 Tip: provider rate limit hit. Retry shortly, or use /model to switch models.`;
-  }
-  return `❌ ${message}`;
+  const tip = /usage limit|quota|balance|credit|insufficient|budget/i.test(message)
+    ? "the current model's usage quota is exhausted. Use /model to switch to another available model (e.g. Gemini or Claude)."
+    : /rate limit|too many requests|429/i.test(message) ? "provider rate limit hit. Retry shortly, or use /model to switch models." : "";
+  return tip ? `⚠️ ${message}\n\n💡 Tip: ${tip}` : `❌ ${message}`;
 }
 
-function runStt(sttCommand, audioPath) {
-  return new Promise((resolveStt, rejectStt) => {
-    const child = spawn("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
-    let out = "";
-    let err = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => (out += chunk));
-    child.stderr.on("data", (chunk) => (err += chunk));
-    child.on("error", rejectStt);
-    child.on("close", (code) => {
-      const text = out.trim();
-      if (code === 0 && text) return resolveStt(text);
-      rejectStt(new Error(`Speech-to-text failed (exit ${code ?? "signal"}): ${(err.trim() || text || "no output").slice(-300)}`));
-    });
-  });
+async function runStt(sttCommand, audioPath) {
+  try {
+    const text = await runCommand("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
+    if (!text) throw new Error("no output");
+    return text;
+  } catch (error) { throw new Error(`Speech-to-text failed: ${error.message.slice(-300)}`); }
 }
 
 function resolvePath(pathStr, baseDir = process.cwd()) {
@@ -332,22 +278,15 @@ function resolvePath(pathStr, baseDir = process.cwd()) {
 
 // pure routing: 判定消息归属的主会话 ("main") 或私聊 Topic ("t:<threadId>")
 // ref: Telegram Bot API 9.3 (2025-12-31) Topics in private chats (https://core.telegram.org/bots/api-changelog)
-function sessionKeyOf(messageOrCallbackMessage) {
-  if (!messageOrCallbackMessage) return "main";
-  const m = messageOrCallbackMessage.message || messageOrCallbackMessage;
-  const chatType = m.chat?.type;
-  if (chatType && chatType !== "private") return "main";
-  const threadId = m.message_thread_id;
-  if (!threadId) return "main";
-  if (m.is_topic_message === false) return "main";
-  return `t:${threadId}`;
+function sessionKeyOf(message) {
+  const m = message?.message || message;
+  if (!m || m.chat?.type && m.chat.type !== "private" || !m.message_thread_id || m.is_topic_message === false) return "main";
+  return `t:${m.message_thread_id}`;
 }
 
 function loadState(stateDir) {
-  const statePath = join(stateDir, "state.json");
-  if (!existsSync(statePath)) return { cwd: null, topics: {}, herdrPanes: {} };
   try {
-    const raw = JSON.parse(readFileSync(statePath, "utf8"));
+    const raw = JSON.parse(readFileSync(join(stateDir, "state.json"), "utf8"));
     const topics = {};
     if (typeof raw.topics === "object" && raw.topics !== null) {
       for (const [threadId, info] of Object.entries(raw.topics)) {
@@ -359,7 +298,9 @@ function loadState(stateDir) {
       for (const [key, paneId] of Object.entries(raw.herdrPanes)) {
         if (typeof paneId === "string" && paneId) herdrPanes[key] = paneId;
         else if (paneId && typeof paneId === "object" && typeof paneId.cwd === "string") {
-          herdrPanes[key] = { cwd: paneId.cwd, ...(paneId.paneId ? { paneId: paneId.paneId } : {}), ...(paneId.sessionFile ? { sessionFile: paneId.sessionFile } : {}), ...(paneId.workspaceId ? { workspaceId: paneId.workspaceId } : {}), owned: paneId.owned === true };
+          const { cwd, sessionFile, workspaceId, owned } = paneId;
+          herdrPanes[key] = { cwd, ...(paneId.paneId ? { paneId: paneId.paneId } : {}),
+            ...(sessionFile ? { sessionFile } : {}), ...(workspaceId ? { workspaceId } : {}), owned: owned === true };
         }
       }
     }
@@ -367,78 +308,14 @@ function loadState(stateDir) {
   } catch { return { cwd: null, topics: {}, herdrPanes: {} }; }
 }
 
-function shellQuote(str) {
-  return `'${String(str).replaceAll("'", "'\\''")}'`;
-}
-
-async function readFirstLine(filePath) {
-  try {
-    const raw = await readFile(filePath, "utf8");
-    const nl = raw.indexOf("\n");
-    return nl === -1 ? raw : raw.slice(0, nl);
-  } catch { return null; }
-}
-
-async function parseSessionHeader(filePath) {
-  try {
-    const firstLine = await readFirstLine(filePath);
-    const header = firstLine ? JSON.parse(firstLine) : null;
-    return header?.type === "session" ? header : null;
-  } catch { return null; }
-}
-
-async function parseSessionPreview(filePath) {
-  try {
-    const raw = await readFile(filePath, "utf8");
-    for (const line of raw.split("\n", 20)) {
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type === "session_info" && entry.name) return entry.name;
-        if (entry.type === "message" && entry.message?.role === "user") {
-          const text = extractText(entry.message.content).slice(0, 60);
-          if (text) return text;
-        }
-      } catch {
-        const m = line.match(/"role"\s*:\s*"user"[\s\S]*?"text"\s*:\s*"([^"\\]{1,60})/);
-        if (m) return m[1];
-      }
-    }
-    return "";
-  } catch { return ""; }
-}
-
-function encodeCwdSessionDir(baseDir, cwd) {
-  return join(baseDir, `--${cwd.replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-")}--`);
-}
-
-async function scanDesktopSessions(desktopDir, targetCwd, limit = 10) {
-  if (!desktopDir || !targetCwd) return [];
-  const dir = encodeCwdSessionDir(desktopDir, targetCwd);
-  if (!existsSync(dir)) return [];
-  const names = (await readdir(dir).catch(() => [])).filter((name) => name.endsWith(".jsonl"));
-  const matched = [];
-  for (const name of names) {
-    const path = join(dir, name);
-    try {
-      const header = await parseSessionHeader(path);
-      if (header?.cwd === targetCwd) {
-        const s = await stat(path).catch(() => null);
-        if (s) matched.push({ path, mtime: s.mtimeMs, id: header.id });
-      }
-    } catch {}
-  }
-  matched.sort((a, b) => b.mtime - a.mtime);
-  return Promise.all(matched.slice(0, limit).map(async (item) => ({ ...item, title: (await parseSessionPreview(item.path)) || basename(item.path) })));
-}
+const shellQuote = (str) => `'${String(str).replaceAll("'", "'\\''")}'`;
 
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
   const configDir = dirname(path);
   let file = {};
-  if (existsSync(path)) {
-    try { file = JSON.parse(readFileSync(path, "utf8")); }
-    catch (err) { throw new Error(`Failed to parse config file ${path}: ${err.message}`); }
+  try { file = JSON.parse(readFileSync(path, "utf8")); } catch (error) {
+    if (error.code !== "ENOENT") throw new Error(`Failed to parse config file ${path}: ${error.message}`);
   }
 
   const stateDir = resolvePath(file.stateDir || join(homedir(), ".local", "var", "remote-pi"), configDir);
@@ -468,18 +345,15 @@ function loadConfig() {
 
 class Telegram {
   constructor(token, offsetPath) {
-    this.base = `https://api.telegram.org/bot${token}`;
-    this.fileBase = `https://api.telegram.org/file/bot${token}`;
-    this.offsetPath = offsetPath;
-    this.retryNotBefore = 0; // ref: Telegram ResponseParameters retry_after (https://core.telegram.org/bots/api#responseparameters)
-    this.currentPollAc = null;
-    this.polling = false;
-    this.pollFailures = 0;
-    this.outageStart = 0;
-    this.inConflict = false; }
+    Object.assign(this, {
+      base: `https://api.telegram.org/bot${token}`, fileBase: `https://api.telegram.org/file/bot${token}`, offsetPath,
+      currentPollAc: null, polling: false, pollFailures: 0, outageStart: 0, inConflict: false,
+    });
+  }
   async call(method, body = {}, timeout = 35_000, maxAttempts = 3, signal = null, quiet = false) {
     let lastError;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let status, retryAfter;
       try {
         const reqSignal = signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout);
         const res = await fetch(`${this.base}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: reqSignal });
@@ -488,23 +362,20 @@ class Telegram {
           if (method !== "getUpdates" || data.result?.length) console.log(`${new Date().toISOString()} [tg:call] ${method} ok${method === "getUpdates" ? ` (updates: ${data.result.length})` : ""}`);
           return data.result;
         }
-        if (res.status === 429) {
-          const retrySec = data?.parameters?.retry_after || attempt + 1;
-          this.retryNotBefore = Math.max(this.retryNotBefore, Date.now() + retrySec * 1000);
-        }
-        lastError = new Error(`Telegram ${method}: ${data.description || res.status}`);
-        if (!quiet) console.error(`${new Date().toISOString()} [tg:call] ${method} HTTP ${res.status}: ${data.description || ""}`);
-        if (!shouldRetryTelegram(method, { status: res.status }) || attempt === maxAttempts - 1) throw lastError;
-        await sleep((data.parameters?.retry_after || attempt + 1) * 1000);
+        status = res.status;
+        retryAfter = data.parameters?.retry_after;
+        throw new Error(`Telegram ${method}: ${data.description || status}`);
       } catch (error) {
         if (signal?.aborted) throw error;
         if (!quiet) console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed:`, error.message);
         lastError = error;
-        if (!shouldRetryTelegram(method, { error }) || attempt === maxAttempts - 1) throw error;
-        await sleep((attempt + 1) * 1000);
+        if (!shouldRetryTelegram(method, { status, error }) || attempt === maxAttempts - 1) throw error;
+        // ref: https://core.telegram.org/bots/api#responseparameters — 429 retries honor retry_after.
+        await sleep((retryAfter || attempt + 1) * 1000);
       }
     }
-    throw lastError; }
+    throw lastError;
+  }
   async sendOne(chatId, text, extra = {}) {
     const plain = String(text || "(empty)");
     try {
@@ -512,52 +383,40 @@ class Telegram {
     } catch (error) {
       const msg = String(error.message || "");
       if (!msg.includes("can't parse entities") && !msg.includes("message is too long")) throw error;
+      // ref: https://core.telegram.org/bots/api#sendmessage — HTML parse/length failures may fall back to plain text.
       console.error("HTML parse/length fallback:", error.message);
-      if (plain.length > 4000) {
-        let lastMsg;
-        for (let i = 0; i < plain.length; i += 4000) {
-          lastMsg = await this.call("sendMessage", { chat_id: chatId, text: plain.slice(i, i + 4000), ...(i + 4000 >= plain.length ? extra : {}) });
-        }
-        return lastMsg;
+      let lastMsg;
+      const base = { message_thread_id: extra.message_thread_id, disable_notification: extra.disable_notification };
+      for (let i = 0; i < plain.length; i += 4000) {
+        lastMsg = await this.call("sendMessage", { chat_id: chatId, text: plain.slice(i, i + 4000), ...(i + 4000 >= plain.length ? extra : base) });
       }
-      return this.call("sendMessage", { chat_id: chatId, text: plain, ...extra });
+      return lastMsg;
     }
   }
-
   async send(chatId, text, extra = {}) {
     let last;
     const parts = chunks(text), base = {};
     if (extra?.message_thread_id) base.message_thread_id = extra.message_thread_id;
     if (extra?.disable_notification) base.disable_notification = extra.disable_notification;
     for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : base);
-    return last; }
-  async edit(chatId, messageId, text, ephemeral = false, extra = {}) {
+    return last;
+  }
+  async edit(chatId, messageId, text) {
     const plain = String(text || "(empty)");
-    const timeout = ephemeral ? 10_000 : 35_000;
-    const maxAttempts = ephemeral ? 1 : 3;
-    const extraParams = extra?.reply_markup ? { reply_markup: extra.reply_markup } : {};
     try {
-      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramHtml(plain), parse_mode: "HTML", ...extraParams }, timeout, maxAttempts);
+      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramHtml(plain), parse_mode: "HTML" });
     } catch (error) {
       const msg = String(error.message || "");
       if (msg.includes("can't parse entities") || msg.includes("message is too long")) {
         console.error("HTML parse/length fallback:", error.message);
-        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain.slice(0, 4000), ...extraParams }, timeout, maxAttempts);
+        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain.slice(0, 4000) });
       }
       if (!error.message.includes("message is not modified")) throw error;
     }
   }
-
   answer(callbackQueryId, text = "") {
-    return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch(console.error); }
-  async sendChatAction(chatId, action = "typing", extra = {}) {
-    try {
-      const body = { chat_id: chatId, action };
-      if (extra?.message_thread_id) body.message_thread_id = extra.message_thread_id;
-      await fetch(`${this.base}/sendChatAction`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(4_000) });
-    } catch {}
+    return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch(console.error);
   }
-
   async sendDocument(chatId, path, extra = {}) {
     const form = new FormData();
     form.set("chat_id", String(chatId));
@@ -566,21 +425,28 @@ class Telegram {
     const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
-    console.log(`${new Date().toISOString()} [tg:call] sendDocument ok`); }
-  async deleteMessage(chatId, messageId) {
-    await this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, 10_000, 1); }
-  async setReaction(chatId, messageId, emoji) {
-    if (!messageId) return null;
-    const reaction = emoji ? [{ type: "emoji", emoji: String(emoji) }] : [];
-    try { return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction }, 5000, 1); }
-    catch { return null; }
+    console.log(`${new Date().toISOString()} [tg:call] sendDocument ok`);
   }
-
+  // ref: https://core.telegram.org/bots/api#sendmessagedraft — drafts are temporary; persist finals with sendMessage.
+  draft(chatId, draftId, text, extra = {}) {
+    return this.call("sendMessageDraft", {
+      chat_id: chatId, draft_id: draftId, text: text ? telegramHtml(text) : "", parse_mode: "HTML", ...extra,
+    }, 10_000, 1);
+  }
+  // ref: https://core.telegram.org/bots/api#setmessagereaction — one emoji per bot, [] clears it.
+  async react(chatId, messageId, emoji) {
+    if (!messageId) return null;
+    try {
+      return await this.call("setMessageReaction", {
+        chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: "emoji", emoji }] : [],
+      }, 10_000, 1);
+    } catch { return null; }
+  }
   stopPolling() {
     this.polling = false;
-    if (this.currentPollAc) { try { this.currentPollAc.abort("stop"); } catch {} this.currentPollAc = null; }
+    this.currentPollAc?.abort("stop");
+    this.currentPollAc = null;
   }
-
   async poll(handler) {
     let offset = Number(await readFile(this.offsetPath, "utf8").catch(() => "0")) || 0;
     let persistChain = Promise.resolve();
@@ -614,16 +480,24 @@ class Telegram {
       } catch (error) {
         this.currentPollAc = null;
         if (!this.polling) break;
-        if (error.message?.includes("Conflict")) {
-          if (!this.inConflict) { this.inConflict = true; console.error(`${new Date().toISOString()} [tg:poll] conflict: ${error.message}`); }
-          try { this.currentPollAc = new AbortController(); await sleep(15_000, undefined, { signal: this.currentPollAc.signal }); } catch {} finally { this.currentPollAc = null; }
-          continue;
+        const conflict = error.message?.includes("Conflict");
+        if (conflict) {
+          if (!this.inConflict) console.error(`${new Date().toISOString()} [tg:poll] conflict: ${error.message}`);
+          this.inConflict = true;
+        } else {
+          this.inConflict = false;
+          if (++this.pollFailures === 1) {
+            this.outageStart = Date.now();
+            console.error(`${new Date().toISOString()} [tg:poll] offline: ${error.message}; retrying with backoff`);
+          }
         }
-        this.inConflict = false;
-        this.pollFailures++;
-        if (this.pollFailures === 1) { this.outageStart = Date.now(); console.error(`${new Date().toISOString()} [tg:poll] offline: ${error.message}; retrying with backoff`); }
-        const backoffMs = pollBackoffMs(this.pollFailures);
-        try { this.currentPollAc = new AbortController(); await sleep(backoffMs, undefined, { signal: this.currentPollAc.signal }); } catch {} finally { this.currentPollAc = null; }
+        const backoffMs = conflict ? 15_000 : pollBackoffMs(this.pollFailures);
+        try {
+          this.currentPollAc = new AbortController();
+          await sleep(backoffMs, undefined, { signal: this.currentPollAc.signal });
+        } catch {} finally {
+          this.currentPollAc = null;
+        }
       }
     }
   }
@@ -635,23 +509,18 @@ function runCommand(cmd, args = [], options = {}) {
   }
   const { okCodes = [0], ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
-    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOptions });
+    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], killSignal: "SIGKILL", ...spawnOptions });
     let stdout = "";
     let stderr = "";
     cp.stdout?.setEncoding("utf8");
     cp.stderr?.setEncoding("utf8");
     cp.stdout?.on("data", (d) => { stdout += d; });
     cp.stderr?.on("data", (d) => { stderr += d; });
-    const timer = spawnOptions.timeout ? setTimeout(() => {
-      cp.kill("SIGKILL");
-      reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
-    }, spawnOptions.timeout) : null;
-    cp.on("error", (err) => {
-      if (timer) clearTimeout(timer);
-      reject(err);
+    cp.on("error", reject); // ref: https://nodejs.org/api/child_process.html#event-exit — inherited stdio may outlive the timed-out child.
+    cp.on("exit", () => {
+      if (cp.killed) reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
     });
     cp.on("close", (code) => {
-      if (timer) clearTimeout(timer);
       if (okCodes.includes(code)) resolve(stdout.trim());
       else reject(new Error(`Command failed (${code}): ${stderr.trim() || stdout.trim()}`));
     });
@@ -659,232 +528,66 @@ function runCommand(cmd, args = [], options = {}) {
 }
 
 // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-async function resolveHerdrEnvironment(cwd, { excludePaneIds, threadId, persistedPaneId, paneEnv = {}, runCmd = runCommand, herdrBin, socketPath } = {}) {
-  if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand) return {};
-  let bin = herdrBin;
-  if (!bin) {
-    try { bin = (await runCmd("which", ["herdr"], { timeout: 2000 })).trim(); }
-    catch {
-      const fallback = join(homedir(), ".local", "bin", "herdr");
-      if (existsSync(fallback)) bin = fallback;
-      else return {};
-    }
+async function resolveHerdrEnvironment(cwd, {
+  excludePaneIds = [], threadId, persistedPaneId, paneEnv = {}, runCmd = runCommand, herdrBin, socketPath,
+} = {}) {
+  if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand || !herdrBin || !socketPath) return {};
+  let pane, created = false;
+  if (persistedPaneId && !excludePaneIds.includes(persistedPaneId)) {
+    try { pane = JSON.parse(await runCmd(herdrBin, ["pane", "get", persistedPaneId], { timeout: 3000 })).result?.pane; } catch {}
   }
-  let sock = socketPath;
-  if (!sock) {
+  if (!pane?.pane_id) {
     try {
-      const raw = await runCmd(bin, ["status", "server", "--json"], { timeout: 3000 });
-      const parsed = JSON.parse(raw);
-      if (parsed.running && parsed.socket) sock = parsed.socket;
-    } catch {}
+      const label = `${basename(cwd) || "remote-pi"}${threadId ? `#${threadId}` : ""}`;
+      const args = ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus",
+        ...Object.entries(paneEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`])];
+      const result = JSON.parse(await runCmd(herdrBin, args, { timeout: 5000 })).result;
+      pane = { ...result?.root_pane, workspace_id: result?.workspace?.workspace_id, tab_id: result?.tab?.tab_id };
+      created = Boolean(pane.pane_id);
+    } catch (error) { console.warn(`[herdr] failed to create workspace for ${cwd}: ${error.message}`); }
   }
-  if (!sock) return {};
-
-  let workspaceId, tabId, paneId, createdPane = false;
-  const exclude = new Set(excludePaneIds || []);
-  if (persistedPaneId && !exclude.has(persistedPaneId)) {
-    try {
-      const paneRaw = await runCmd(bin, ["pane", "get", persistedPaneId], { timeout: 3000 });
-      const existingPane = JSON.parse(paneRaw).result?.pane;
-      if (existingPane?.pane_id) { workspaceId = existingPane.workspace_id; tabId = existingPane.tab_id; paneId = existingPane.pane_id; }
-    } catch {}
-  }
-  if (!paneId) {
-    try {
-      const base = basename(cwd) || "remote-pi";
-      const label = threadId ? `${base}#${threadId}` : base;
-      const createdRaw = await runCmd(bin, ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus", ...Object.entries(paneEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`])], { timeout: 5000 });
-      const created = JSON.parse(createdRaw);
-      workspaceId = created.result?.workspace?.workspace_id; tabId = created.result?.tab?.tab_id; paneId = created.result?.root_pane?.pane_id; createdPane = Boolean(paneId);
-    } catch (err) { console.warn(`${new Date().toISOString()} [herdr] failed to create workspace for ${cwd}: ${err.message}`); }
-  }
-  if (!paneId) return {};
-  return { HERDR_ENV: "1", HERDR_SOCKET_PATH: sock, HERDR_BIN_PATH: bin, HERDR_WORKSPACE_ID: workspaceId, HERDR_TAB_ID: tabId, HERDR_PANE_ID: paneId, REMOTE_PI_CREATED_PANE: createdPane ? "1" : "0" };
-}
-
-const HERDR_STATUS_ICON = { working: "⏳", blocked: "✋", done: "✅", idle: "💤", unknown: "❔" };
-
-// /remote-control（remote-pi.ts）通过 herdr 原生 pane metadata token 标记订阅
-const HERDR_OPT_IN_TOKEN = "remote_pi";
-
-function herdrOptedIn(agent) {
-  return agent?.agent === "pi" && agent?.tokens?.[HERDR_OPT_IN_TOKEN] === "on";
+  if (!pane?.pane_id) return {};
+  return {
+    HERDR_ENV: "1", HERDR_BIN_PATH: herdrBin, HERDR_SOCKET_PATH: socketPath,
+    HERDR_PANE_ID: pane.pane_id, HERDR_WORKSPACE_ID: pane.workspace_id, HERDR_TAB_ID: pane.tab_id,
+    REMOTE_PI_CREATED_PANE: created ? "1" : "0",
+  };
 }
 
 // ref: Herdr pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
 function resolveAgentSessionFile(agent) {
-  if (agent?.agent_session?.kind === "path" && agent?.agent_session?.value) {
-    return agent.agent_session.value;
-  }
-  if (typeof agent?.agent_session?.path === "string") {
-    return agent.agent_session.path;
-  }
-  if (typeof agent?.agent_session === "string") {
-    return agent.agent_session;
-  }
+  const session = agent?.agent_session;
+  if (session?.kind === "path" && session.value) return session.value;
+  if (typeof session?.path === "string") return session.path;
+  if (typeof session === "string") return session;
   return agent?.tokens?.remote_pi_session || null;
 }
 
-function herdrTail(screen, maxLines = 30, maxChars = 2500) {
-  const lines = String(screen || "").replace(/\s+$/, "").split("\n");
-  return lines.slice(-maxLines).join("\n").slice(-maxChars).trim();
-}
+const herdrTail = (screen, maxLines = 30, maxChars = 2500) =>
+  String(screen || "").trim().split("\n").slice(-maxLines).join("\n").slice(-maxChars);
 
-// ref: Herdr socket API events.subscribe（`herdr api schema --json`；订阅后连接变为单向事件流，订阅集合变化需重连）
-// 推送负责实时性，每 15 秒 agent list 全量对账兜底（漏事件、herdr 重启、合盖睡眠）
-class HerdrWatcher {
-  constructor({ bin, socketPath, isExcluded, onTransition }) {
-    this.bin = bin;
-    this.socketPath = socketPath;
-    this.isExcluded = isExcluded;
-    this.onTransition = onTransition;
-    this.statuses = new Map();
-    this.agents = new Map();
-    this.workspaces = new Map();
-    this.socket = null;
-    this.subscribedKey = null;
-    this.syncChain = Promise.resolve();
-    this.syncTimer = null;
-    this.reconcileTimer = null;
-    this.stopped = false; }
-  async cli(args, timeout = 5000) {
-    return runCommand(this.bin, args, { timeout }); }
-  async cliJson(args, timeout = 5000) {
-    return JSON.parse(await this.cli(args, timeout)).result; }
-  start() {
-    this.stopped = false;
-    if (HERDR_DISABLED_FOR_TEST) return;
-    this.sync();
-    this.reconcileTimer = setInterval(() => this.sync(), 15_000);
-    this.reconcileTimer.unref?.(); }
-  stop() {
-    this.stopped = true;
-    clearInterval(this.reconcileTimer);
-    clearTimeout(this.syncTimer);
-    const socket = this.socket;
-    this.socket = null;
-    socket?.destroy(); }
-  scheduleSync(delay) {
-    if (HERDR_DISABLED_FOR_TEST) return;
-    clearTimeout(this.syncTimer);
-    this.syncTimer = setTimeout(() => this.sync(), delay);
-    this.syncTimer.unref?.(); }
-  sync() {
-    if (HERDR_DISABLED_FOR_TEST) return Promise.resolve();
-    this.syncChain = this.syncChain.then(() => this.doSync()).catch((error) => {
-      console.warn(`${new Date().toISOString()} [herdr] sync failed: ${error.message}`);
-      if (!this.stopped) this.scheduleSync(15_000);
-    });
-    return this.syncChain; }
-  async doSync() {
-    if (this.stopped) return;
-    const [agentList, workspaceList] = await Promise.all([this.cliJson(["agent", "list"]), this.cliJson(["workspace", "list"])]);
-    this.workspaces = new Map((workspaceList?.workspaces ?? []).map((w) => [w.workspace_id, w.label]));
-    const agents = agentList?.agents ?? [];
-    this.agents = new Map(agents.map((a) => [a.pane_id, a]));
-    for (const agent of agents) this.observe(agent.pane_id, agent.agent_status);
-    for (const paneId of this.statuses.keys()) if (!this.agents.has(paneId)) this.statuses.delete(paneId);
-    const paneIds = [...this.agents.keys()].sort();
-    if (paneIds.join(",") !== this.subscribedKey || !this.socket) this.subscribe(paneIds);
+const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
+
+async function waitForShell(bin, paneId, options, attempts) {
+  for (let i = 0; i < attempts; i++) {
+    const raw = await runCommand(bin, ["pane", "process-info", "--pane", paneId], options);
+    if (paneHasForegroundShell(JSON.parse(raw).result?.process_info)) return true;
+    if (i + 1 < attempts) await sleep(100);
   }
-
-  // 首见和重复状态不通知；完成由原生 Pi 事件处理，这里只补充 TUI 待确认提醒。
-  observe(paneId, status) {
-    const prev = this.statuses.get(paneId);
-    this.statuses.set(paneId, status);
-    if (prev === undefined || prev === status || this.isExcluded(paneId)) return;
-    if (status === "blocked") this.notify(paneId, status);
-  }
-
-  // 只推送在 Pi 里开启 /remote-control 的 pane：现取 agent get，以 pane 上的 remote_pi token 为准（默认不推送）
-  async notify(paneId, status) {
-    try {
-      const agent = (await this.cliJson(["agent", "get", paneId]))?.agent;
-      if (!agent) return;
-      this.agents.set(paneId, agent);
-      if (!herdrOptedIn(agent)) return;
-      await this.onTransition({ paneId, status, agent });
-      this.sync();
-    } catch (error) {
-      console.warn(`${new Date().toISOString()} [herdr] notify ${paneId} failed: ${error.message}`);
-    }
-  }
-
-  subscribe(paneIds) {
-    this.socket?.destroy();
-    if (HERDR_DISABLED_FOR_TEST || !this.socketPath) return;
-    this.subscribedKey = paneIds.join(",");
-    const socket = net.connect(this.socketPath);
-    socket.setEncoding("utf8");
-    this.socket = socket;
-    let buffer = "";
-    socket.on("connect", () => {
-      socket.write(`${JSON.stringify({
-        id: "remote-pi:watch",
-        method: "events.subscribe",
-        params: { subscriptions: [{ type: "pane.agent_detected" }, ...paneIds.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId }))] },
-      })}\n`);
-    });
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      let index;
-      while ((index = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, index).trim();
-        buffer = buffer.slice(index + 1);
-        if (line) this.handleLine(socket, line);
-      }
-    });
-    socket.on("error", (error) => console.warn(`${new Date().toISOString()} [herdr] event socket: ${error.message}`));
-    socket.on("close", () => {
-      if (this.socket !== socket) return;
-      this.socket = null;
-      if (!this.stopped) this.scheduleSync(5000);
-    }); }
-  handleLine(socket, line) {
-    let message;
-    try { message = JSON.parse(line); } catch { return; }
-    if (message.error) {
-      // 典型是 pane_not_found（list 与 subscribe 之间 pane 被关）；断开后由 close 回调重新对账
-      console.warn(`${new Date().toISOString()} [herdr] subscribe failed: ${message.error.message || message.error.code}`);
-      socket.destroy();
-      return;
-    }
-    if (message.event === "pane_agent_detected" || message.event === "pane.agent_detected") {
-      this.scheduleSync(300);
-    } else if (message.event === "pane.agent_status_changed" && message.data?.pane_id) {
-      const agent = this.agents.get(message.data.pane_id);
-      if (agent) agent.agent_status = message.data.agent_status;
-      this.observe(message.data.pane_id, message.data.agent_status);
-    }
-  }
-
-  label(paneId) {
-    const agent = this.agents.get(paneId);
-    const name = agent?.name || agent?.agent || "agent";
-    const where = this.workspaces.get(agent?.workspace_id) || (agent?.cwd ? basename(agent.cwd) : "");
-    return `${name}${where ? ` · ${where}` : ""} (${paneId})`;
-  }
-}
-
-function paneHasForegroundShell(info) {
-  return Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
+  return false;
 }
 
 // ref: Pi docs/rpc.md#framing; Node net IPC sockets. The directory is private and the socket is mode 0600.
 class PaneServer {
   constructor(path, onHello) {
-    this.path = path;
-    this.onHello = onHello;
-    this.connections = new Map();
-    this.sockets = new Set();
-    this.waiters = new Set();
-    this.server = null;
-    this.starting = null;
-    this.closed = false; }
+    Object.assign(this, { path, onHello, connections: new Map(), sockets: new Set(),
+      waiters: new Set(), server: null, starting: null, closed: false });
+  }
   async start() {
     if (this.server) return;
     this.starting ??= this.listen().finally(() => { this.starting = null; });
-    return this.starting; }
+    return this.starting;
+  }
   async listen() {
     this.closed = false;
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -936,13 +639,19 @@ class PaneServer {
     server.on("error", (error) => console.error(`[bridge] ${error.message}`));
     await new Promise((done, reject) => {
       server.once("error", reject);
-      server.listen(this.path, () => { server.off("error", reject); done(); });
+      server.listen(this.path, () => {
+        server.off("error", reject);
+        done();
+      });
     });
     await chmod(this.path, 0o600);
     this.server = server;
-    server.unref(); }
+    server.unref();
+  }
   find({ paneId, sessionFile }) {
-    return [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable && (sessionFile ? c.hello.sessionFile === sessionFile : paneId && c.hello.paneId === paneId)); }
+    return [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable &&
+      (sessionFile ? c.hello.sessionFile === sessionFile : paneId && c.hello.paneId === paneId));
+  }
   waitFor(predicate, timeout = 30_000) {
     return new Promise((done, reject) => {
       const finish = (error, value) => {
@@ -957,7 +666,8 @@ class PaneServer {
       const timer = setTimeout(() => finish(new Error("Timed out waiting for Pi bridge hello")), timeout);
       this.waiters.add(waiter);
       waiter.check();
-    }); }
+    });
+  }
   async stop() {
     this.closed = true;
     for (const waiter of [...this.waiters]) waiter.cancel();
@@ -971,23 +681,25 @@ class PaneServer {
 // Stopping this view or the gateway never stops the interactive Pi.
 class PaneRpc {
   constructor(session, onEvent, onClose) {
-    this.session = session;
-    this.gateway = session.gateway;
-    this.onEvent = onEvent;
-    this.onClose = onClose;
-    this.proc = null;
-    this.connection = null;
-    this.pending = new Map();
-    this.starting = null;
-    this.herdrEnv = {};
-    this.stopping = false; }
+    Object.assign(this, { session, gateway: session.gateway, onEvent, onClose, proc: null,
+      connection: null, pending: new Map(), starting: null, herdrEnv: {}, stopping: false });
+  }
   async ensureStarted() {
     if (this.proc && !this.proc.destroyed) return;
     this.starting ??= this.start().finally(() => { this.starting = null; });
-    return this.starting; }
+    return this.starting;
+  }
   async start() {
     this.stopping = false;
-    await this.gateway.ensurePaneSession(this); }
+    await this.gateway.ensurePaneSession(this);
+  }
+  finish(id, error, data = {}) {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pending.delete(id);
+    if (error) pending.reject(error); else pending.done(data);
+  }
   bind(connection) {
     this.stopping = false;
     this.connection?.clients.delete(this);
@@ -998,61 +710,50 @@ class PaneRpc {
     this.session.binding = { ...this.session.binding, paneId: connection.hello.paneId, sessionFile: connection.hello.sessionFile, cwd: connection.hello.cwd };
     this.session.cwd = connection.hello.cwd;
     for (const [id, pending] of this.pending) {
-      if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume", "fork"].includes(connection.hello.reason)) {
-        clearTimeout(pending.timer);
-        this.pending.delete(id);
-        pending.done({ cancelled: false, ...(pending.text !== undefined ? { text: pending.text } : {}) });
+      if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume"].includes(connection.hello.reason)) {
+        this.finish(id, null, { cancelled: false });
       }
     }
   }
-
   receive(record) {
+    const pending = this.pending.get(record.id);
     if (record.type === "session_replacing") {
-      const pending = this.pending.get(record.id);
-      if (pending && pending.type === record.command) { pending.replacing = true; pending.text = record.text; }
+      if (pending?.type === record.command) pending.replacing = true;
     } else if (record.type === "response") {
-      const pending = this.pending.get(record.id);
-      if (!pending || record.command !== pending.type) return;
-      clearTimeout(pending.timer);
-      this.pending.delete(record.id);
-      if (record.success) pending.done(record.data || {});
-      else pending.reject(new Error(record.error || "Pi bridge request failed"));
-    } else {
-      this.onEvent(record);
-    }
+      if (pending?.type === record.command) this.finish(record.id, record.success ? null : new Error(record.error || "Pi bridge request failed"), record.data || {});
+    } else this.onEvent(record);
   }
-
   disconnected(connection) {
     if (this.connection !== connection) return;
     this.proc = null;
     this.connection = null;
     connection.clients.delete(this);
-    let replacing = false;
+    const replacing = [...this.pending.values()].some((p) => p.replacing);
     for (const [id, pending] of this.pending) {
-      if (pending.replacing) { replacing = true; continue; }
-      clearTimeout(pending.timer);
-      this.pending.delete(id);
-      pending.reject(new Error("Pi bridge disconnected; command delivery may be incomplete"));
+      if (!pending.replacing) this.finish(id, new Error("Pi bridge disconnected; command delivery may be incomplete"));
     }
-    if (!replacing) this.onClose?.({ expected: this.stopping || this.gateway.bridge.closed }); }
+    if (!replacing) this.onClose?.({ expected: this.stopping || this.gateway.bridge.closed });
+  }
   async request(type, fields = {}, timeout = 600_000) {
     await this.ensureStarted();
     const id = `pane-${randomBytes(12).toString("hex")}`;
     return new Promise((done, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Pi bridge ${type} timed out; not retried`)); }, timeout);
+      const timer = setTimeout(() => this.finish(id, new Error(`Pi bridge ${type} timed out; not retried`)), timeout);
       this.pending.set(id, { type, done, reject, timer, from: this.session.binding.sessionFile });
-      try { this.write({ id, type, ...fields }); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
-    }); }
+      try { this.write({ id, type, ...fields }); } catch (error) {
+        this.finish(id, error);
+      }
+    });
+  }
   write(record) {
-    if (!writeJsonLine(this.proc, record)) throw new Error("Pi bridge is not connected"); }
+    if (!writeJsonLine(this.proc, record)) throw new Error("Pi bridge is not connected");
+  }
   stop() {
     this.stopping = true;
     this.connection?.clients.delete(this);
     this.connection = null;
     this.proc = null;
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error("Pi view detached")); }
-    this.pending.clear();
+    for (const id of this.pending.keys()) this.finish(id, new Error("Pi view detached"));
   }
 }
 
@@ -1066,103 +767,84 @@ class ChatSession {
     const stored = gateway.state.herdrPanes?.[this.key];
     this.binding = typeof stored === "string" ? { paneId: stored, cwd, owned: true } : { cwd, ...stored };
     this.chatId = gateway.chatId;
-
-    this.draft = null;
-    this.toolPanel = null;
-    this.queue = { steering: [], followUp: [] };
-    this.isStreaming = false;
-    this.abortedRun = false;
-    this.repliedInRun = false;
-    this.typingTimer = null;
-    this.lastModel = null;
-    this.lastPrompt = null;
-    this.mediaGroups = new Map();
-    this.eventChain = Promise.resolve();
-    this.updateChain = Promise.resolve();
-    this.runOrigin = "telegram";
-    this.lastTopicName = null;
-
-    this.pi = this.createPi(); }
-  createPi() {
-    return new PaneRpc(this, (event) => this.queueEvent(event), (exit) => {
+    Object.assign(this, {
+      run: null, lastDraftAt: -Infinity, nextOrigin: "telegram", nextTrigger: null,
+      isStreaming: false, lastModel: null, lastPrompt: null, lastTopicName: null,
+      mediaGroups: new Map(), eventChain: Promise.resolve(), updateChain: Promise.resolve(),
+    });
+    this.pi = new PaneRpc(this, (event) => this.queueEvent(event), (exit) => {
       this.handlePiExit(exit).catch((error) => console.warn(`[bridge] disconnect: ${error.message}`));
-    }); }
+    });
+  }
   threadExtra(extra = {}) { return this.threadId ? { message_thread_id: this.threadId, ...extra } : extra; }
   send(text, extra = {}) { return this.gateway.telegram.send(this.chatId, text, this.threadExtra(extra)); }
-  sendOne(text, extra = {}) { return this.gateway.telegram.sendOne(this.chatId, text, this.threadExtra(extra)); }
-  sendDocument(path, extra = {}) { return this.gateway.queueUpload(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra(extra))); }
   action(payload, ttl = 10 * 60_000) { return this.gateway.action({ ...payload, sessionKey: this.key }, ttl); }
   keyboard(items, ttl) { return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action, ttl) }]) } }; }
   queueEvent(event) {
-    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error(`Pi event [${this.key}]:`, error)); }
-  startTyping() {
-    if (this.typingTimer) return;
-    this.gateway.telegram.sendChatAction(this.chatId, "typing", this.threadExtra());
-    this.typingTimer = setInterval(() => { this.gateway.telegram.sendChatAction(this.chatId, "typing", this.threadExtra()); }, 4500);
-    this.typingTimer.unref(); }
-  stopTyping() {
-    if (this.typingTimer) { clearInterval(this.typingTimer); this.typingTimer = null; }
+    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error(`Pi event [${this.key}]:`, error));
   }
-
-  async onSessionSwitched(sessionPath = null) {
-    const state = await this.pi.request("get_state");
-    this.binding = { ...this.binding, sessionFile: sessionPath || state.sessionFile };
-    await this.gateway.persistPaneSession(this); }
+  clearRun(aborted = false) {
+    const run = this.run;
+    if (run) {
+      clearInterval(run.timer);
+      const emoji = run.error ? "💔" : aborted || run.aborted ? null : run.replied ? "👌" : "🤷";
+      void this.gateway.telegram.react(this.chatId, run.trigger, emoji);
+    }
+    this.run = null;
+    this.isStreaming = false;
+  }
+  async tickRun(now = Date.now()) {
+    const run = this.run;
+    if (!run || run.disabled || run.delivering || run.pending || now - this.lastDraftAt < 1500) return;
+    const tail = run.text ? chunks(run.text, 3500).at(-1) : "";
+    const text = [tail, run.tool ? `⚙️ ${run.tool.slice(0, 300)}` : ""].filter(Boolean).join("\n\n");
+    if (text === run.sent && now - this.lastDraftAt < 20_000) return;
+    run.sent = text;
+    this.lastDraftAt = now;
+    run.pending = this.gateway.telegram.draft(this.chatId, run.draftId, text, this.threadExtra()).catch((error) => {
+      run.disabled = true;
+      console.error(`Draft [${this.key}] disabled:`, error.message);
+    }).finally(() => { run.pending = null; });
+    await run.pending;
+  }
   async handlePiExit({ expected }) {
     if (expected) return;
-    this.stopTyping();
-    this.isStreaming = false; }
+    this.clearRun(true);
+  }
   resetSessionState() {
-    this.isStreaming = false;
-    this.stopTyping();
+    this.clearRun(true);
+    this.nextTrigger = null;
+    this.nextOrigin = "telegram";
     for (const group of this.mediaGroups.values()) {
-      if (typeof group === "object" && group !== null) {
-        if (group.timer) clearTimeout(group.timer);
-        group.cancelled = true;
-        if (group.resolveReady) group.resolveReady();
-      }
+      clearTimeout(group.timer);
+      group.cancelled = true;
+      group.resolveReady();
     }
     this.mediaGroups.clear();
     for (const [key, action] of this.gateway.actions) {
       if (action.type === "ui" && action.sessionKey === this.key) this.gateway.actions.delete(key);
     }
-    if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
-    this.toolPanel = null;
-    if (this.draft) {
-      if (this.draft.timer) clearTimeout(this.draft.timer);
-      this.draft.closed = true;
-      if (this.draft.messageId) this.gateway.telegram.deleteMessage(this.chatId, this.draft.messageId).catch(() => {});
-    }
-    this.draft = null;
-    this.queue = { steering: [], followUp: [] }; }
-  async prompt(message, images, streamingBehavior) {
-    this.runOrigin = "telegram";
-    this.startTyping();
-    if (!streamingBehavior && !this.isStreaming) this.lastPrompt = { message, images };
-    try {
-      const fields = { message };
-      if (images) fields.images = images;
-      const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
-      if (behavior) fields.streamingBehavior = behavior;
-      console.log(`${new Date().toISOString()} [prompt${this.threadId ? `:${this.threadId}` : ""}] sending to Pi (behavior=${behavior || "initial"}, chars=${message.length})`);
-      try {
-        await this.pi.request("prompt", fields);
-      } catch (error) {
-        if (!behavior && /streaming/i.test(error.message)) {
-          fields.streamingBehavior = "steer";
-          await this.pi.request("prompt", fields);
-          this.isStreaming = true;
-        } else throw error;
-      }
-      console.log(`${new Date().toISOString()} [prompt${this.threadId ? `:${this.threadId}` : ""}] accepted by Pi`);
-      if (fields.streamingBehavior === "followUp") await this.send("↪ Queued as follow-up", { disable_notification: true });
-    } catch (error) {
-      this.stopTyping();
-      throw error;
-    }
+    this.uiMessages?.clear();
   }
-
-  async handleCommand({ name, argument }, original, updateId = null) {
+  async prompt(message, images, streamingBehavior, triggerMessageId = null) {
+    const behavior = streamingBehavior || (this.isStreaming ? "steer" : undefined);
+    if (!behavior) {
+      this.lastPrompt = { message, images, triggerMessageId };
+      this.nextTrigger = triggerMessageId;
+      this.nextOrigin = "telegram";
+    }
+    const fields = { message, ...(images ? { images } : {}), ...(behavior ? { streamingBehavior: behavior } : {}) };
+    try {
+      await this.pi.request("prompt", fields);
+    } catch (error) {
+      if (behavior || !/streaming/i.test(error.message)) throw error;
+      this.nextTrigger = null;
+      await this.pi.request("prompt", { ...fields, streamingBehavior: "steer" });
+      this.isStreaming = true;
+    }
+    if (behavior === "followUp") await this.send("↪ Queued as follow-up", { disable_notification: true });
+  }
+  async handleCommand({ name, argument }, original, updateId = null, triggerMessageId = null) {
     switch (name) {
       case "start":
       case "help":
@@ -1174,9 +856,8 @@ class ChatSession {
       case "thinking": return this.showThinking(argument);
       case "resume": return this.showSessions();
       case "new": {
-        this.abortedRun = true;
+        this.clearRun(true);
         if (this.pi.proc) {
-          await this.pi.request("clear_queue").catch(() => {});
           await this.pi.request("abort").catch(() => {});
         }
         const stateBefore = this.pi.proc ? await this.pi.request("get_state").catch(() => null) : null;
@@ -1187,7 +868,6 @@ class ChatSession {
         if (this.pi.proc) {
           const result = await this.pi.request("new_session");
           if (result.cancelled) return this.send("New session cancelled");
-          await this.onSessionSwitched();
         }
         if (targetModel) {
           await this.pi.request("set_model", targetModel).catch((err) => {
@@ -1206,24 +886,18 @@ class ChatSession {
         return this.send(`✅ Session name set to: ${argument}`);
       }
       case "status": return this.showSession();
-      case "agents": return this.gateway.showHerdrAgents();
       case "compact": {
-        this.startTyping();
-        try {
-          const res = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
-          return this.send(res?.tokensBefore ? `Context compacted: ${res.tokensBefore} → ~${res.estimatedTokensAfter} tokens` : "Context compacted.");
-        } finally { this.stopTyping(); }
+        const res = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
+        return this.send(res?.tokensBefore ? `Context compacted: ${res.tokensBefore} → ~${res.estimatedTokensAfter} tokens` : "Context compacted.");
       }
       case "followup": {
         if (!argument) return this.send("Usage: /followup <message>");
-        return this.prompt(argument, undefined, "followUp");
+        return this.prompt(argument, undefined, "followUp", triggerMessageId);
       }
       case "abort": {
-        this.abortedRun = true;
+        this.clearRun(true);
         if (this.pi.proc) await this.pi.request("abort").catch(() => {});
-        const kept = this.queue;
         this.resetSessionState();
-        this.queue = kept;
         return this.send("⏹ Stopped (queued messages kept)");
       }
       case "restart": {
@@ -1243,39 +917,33 @@ class ChatSession {
         if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
           return this.send("❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
         }
-        this.startTyping();
         try {
           const res = await this.pi.request("bash", { command: argument });
           const output = res.output ? res.output.trim() : "(no output)";
           return this.send(output.split("\n").length > 3 ? expandableBlockquote(output) : output);
         } catch (error) {
           if (!/abort/i.test(error.message)) return this.send(`❌ ${error.message}`);
-        } finally { this.stopTyping(); }
+        }
         return;
       }
       default: {
         const data = await this.pi.request("get_commands");
         const targets = commandRoutes(data.commands).get(name);
         if (targets?.size > 1) return this.send(`Ambiguous command: /${name}\nMatches: ${[...targets].map((target) => `/${target}`).join(", ")}\nUse an unambiguous native name from /help, or run it in the Pi terminal.`);
-        if (targets?.size === 1) return this.prompt(`/${[...targets][0]}${argument ? ` ${argument}` : ""}`);
+        if (targets?.size === 1) return this.prompt(`/${[...targets][0]}${argument ? ` ${argument}` : ""}`, undefined, undefined, triggerMessageId);
         return this.send(`Unknown command: /${name}\nUse /help`);
       }
     }
   }
-
   async handleMediaGroup(messages) {
-    const mediaList = await Promise.all(messages.map((m) => this.gateway.extractMedia(m)));
-    const files = [], images = [];
-    let caption = "";
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].caption) caption = messages[i].caption;
-      const media = mediaList[i];
-      if (!media) continue;
-      files.push(media.saved);
-      if (media.image) images.push(media.image);
+    const media = (await Promise.all(messages.map((m) => this.gateway.extractMedia(m)))).filter(Boolean);
+    const files = media.map((m) => m.saved), images = media.map((m) => m.image).filter(Boolean);
+    const caption = messages.filter((m) => m.caption).at(-1)?.caption;
+    if (files.length || caption) {
+      await this.prompt(files.length ? attachmentPrompt(caption || "Please review these files.", files) : caption,
+        images.length ? images : undefined, undefined, messages[0]?.message_id);
     }
-    if (files.length) await this.prompt(attachmentPrompt(caption || "Please review these files.", files), images.length ? images : undefined);
-    else if (caption) await this.prompt(caption); }
+  }
   async showCommands() {
     if (!this.pi.proc) return;
     const data = await this.pi.request("get_commands");
@@ -1287,52 +955,43 @@ class ChatSession {
         : routes.get(name)?.size > 1 ? `Telegram /${name} is ambiguous; use an unambiguous native name or Pi terminal` : "";
       return `/${item.name}${item.description ? ` — ${item.description}` : ""}${issue ? ` [${issue}]` : ""}`;
     }).join("\n");
-    await this.send(text); }
-  async retryLastPrompt() {
-    const { message, images } = this.lastPrompt;
-    await this.send(`🔁 Retrying last prompt (${message.length} chars)…`);
-    await this.prompt(message, images); }
+    await this.send(text);
+  }
   async showModels(query) {
     const data = await this.pi.request("get_available_models");
     const models = data.models || [];
-    if (query) {
-      const exact = models.find((m) => `${m.provider}/${m.id}` === query || m.id === query);
-      if (exact) {
-        await this.pi.request("set_model", { provider: exact.provider, modelId: exact.id });
-        this.lastModel = { provider: exact.provider, modelId: exact.id };
-        return this.send(`✅ ${exact.provider}/${exact.id}`);
-      }
-    }
+    const exact = query && models.find((m) => `${m.provider}/${m.id}` === query || m.id === query);
+    if (exact) return this.handleCallbackAction({ type: "model", provider: exact.provider, modelId: exact.id });
     const filtered = models.filter((m) => !query || `${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()));
     if (!filtered.length) return this.send(`No matching model: ${query}`);
     const display = filtered.slice(0, 18);
     const suffix = filtered.length > 18 ? `\n\n(${filtered.length} models; showing first 18 — use /model <query> to filter)` : "";
-    return this.send(`Pick a model:${suffix}`, this.keyboard(display.map((m) => ({ label: `${m.provider}/${m.id}`, action: { type: "model", provider: m.provider, modelId: m.id } })))); }
+    return this.send(`Pick a model:${suffix}`, this.keyboard(display.map((m) => ({ label: `${m.provider}/${m.id}`, action: { type: "model", provider: m.provider, modelId: m.id } }))));
+  }
   async showThinking(argument) {
     const data = await this.pi.request("get_available_thinking_levels");
     if (argument) {
       if (!data.levels.includes(argument)) return this.send(`Available levels: ${data.levels.join(", ")}`);
-      await this.pi.request("set_thinking_level", { level: argument });
-      return this.send(`✅ thinking: ${argument}`);
+      return this.handleCallbackAction({ type: "thinking", level: argument });
     }
-    return this.send("Pick a thinking level:", this.keyboard(data.levels.map((l) => ({ label: l, action: { type: "thinking", level: l } })))); }
-  async sessionFiles() {
-    const root = process.env.PI_CODING_AGENT_SESSION_DIR || join(resolvePath(process.env.PI_CODING_AGENT_DIR || "~/.pi/agent", this.cwd), "sessions");
-    return scanDesktopSessions(resolvePath(root, this.cwd), this.cwd, 15); }
+    return this.send("Pick a thinking level:", this.keyboard(data.levels.map((l) => ({ label: l, action: { type: "thinking", level: l } }))));
+  }
   async showSessions() {
-    const sessions = (await this.sessionFiles()).slice(0, 12);
+    const { sessions } = await this.pi.request("list_sessions");
     if (!sessions.length) return this.send("No past sessions for this directory yet.");
-    return this.send("Pick a session:", this.keyboard(sessions.map((s) => ({ label: s.title, action: { type: "resume", path: s.path } })))); }
+    return this.send("Pick a session:", this.keyboard(sessions.map((s) => ({ label: s.title, action: { type: "resume", path: s.path } }))));
+  }
   async showSession() {
     const [state, stats] = await Promise.all([this.pi.request("get_state"), this.pi.request("get_session_stats")]);
     const model = state.model ? `${state.model.provider}/${state.model.id}` : "none";
     const context = stats.contextUsage ? `${stats.contextUsage.tokens ?? "?"}/${stats.contextUsage.contextWindow} (${stats.contextUsage.percent ?? "?"}%)` : "n/a";
     const lines = [
       `Name: ${state.sessionName || "(unnamed)"}`, `Model: ${model}`, `Thinking: ${state.thinkingLevel}`,
-      `State: ${state.isStreaming ? "working" : "idle"}`, `Messages: ${stats.totalMessages}`, `Context: ${context}`,
+      `State: ${state.isStreaming ? "working" : "idle"}`, `Context: ${context}`,
       `Cost: $${Number(stats.cost || 0).toFixed(4)}`, `Session: ${state.sessionId}`, `File: ${state.sessionFile || "not persisted"}`,
     ];
-    await this.send(lines.join("\n")); }
+    await this.send(lines.join("\n"));
+  }
   async handleCallbackAction(action, callback) {
     if (action.type === "jump_pane") {
       const connection = this.gateway.bridge.connections.get(action.paneId);
@@ -1354,7 +1013,9 @@ class ChatSession {
     } else if (action.type === "retry") {
       if (!this.lastPrompt) return this.send("No prompt to retry");
       if (this.isStreaming) return this.send("⚠️ Still streaming; /abort first");
-      await this.retryLastPrompt();
+      const { message, images, triggerMessageId } = this.lastPrompt;
+      await this.send(`🔁 Retrying last prompt (${message.length} chars)…`);
+      await this.prompt(message, images, undefined, triggerMessageId);
     } else if (action.type === "thinking") {
       await this.pi.request("set_thinking_level", { level: action.level });
       await this.send(`✅ thinking: ${action.level}`);
@@ -1368,11 +1029,6 @@ class ChatSession {
       if (this.isStreaming) await this.pi.request("abort").catch(() => {});
       this.resetSessionState();
       const result = await this.pi.request("switch_session", { sessionPath: action.path });
-      if (!result.cancelled) {
-        const state = await this.pi.request("get_state").catch(() => null);
-        if (state?.model?.provider && state?.model?.id) this.lastModel = { provider: state.model.provider, modelId: state.model.id };
-        await this.onSessionSwitched(action.path);
-      }
       await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
     } else if (action.type === "ui") {
       for (const [k, v] of this.gateway.actions) {
@@ -1385,30 +1041,22 @@ class ChatSession {
       }
     }
   }
-
   async handleEvent(event) {
     if (event.type === "remote_user_input") {
-      this.runOrigin = "terminal";
+      this.nextOrigin = "terminal";
+      this.nextTrigger = null;
       await this.send(`🖥 ${event.text}`, { disable_notification: true });
       return;
     }
     if (event.type === "session_info_changed") {
-      if (this.threadId) {
-        const prefix = this.binding?.owned === false ? "📡 " : "";
-        const base = (event.name || basename(this.cwd) || "topic").trim();
-        const newName = `${prefix}${base}`.slice(0, 128);
-        if (this.lastTopicName !== newName) {
-          this.lastTopicName = newName;
-          // ref: Telegram Bot API editForumTopic works in private chats with topics enabled (https://core.telegram.org/bots/api#editforumtopic)
-          await this.gateway.telegram.call("editForumTopic", {
-            chat_id: this.chatId,
-            message_thread_id: this.threadId,
-            name: newName,
-          }).catch((err) => {
-            console.warn(`[topic] failed to rename topic ${this.threadId}: ${err.message}`);
-          });
-        }
-      }
+      if (!this.threadId) return;
+      const prefix = this.binding.owned === false ? "📡 " : "";
+      const newName = `${prefix}${(event.name || basename(this.cwd) || "topic").trim()}`.slice(0, 128);
+      if (this.lastTopicName === newName) return;
+      this.lastTopicName = newName;
+      // ref: https://core.telegram.org/bots/api#editforumtopic — private chats support topic names.
+      await this.gateway.telegram.call("editForumTopic", { chat_id: this.chatId, message_thread_id: this.threadId, name: newName })
+        .catch((error) => console.warn(`[topic] failed to rename topic ${this.threadId}: ${error.message}`));
       return;
     }
     if (event.type === "extension_ui_resolved") {
@@ -1420,222 +1068,78 @@ class ChatSession {
       if (messageId) await this.gateway.telegram.call("editMessageReplyMarkup", { chat_id: this.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
       return;
     }
-    if (event.type === "agent_start") {
+    if (event.type === "agent_start" && !this.run) {
       this.isStreaming = true;
-      this.repliedInRun = false;
-      this.abortedRun = false;
-      this.startTyping();
-      if (this.toolPanel?.timer) clearTimeout(this.toolPanel.timer);
-      this.toolPanel = null;
-      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_start`);
+      this.run = {
+        trigger: this.nextTrigger, origin: this.nextOrigin, draftId: randomBytes(4).readUInt32BE() || 1,
+        text: "", tool: null, replied: false, error: false, aborted: false,
+      };
+      this.nextTrigger = null;
+      this.nextOrigin = "telegram";
+      void this.gateway.telegram.react(this.chatId, this.run.trigger, "👨‍💻");
+      void this.tickRun();
+      this.run.timer = setInterval(() => { void this.tickRun(); }, 1000).unref();
     }
-    if (event.type === "agent_settled") {
-      this.isStreaming = false;
-      this.stopTyping();
-      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] agent_settled`);
-      if (this.toolPanel && this.toolPanel.tools.length) {
-        for (const tool of this.toolPanel.tools) {
-          if (tool.status === "running") tool.status = "done";
-        }
-        this.scheduleToolPanelUpdate(true, true);
-      }
-      if (this.draft?.text) {
-        this.repliedInRun = true;
-        const draft = this.draft;
-        this.draft = null;
-        if (draft.timer) clearTimeout(draft.timer);
-        draft.closed = true;
-        this.gateway.queueTelegram(() => this.finishDraft(draft));
-      }
-      this.abortedRun = false;
-      this.runOrigin = "telegram";
-    }
-    if (event.type === "queue_update") {
-      this.queue = { steering: event.steering, followUp: event.followUp };
-    }
+    if (event.type === "agent_settled") this.clearRun(event.aborted);
     if (!this.gateway.chatReady) return;
-
     if (event.type === "compaction_end" && event.errorMessage) {
-      const extra = this.gateway.isUserPresent() ? { disable_notification: true } : {};
-      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`, extra); }
-    if (event.type === "message_start" && event.message?.role === "assistant") {
-      this.draft = { text: "", messageId: null, timer: null, closed: false };
+      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`, { disable_notification: true });
     }
-    if (event.type === "message_update") {
-      const update = event.assistantMessageEvent;
-      if (update?.type === "text_delta" && this.draft) {
-        this.draft.text += update.delta;
-        if (!this.draft.timer) {
-          const draft = this.draft;
-          draft.timer = setTimeout(() => {
-            draft.timer = null;
-            if (draft.flushQueued) return;
-            draft.flushQueued = true;
-            this.gateway.queueTelegram(() => {
-              draft.flushQueued = false;
-              return this.flushDraft(draft);
-            });
-          }, 1200);
+    const run = this.run;
+    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta" && run) {
+      run.text += event.assistantMessageEvent.delta;
+    }
+    if (event.type === "message_end" && event.message?.role === "assistant" && run) {
+      const message = event.message;
+      let text = extractText(message.content);
+      if (message.stopReason === "aborted") run.aborted = true;
+      if (message.stopReason === "error" || message.errorMessage) {
+        run.error = true;
+        text = [text, formatAssistantError(message.errorMessage)].filter(Boolean).join("\n\n");
+      }
+      run.delivering = true;
+      try {
+        await run.pending;
+        if (this.run !== run) return;
+        if (text) {
+          const extra = { disable_notification: message.stopReason === "toolUse" || run.origin !== "telegram" || this.gateway.isUserPresent() };
+          if ((message.stopReason === "error" || message.errorMessage) && this.lastPrompt) {
+            Object.assign(extra, this.keyboard([{ label: "🔁 Retry", action: { type: "retry" } }]));
+          }
+          await this.send(text, extra);
+          run.replied = true;
         }
-      }
+        run.text = "";
+        run.draftId = randomBytes(4).readUInt32BE() || 1;
+      } finally { run.delivering = false; }
     }
-    if (event.type === "message_end" && event.message?.role === "assistant") {
-      if (event.message.stopReason === "aborted") this.abortedRun = true;
-      const draft = this.draft || { text: "", messageId: null, timer: null };
-      this.draft = null;
-      if (draft.timer) clearTimeout(draft.timer);
-      draft.closed = true;
-      const content = extractText(event.message.content);
-      if (content) draft.text = content;
-      if (event.message.stopReason === "error" || event.message.errorMessage) {
-        const errText = formatAssistantError(event.message.errorMessage);
-        draft.text = draft.text ? `${draft.text}\n\n${errText}` : errText;
-        draft.isError = true;
-      }
-      const outTok = event.message.usage?.output;
-      console.log(`${new Date().toISOString()} [run${this.threadId ? `:${this.threadId}` : ""}] message_end (${outTok ? `${outTok} tokens` : "assistant"}${event.message.stopReason ? `, reason: ${event.message.stopReason}` : ""})`);
-      if (draft.text) {
-        this.repliedInRun = true;
-        this.gateway.queueTelegram(() => this.finishDraft(draft));
-      }
-    }
-
     if (event.type === "tool_execution_start") {
-      if (!this.toolPanel) this.toolPanel = { messageId: null, tools: [], timer: null, sending: false };
-      const summary = toolSummary(event.toolName, event.args);
-      console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] start: ${event.toolName}`);
-      this.toolPanel.tools.push({
-        id: event.toolCallId,
-        summary,
-        status: "running",
-        startedAt: Date.now(),
-      });
-      this.scheduleToolPanelUpdate(false, false);
+      if (run) run.tool = toolSummary(event.toolName, event.args);
+      // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — never log tool arguments.
+      console.log(`[tool] start: ${event.toolName}`);
     }
     if (event.type === "tool_execution_end") {
-      if (this.toolPanel) {
-        const tool = this.toolPanel.tools.find((item) => item.id === event.toolCallId);
-        if (tool) tool.status = event.isError ? "error" : "done";
-        const dur = tool ? `${Date.now() - tool.startedAt}ms` : "?";
-        console.log(`${new Date().toISOString()} [tool${this.threadId ? `:${this.threadId}` : ""}] end: ${event.toolName} (${event.isError ? "error" : "done"}, took ${dur})`);
-        this.scheduleToolPanelUpdate(false, false);
-      }
+      if (run) run.tool = null;
       if (event.toolName === "remote_attach" && !event.isError) {
         const rawPaths = event.result?.details?.paths || event.args?.paths || [];
         const paths = event.result?.details?.paths ? rawPaths : rawPaths.map((p) => resolve(this.cwd, p));
         for (const path of paths) {
-          this.gateway.queueUpload(async () => {
-            try { await this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra()); }
-            catch (error) { await this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`); }
-          });
+          this.gateway.queueUpload(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra())
+            .catch((error) => this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`)));
         }
       }
     }
     if (event.type === "extension_ui_request") await this.handleUiRequest(event);
-    if (event.type === "extension_error") await this.send(`❌ Extension ${event.extensionPath}: ${event.error}`); }
-  scheduleToolPanelUpdate(force = false, isSettled = false) {
-    if (!this.toolPanel) return;
-    if (force) {
-      if (this.toolPanel.timer) {
-        clearTimeout(this.toolPanel.timer);
-        this.toolPanel.timer = null;
-      }
-      this.gateway.queueTelegram(() => this.flushToolPanel(isSettled));
-      return;
-    }
-    if (!this.toolPanel.messageId && !this.toolPanel.sending) {
-      this.toolPanel.sending = true;
-      this.gateway.queueTelegram(() => this.flushToolPanel(false));
-      return;
-    }
-    if (!this.toolPanel.timer) {
-      this.toolPanel.timer = setTimeout(() => {
-        if (this.toolPanel) {
-          this.toolPanel.timer = null;
-          this.gateway.queueTelegram(() => this.flushToolPanel(false));
-        }
-      }, 1200);
-    }
+    if (event.type === "extension_error") await this.send(`❌ Extension ${event.extensionPath}: ${event.error}`);
   }
-
-  async flushToolPanel(isSettled = false) {
-    if (!this.toolPanel || !this.toolPanel.tools.length) return;
-    const text = renderToolPanel(this.toolPanel.tools, isSettled);
-    if (!text) return;
-    try {
-      if (this.toolPanel.messageId) {
-        await this.gateway.telegram.edit(this.chatId, this.toolPanel.messageId, text);
-      } else {
-        const sent = await this.sendOne(text, { disable_notification: true });
-        if (this.toolPanel) this.toolPanel.messageId = sent.message_id;
-      }
-    } finally {
-      if (this.toolPanel) this.toolPanel.sending = false;
-    }
-  }
-
-  async flushDraft(draft) {
-    if (!draft.text || draft.flushing || draft.closed) return;
-    if (this.gateway.telegram.retryNotBefore > Date.now()) return;
-    draft.flushing = true;
-    try {
-      const text = previewText(draft.text);
-      if (text === draft.sentPreview) return;
-      if (draft.messageId) {
-        await this.gateway.telegram.edit(this.chatId, draft.messageId, text, true);
-      } else {
-        const sent = await this.sendOne(text, { disable_notification: true });
-        draft.messageId = sent.message_id;
-      }
-      draft.sentPreview = text;
-    } catch (error) {
-      console.error(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] preview update failed:`, error.message);
-    } finally {
-      draft.flushing = false;
-    }
-  }
-
-  async finishDraft(draft) {
-    if (!draft.text) return;
-    draft.closed = true;
-    try {
-      const parts = chunks(draft.text);
-      const retryMarkup = (draft.isError && this.lastPrompt) ? {
-        reply_markup: {
-          inline_keyboard: [[{ text: "🔁 Retry", callback_data: this.action({ type: "retry" }, 60 * 60_000) }]],
-        },
-      } : {};
-      if (draft.messageId) {
-        const extra0 = parts.length === 1 ? retryMarkup : {};
-        await this.gateway.telegram.edit(this.chatId, draft.messageId, parts[0], false, extra0);
-        for (let i = 1; i < parts.length; i++) {
-          const extra = i === parts.length - 1 ? retryMarkup : {};
-          await this.sendOne(parts[i], extra);
-        }
-      } else {
-        for (let i = 0; i < parts.length; i++) {
-          const extra = i === parts.length - 1 ? retryMarkup : {};
-          await this.sendOne(parts[i], extra);
-        }
-      }
-      console.log(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] final reply sent (${parts.length} parts)`);
-    } catch (error) {
-      console.error(`${new Date().toISOString()} [ui${this.threadId ? `:${this.threadId}` : ""}] final reply delivery failed:`, error.message);
-      await this.send(`❌ Reply delivery failed: ${error.message}`).catch(() => {});
-    }
-  }
-
   async handleUiRequest(request) {
-    if (request.method === "select") {
-      const options = request.options.map((value) => ({ label: value, response: { value } }));
-      const sent = await this.send([request.title, request.message].filter(Boolean).join("\n"), this.keyboard(options.map((option) => ({
-        label: option.label, action: { type: "ui", requestId: request.id, response: option.response },
-      }))));
-      this.uiMessages ||= new Map();
-      if (sent?.message_id) this.uiMessages.set(request.id, sent.message_id);
-    }
+    if (request.method !== "select") return;
+    const sent = await this.send([request.title, request.message].filter(Boolean).join("\n"), {
+      ...this.keyboard(request.options.map((value) => ({ label: value, action: { type: "ui", requestId: request.id, response: { value } } }))),
+      disable_notification: this.gateway.isUserPresent(),
+    });
+    if (sent?.message_id) (this.uiMessages ||= new Map()).set(request.id, sent.message_id);
   }
-
   stop() {
     this.resetSessionState();
     this.pi?.stop?.();
@@ -1644,39 +1148,21 @@ class ChatSession {
 
 class Gateway {
   constructor(config) {
-    this.config = config;
-    this.chatId = config.allowedUserId;
-    this.chatReady = false;
-    this.state = loadState(config.stateDir);
-    this.telegram = new Telegram(config.botToken, join(config.stateDir, "telegram-offset"));
-    this.actions = new Map();
-    this.als = new AsyncLocalStorage();
-    this.telegramChain = Promise.resolve();
-    this.uploadChain = Promise.resolve();
-    this.stateWriteChain = Promise.resolve();
-    this.downloadCleanupTimer = null;
-    this.herdrWatcher = null;
-    this.herdrMessages = new Map();
-    this.bridge = new PaneServer(join(config.stateDir, "bridge.sock"), (connection) => this.onPaneHello(connection));
-    this.paneStartChain = Promise.resolve();
-    this.herdrEnvironment = null;
-
-    const origSend = this.telegram.send.bind(this.telegram);
-    this.telegram.send = (chatId, text, extra = {}) =>
-      this.queueTelegram(() => origSend(chatId, text, extra));
-
-    const origSendOne = this.telegram.sendOne.bind(this.telegram);
-    this.telegram.sendOne = (chatId, text, extra = {}) =>
-      this.queueTelegram(() => origSendOne(chatId, text, extra));
-
-    const origEdit = this.telegram.edit.bind(this.telegram);
-    this.telegram.edit = (chatId, messageId, text, ephemeral = false) =>
-      this.queueTelegram(() => origEdit(chatId, messageId, text, ephemeral));
-
+    Object.assign(this, {
+      config, chatId: config.allowedUserId, chatReady: false, state: loadState(config.stateDir),
+      telegram: new Telegram(config.botToken, join(config.stateDir, "telegram-offset")), actions: new Map(),
+      als: new AsyncLocalStorage(), telegramChain: Promise.resolve(), uploadChain: Promise.resolve(),
+      stateWriteChain: Promise.resolve(), paneStartChain: Promise.resolve(), downloadCleanupTimer: null,
+      blockedTimer: null, blockedStatuses: new Map(), blockedPolling: false, herdrEnvironment: null,
+      bridge: new PaneServer(join(config.stateDir, "bridge.sock"), (connection) => this.onPaneHello(connection)),
+    });
+    for (const method of ["send", "sendOne", "edit"]) {
+      const original = this.telegram[method].bind(this.telegram);
+      this.telegram[method] = (...args) => this.queueTelegram(() => original(...args));
+    }
     this.sessions = new Map();
     this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd });
     this.sessions.set("main", this.mainSession);
-
     // 延迟初始化 state.json 中持久化的有效 topic 会话
     for (const [threadId, info] of Object.entries(this.state.topics || {})) {
       if (info?.cwd && existsSync(info.cwd)) {
@@ -1685,21 +1171,17 @@ class Gateway {
       }
     }
   }
-
   // ref: Claude Code Remote Control CLAUDE_CLIENT_PRESENCE_FILE skips phone pushes while present (https://code.claude.com/docs/en/remote-control)
   isUserPresent() {
-    if (!this.config?.presenceFile) return false;
     try {
-      return Boolean(statSync(this.config.presenceFile, { throwIfNoEntry: false }));
-    } catch {
-      return false;
-    }
+      return Boolean(this.config?.presenceFile && statSync(this.config.presenceFile, { throwIfNoEntry: false }));
+    } catch { return false; }
   }
-
   async persistPaneSession(session) {
     this.state.herdrPanes = { ...this.state.herdrPanes, [session.key]: { ...session.binding, cwd: session.cwd } };
     if (session.threadId !== null) this.state.topics[session.threadId] = { ...this.state.topics[session.threadId], cwd: session.cwd };
-    await this.saveState({ herdrPanes: this.state.herdrPanes, topics: this.state.topics }); }
+    await this.saveState({ herdrPanes: this.state.herdrPanes, topics: this.state.topics });
+  }
   async onPaneHello(connection) {
     const hello = connection.hello;
     let targets = [...this.sessions.values()].filter((s) => s.binding.paneId === hello.paneId || s.binding.sessionFile === hello.sessionFile);
@@ -1712,22 +1194,16 @@ class Gateway {
       }
       const topicName = hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi";
       const topicTitle = `📡 ${topicName}`.slice(0, 128);
-      const created = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: topicTitle });
-      const threadId = created.message_thread_id;
+      const { message_thread_id: threadId } = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: topicTitle });
       const session = new ChatSession(this, { threadId, cwd: hello.cwd });
       session.lastTopicName = topicTitle;
       session.binding = { paneId: hello.paneId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false };
       this.sessions.set(session.key, session);
       targets = [session];
       await session.send(`📡 Remote control on — ${hello.paneId}\n${hello.cwd}\nThe terminal and this topic share one Pi session.`);
-      if (hello.recent && (hello.recent.lastUserText || hello.recent.lastAssistantText)) {
-        const parts = [];
-        if (hello.recent.lastUserText) parts.push(`👤 ${hello.recent.lastUserText}`);
-        if (hello.recent.lastAssistantText) parts.push(`🤖 ${hello.recent.lastAssistantText}`);
-        if (parts.length) {
-          await session.send(parts.join("\n\n"), { disable_notification: true });
-        }
-      }
+      const recent = [["👤", hello.recent?.lastUserText], ["🤖", hello.recent?.lastAssistantText]]
+        .filter(([, text]) => text).map(([icon, text]) => `${icon} ${text}`);
+      if (recent.length) await session.send(recent.join("\n\n"), { disable_notification: true });
     }
     for (const session of targets) {
       if (session.threadId && !session.lastTopicName) {
@@ -1746,7 +1222,6 @@ class Gateway {
       if (wasUnbound && session.threadId === null) this.registerBotCommands().catch(() => {});
     }
   }
-
   async liveSessionPane(sessionFile) {
     const connected = this.bridge.find({ sessionFile });
     if (connected) return connected.hello.paneId;
@@ -1754,37 +1229,35 @@ class Gateway {
     if (!env?.HERDR_BIN_PATH) return null;
     const raw = await runCommand(env.HERDR_BIN_PATH, ["agent", "list"], { env: { ...process.env, ...env }, timeout: 5000 });
     const data = JSON.parse(raw);
-    return (data.result?.agents || data.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null; }
+    return (data.result?.agents || data.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
+  }
   ensurePaneSession(rpc, options = {}) {
     // Serialize starts, including sessions arriving concurrently from different topics.
     const work = this.paneStartChain.then(() => this.startPaneSession(rpc, options));
     this.paneStartChain = work.catch(() => {});
     return work;
   }
-
   // Returns true when rpc ends up bound to a live Pi pane. spawn:false attaches only —
   // a gateway (re)start must never create workspaces or launch Pi processes by itself.
   async startPaneSession(rpc, { spawn = true } = {}) {
     const session = rpc.session;
     if (HERDR_DISABLED_FOR_TEST && !this.bridge.server) throw new Error("Self-test must provide a fake connected pane");
     await this.bridge.start();
-    const existing = this.bridge.find(session.binding);
-    if (existing) {
-      rpc.bind(existing);
+    let connection = this.bridge.find(session.binding);
+    const file = session.binding.sessionFile;
+    const livePane = !connection && file ? await this.liveSessionPane(file) : null;
+    if (livePane) {
+      const env = this.herdrEnvironment;
+      const options = { env: { ...process.env, ...env }, timeout: 5000 };
+      if (!await waitForShell(env.HERDR_BIN_PATH, livePane, options, 1)) {
+        // A live Pi without hello is not permission to create another writer.
+        connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
+      }
+    }
+    if (connection) {
+      rpc.bind(connection);
       await this.persistPaneSession(session);
       return true;
-    }
-    const file = session.binding.sessionFile;
-    const livePane = file ? await this.liveSessionPane(file) : null;
-    if (livePane) {
-      const nativeEnv = this.herdrEnvironment;
-      const raw = await runCommand(nativeEnv.HERDR_BIN_PATH, ["pane", "process-info", "--pane", livePane], { env: { ...process.env, ...nativeEnv }, timeout: 5000 });
-      if (!paneHasForegroundShell(JSON.parse(raw).result?.process_info)) {
-        // A running Pi without hello is not permission to create another writer (or another workspace).
-        rpc.bind(await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane));
-        await this.persistPaneSession(session);
-        return true;
-      }
     }
     if (!spawn) return false;
     if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test must provide a fake connected pane");
@@ -1792,6 +1265,7 @@ class Gateway {
       persistedPaneId: session.binding.paneId,
       excludePaneIds: this.getOwnedPaneIds(session), threadId: session.threadId,
       paneEnv: { REMOTE_PI_ATTACH: "1", REMOTE_PI_BRIDGE_SOCKET: this.bridge.path },
+      herdrBin: this.herdrEnvironment?.HERDR_BIN_PATH, socketPath: this.herdrEnvironment?.HERDR_SOCKET_PATH,
     });
     if (!env.HERDR_PANE_ID) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
     this.herdrEnvironment = env;
@@ -1803,32 +1277,23 @@ class Gateway {
     await this.persistPaneSession(session);
     const raw = await runCommand(bin, ["pane", "get", paneId], options);
     const pane = JSON.parse(raw).result?.pane;
-    let shell = false;
-    for (let i = 0; i < 10; i++) {
-      const info = JSON.parse(await runCommand(bin, ["pane", "process-info", "--pane", paneId], options)).result?.process_info;
-      if (paneHasForegroundShell(info)) { shell = true; break; }
-      if (env.REMOTE_PI_CREATED_PANE !== "1") break;
-      await sleep(100);
-    }
-    if (!shell) {
-      if (pane?.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
-      const connection = await this.bridge.waitFor((c) => c.hello.paneId === paneId);
-      rpc.bind(connection);
-      await this.persistPaneSession(session);
-      return true;
-    }
-    this.startHerdrWatcher();
+    const shell = await waitForShell(bin, paneId, options, env.REMOTE_PI_CREATED_PANE === "1" ? 10 : 1);
+    if (!shell && pane?.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
     // ref: Herdr CLI agent start requires a foreground shell; never send an export into another application.
-    if (env.REMOTE_PI_CREATED_PANE !== "1") {
+    if (shell && env.REMOTE_PI_CREATED_PANE !== "1") {
       await runCommand(bin, ["pane", "run", paneId, `export REMOTE_PI_ATTACH=1 REMOTE_PI_BRIDGE_SOCKET=${shellQuote(this.bridge.path)}`], options);
     }
     const waiting = this.bridge.waitFor((c) => c.hello.paneId === paneId);
     // Attach a rejection handler immediately; agent start can take longer than the hello deadline.
     waiting.catch(() => {});
-    await runCommand(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--", ...(file ? ["--session", file] : [])], { ...options, timeout: 45_000 });
+    if (shell) {
+      await runCommand(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--", ...(file ? ["--session", file] : [])],
+        { ...options, timeout: 45_000 });
+    }
     rpc.bind(await waiting);
     await this.persistPaneSession(session);
-    return true; }
+    return true;
+  }
   async closePaneSession(session) {
     const otherViews = [...this.sessions.values()].filter((s) => s !== session && s.binding.paneId === session.binding.paneId);
     for (const other of otherViews) {
@@ -1843,48 +1308,30 @@ class Gateway {
       const bin = env.HERDR_BIN_PATH;
       if (bin) {
         const options = { env: { ...process.env, ...env }, timeout: 3000 };
-        let shell = false;
-        for (let i = 0; i < 30; i++) {
-          const raw = await runCommand(bin, ["pane", "process-info", "--pane", session.binding.paneId], options);
-          const info = JSON.parse(raw).result?.process_info;
-          if (paneHasForegroundShell(info)) { shell = true; break; }
-          await sleep(100);
-        }
+        const shell = await waitForShell(bin, session.binding.paneId, options, 30);
         if (!shell) throw new Error("Pi has not exited; pane and topic were kept");
         await runCommand(bin, ["pane", "close", session.binding.paneId], options);
       }
     }
-    session.stop(); }
-  getSession(key) {
-    return this.sessions.get(key); }
+    session.stop();
+  }
   getOrCreateSession(message) {
     const key = sessionKeyOf(message);
-    let session = this.sessions.get(key);
-    if (!session) {
-      if (key.startsWith("t:")) {
-        const threadId = Number(key.slice(2));
-        const mainCwd = this.mainSession.cwd;
-        session = new ChatSession(this, { threadId, cwd: mainCwd });
-        this.sessions.set(key, session);
-        this.state.topics[threadId] = { cwd: mainCwd };
-        this.saveState({ topics: this.state.topics }).catch((err) => {
-          console.warn(`[state] failed to persist new topic ${threadId}: ${err.message}`);
-        });
-        session.send(`Topic session started with workspace:\n${mainCwd}\n\nUse /cwd to switch to another project.`);
-      } else {
-        session = this.mainSession;
-      }
-    }
-    return session; }
+    if (this.sessions.has(key)) return this.sessions.get(key);
+    if (!key.startsWith("t:")) return this.mainSession;
+    const threadId = Number(key.slice(2)), cwd = this.mainSession.cwd;
+    const session = new ChatSession(this, { threadId, cwd });
+    this.sessions.set(key, session);
+    this.state.topics[threadId] = { cwd };
+    void this.saveState({ topics: this.state.topics });
+    void session.send(`Topic session started with workspace:\n${cwd}\n\nUse /topic <path> for another project.`);
+    return session;
+  }
   getOwnedPaneIds(excludingSession = null) {
-    const panes = new Set();
-    for (const [key, session] of this.sessions.entries()) {
-      if (session !== excludingSession && (!excludingSession?.binding.paneId || session.binding.paneId !== excludingSession.binding.paneId)) {
-        if (session.pi?.herdrEnv?.HERDR_PANE_ID) panes.add(session.pi.herdrEnv.HERDR_PANE_ID);
-        if (this.state.herdrPanes?.[key]) panes.add(this.state.herdrPanes[key].paneId || this.state.herdrPanes[key]);
-      }
-    }
-    return [...panes]; }
+    return [...new Set([...this.sessions.values()]
+      .filter((s) => s !== excludingSession && (!excludingSession?.binding.paneId || s.binding.paneId !== excludingSession.binding.paneId))
+      .map((s) => s.pi?.herdrEnv?.HERDR_PANE_ID || s.binding.paneId).filter(Boolean))];
+  }
   async start() {
     // launchd 以 O_APPEND 持有日志 fd，newsyslog 处理不了这种 fd；启动时截断 + 每小时巡检（服务极少重启，只靠启动截断等于没截）
     const trimLog = () => stat(this.config.logFile).then((s) => s.size > MAX_LOG_SIZE ? truncate(this.config.logFile, 0) : null).catch(() => {});
@@ -1892,14 +1339,10 @@ class Gateway {
     setInterval(trimLog, 60 * 60_000).unref();
     // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — protect log and state permissions
     await chmod(this.config.logFile, 0o600).catch(() => {});
-    await Promise.all([
-      mkdir(this.config.stateDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.config.downloadsDir, { recursive: true, mode: 0o700 }),
-    ]);
-    await Promise.all([
-      chmod(this.config.stateDir, 0o700).catch(() => {}),
-      chmod(this.config.downloadsDir, 0o700).catch(() => {}),
-    ]);
+    for (const dir of [this.config.stateDir, this.config.downloadsDir]) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await chmod(dir, 0o700).catch(() => {});
+    }
     await this.acquireLock();
     if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test cannot start the gateway");
     try {
@@ -1909,33 +1352,28 @@ class Gateway {
     } catch { throw new Error("Herdr is required: install herdr and ensure its server is reachable"); }
     await this.bridge.start();
     await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
-    const me = await this.telegram.call("getMe");
-    this.me = me;
-    try { await this.telegram.call("getChat", { chat_id: this.chatId }); this.chatReady = true; }
-    catch (error) { if (!error.message.includes("chat not found")) throw error; }
-    let state;
-    let attached = false;
-    {
-      // Startup only re-attaches to a Pi pane that is still running; if none is, the first message
-      // spawns one via the lazy path (PaneRpc.ensureStarted → startPaneSession). Never spawn here.
-      attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
-      if (attached) {
-        state = await this.mainSession.pi.request("get_state").catch(() => null);
-        if (state?.model?.provider && state?.model?.id) {
-          this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
-        }
-      }
+    this.me = await this.telegram.call("getMe");
+    try {
+      await this.telegram.call("getChat", { chat_id: this.chatId });
+      this.chatReady = true;
+    } catch (error) {
+      if (!error.message.includes("chat not found")) throw error;
     }
+    // Startup attaches only; the first message owns lazy Pi startup.
+    const attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
+    const state = attached ? await this.mainSession.pi.request("get_state").catch(() => null) : null;
+    if (state?.model) this.mainSession.lastModel = { provider: state.model.provider, modelId: state.model.id };
     await this.registerBotCommands();
-    this.startHerdrWatcher();
+    this.startBlockedPoller();
     for (const connection of this.bridge.connections.values()) await this.onPaneHello(connection);
     this.cleanupDownloads();
     this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000);
     this.downloadCleanupTimer.unref?.();
     const sessionInfo = state?.sessionId ? `session ${state.sessionId}` : (attached ? "attached" : "not attached (starts on first message)");
-    console.log(`${new Date().toISOString()} @${me.username} ready; Pi ${sessionInfo}`);
+    console.log(`${new Date().toISOString()} @${this.me.username} ready; Pi ${sessionInfo}`);
     await this.completeRestart();
-    await this.telegram.poll((update) => this.dispatchUpdate(update)); }
+    await this.telegram.poll((update) => this.dispatchUpdate(update));
+  }
   async completeRestart() {
     const messageId = this.state.pendingRestartMessageId;
     if (!messageId) return;
@@ -1946,7 +1384,6 @@ class Gateway {
       console.warn(`[restart] failed to update restart notice: ${error.message}`);
     }
   }
-
   async saveDownload(fileId, name, needsBase64 = false) {
     const file = await this.telegram.call("getFile", { file_id: fileId });
     const response = await fetch(`${this.telegram.fileBase}/${file.file_path}`, { signal: AbortSignal.timeout(120_000) });
@@ -1956,62 +1393,50 @@ class Gateway {
     const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
     await writeFile(path, buffer);
     console.log(`${new Date().toISOString()} [download] ${name} (${buffer.length} bytes)`);
-    return { path, data: needsBase64 ? buffer.toString("base64") : null }; }
+    return { path, data: needsBase64 ? buffer.toString("base64") : null };
+  }
   queueTelegram(work) {
     if (this.als.getStore()) return work();
     const next = this.telegramChain.then(() => this.als.run(true, work));
     this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
-    return next; }
+    return next;
+  }
   queueUpload(work) {
     const next = this.uploadChain.then(work);
     this.uploadChain = next.catch((error) => console.error("Upload output:", error));
     return next;
   }
-
   // Downloads expire after a fixed 30 days.
   async cleanupDownloads() {
-    const cutoff = Date.now() - 30 * 24 * 60 * 60_000;
-    let removed = 0;
     try {
-      const entries = await readdir(this.config.downloadsDir, { withFileTypes: true }).catch(() => []);
-      for (const entry of entries) {
+      for (const entry of await readdir(this.config.downloadsDir, { withFileTypes: true })) {
         if (!entry.isFile()) continue;
         const path = join(this.config.downloadsDir, entry.name);
-        try {
-          const s = await stat(path);
-          if (s.mtimeMs < cutoff) {
-            await unlink(path).catch(() => {});
-            removed++;
-          }
-        } catch {}
+        const info = await stat(path).catch(() => null);
+        if (info && info.mtimeMs < Date.now() - 30 * 24 * 60 * 60_000) await unlink(path).catch(() => {});
       }
-      if (removed > 0) console.log(`${new Date().toISOString()} [cleanup] removed ${removed} expired download(s)`);
-    } catch (err) {
-      console.warn(`[cleanup] download retention failed: ${err.message}`);
-    }
+    } catch (error) { console.warn("Download cleanup:", error.message); }
   }
-
   isAllowed(from, chat) {
-    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private"); }
+    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
+  }
   dispatchUpdate(update) {
-    if (parseCommand(update.message?.text?.trim() || "")?.name === "abort") {
-      const m = update.message;
-      if (!this.isAllowed(m.from, m.chat)) return Promise.resolve();
-      this.chatReady = true;
-      this.telegram.setReaction(this.chatId, m.message_id, "👀");
-      const session = this.getOrCreateSession(m);
+    const m = update.message, callback = update.callback_query;
+    if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return Promise.resolve();
+    const action = callback?.data?.startsWith("a:") ? this.actions.get(callback.data.slice(2)) : null;
+    const session = m ? this.getOrCreateSession(m) : this.sessions.get(action?.sessionKey) || this.mainSession;
+    this.chatReady = true;
+    if (parseCommand(m?.text?.trim() || "")?.name === "abort") {
+      this.telegram.react(this.chatId, m.message_id, "👀");
       return session.handleCommand({ name: "abort", argument: "" }, m.text, update.update_id);
     }
-    if (update.message?.media_group_id && this.isAllowed(update.message.from, update.message.chat)) {
-      const m = update.message;
-      this.chatReady = true;
-      const session = this.getOrCreateSession(m);
-      this.telegram.setReaction(this.chatId, m.message_id, "👀");
+    // ref: https://docs.python-telegram-bot.org/en/stable/telegram.message.html#telegram.Message.media_group_id — serialize albums at the first message.
+    if (m?.media_group_id) {
+      this.telegram.react(this.chatId, m.message_id, "👀");
       const key = `${this.chatId}:${m.media_group_id}`;
       let group = session.mediaGroups.get(key);
       if (!group) {
-        let resolveReady;
-        const ready = new Promise((r) => { resolveReady = r; });
+        const { promise: ready, resolve: resolveReady } = Promise.withResolvers();
         group = { messages: [], timer: null, ready, resolveReady, cancelled: false };
         session.mediaGroups.set(key, group);
         const next = session.updateChain.then(async () => {
@@ -2026,27 +1451,16 @@ class Gateway {
       }
       group.messages.push(m);
       if (group.timer) clearTimeout(group.timer);
-      group.timer = setTimeout(() => { session.mediaGroups.delete(key); group.resolveReady(); }, 1200);
+      group.timer = setTimeout(() => {
+        session.mediaGroups.delete(key);
+        group.resolveReady();
+      }, 1200);
       return group.done;
     }
-    if (update.message) {
-      if (!this.isAllowed(update.message.from, update.message.chat)) return Promise.resolve();
-      const session = this.getOrCreateSession(update.message);
-      const next = session.updateChain.then(() => this.handleUpdate(update, session));
-      session.updateChain = next.catch((err) => console.error("Telegram update error:", err));
-      return next;
-    }
-    if (update.callback_query) {
-      if (!this.isAllowed(update.callback_query.from, update.callback_query.message?.chat)) return Promise.resolve();
-      const token = update.callback_query.data?.startsWith("a:") ? update.callback_query.data.slice(2) : "";
-      const action = token ? this.actions.get(token) : null;
-      const sessionKey = (!action?.type?.startsWith("herdr_") && action?.sessionKey) ? action.sessionKey : null;
-      const session = sessionKey ? (this.sessions.get(sessionKey) || this.mainSession) : this.mainSession;
-      const next = session.updateChain.then(() => this.handleUpdate(update, session));
-      session.updateChain = next.catch((err) => console.error("Telegram update error:", err));
-      return next;
-    }
-    return Promise.resolve(); }
+    const next = session.updateChain.then(() => this.handleUpdate(update, session));
+    session.updateChain = next.catch((error) => console.error("Telegram update error:", error));
+    return next;
+  }
   async handleUpdate(update, session = this.mainSession) {
     try {
       if (update.message) {
@@ -2054,6 +1468,7 @@ class Gateway {
         this.chatReady = true;
         const m = update.message;
         const kind = m.text ? "text" : m.photo ? "photo" : m.voice ? "voice" : m.document ? "document" : m.video ? "video" : m.video_note ? "video_note" : m.audio ? "audio" : "other";
+        // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — never log user message content.
         const textLen = (m.text || m.caption || "").length;
         console.log(`${new Date().toISOString()} [update] msg #${m.message_id}: ${textLen ? `${kind}, ${textLen} chars` : kind}`);
         await this.handleMessage(update.message, session, update.update_id);
@@ -2069,45 +1484,35 @@ class Gateway {
       await session.send(`❌ ${error.message}`);
     }
   }
-
   async extractMedia(m) {
-    if (m.photo?.length) {
-      const saved = await this.saveDownload(m.photo.at(-1).file_id, `photo-${m.message_id}.jpg`, true);
-      return { saved, image: { type: "image", data: saved.data, mimeType: "image/jpeg" }, label: "photo" };
-    }
-    const file = m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
+    const photo = m.photo?.at(-1);
+    const file = photo || m.document || m.voice || m.video || m.video_note || m.audio || m.animation;
     if (!file) return null;
-    const isImage = file.mime_type?.startsWith("image/");
-    const kind = m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
-    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(file.mime_type)}`, isImage);
-    const image = isImage ? { type: "image", data: saved.data, mimeType: file.mime_type || "image/jpeg" } : null;
-    const label = m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind;
-    return { saved, image, label };
+    const mime = photo ? "image/jpeg" : file.mime_type;
+    const isImage = mime?.startsWith("image/");
+    const kind = photo ? "photo" : m.voice ? "voice" : m.video_note ? "video_note" : m.audio ? "audio" : "file";
+    const saved = await this.saveDownload(file.file_id, file.file_name || `${kind}-${m.message_id}${extensionFromMime(mime)}`, isImage);
+    const image = isImage ? { type: "image", data: saved.data, mimeType: mime } : null;
+    return { saved, image, label: m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind };
   }
-
   async handleMessage(message, session = this.getOrCreateSession(message), updateId = null) {
-    const herdrPane = this.herdrWatcher && this.herdrMessages.get(message.reply_to_message?.message_id);
-    if (herdrPane && message.text && !message.text.startsWith("/")) return this.replyToHerdrAgent(herdrPane, message);
-
-    const media = await this.extractMedia(message);
-    if (media) {
-      this.telegram.setReaction(this.chatId, message.message_id, "👀");
-      if (message.voice && this.config.sttCommand) {
-        try {
-          const transcript = await runStt(this.config.sttCommand, media.saved.path);
-          await session.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`);
-          return;
-        } catch (error) { return session.send(`❌ ${error.message}`); }
-      }
-      await session.prompt(attachmentPrompt(message.caption || `User sent a ${media.label}.`, [media.saved]), media.image ? [media.image] : undefined);
-      return;
+    const media = await this.extractMedia(message), text = message.text?.trim();
+    if (!media && !text) return;
+    this.telegram.react(this.chatId, message.message_id, "👀");
+    if (!media) {
+      const command = parseCommand(text);
+      return command ? session.handleCommand(command, text, updateId, message.message_id)
+        : session.prompt(text, undefined, undefined, message.message_id);
     }
-    const text = message.text?.trim();
-    if (!text) return;
-    this.telegram.setReaction(this.chatId, message.message_id, "👀");
-    const command = parseCommand(text);
-    if (command) await session.handleCommand(command, text, updateId);
-    else await session.prompt(text); }
+    if (message.voice && this.config.sttCommand) {
+      try {
+        const transcript = await runStt(this.config.sttCommand, media.saved.path);
+        return await session.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`, undefined, undefined, message.message_id);
+      } catch (error) { return session.send(`❌ ${error.message}`); }
+    }
+    return session.prompt(attachmentPrompt(message.caption || `User sent a ${media.label}.`, [media.saved]),
+      media.image ? [media.image] : undefined, undefined, message.message_id);
+  }
   async registerBotCommands() {
     let rpcCommands = [];
     if (this.mainSession.pi.proc) {
@@ -2127,7 +1532,8 @@ class Gateway {
       this.telegram.call("setMyCommands", { commands: finalCommands }),
       this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
     ]);
-    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length})`); }
+    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length})`);
+  }
   async saveState(patch) {
     this.state = { ...this.state, ...patch };
     const statePath = join(this.config.stateDir, "state.json");
@@ -2143,100 +1549,51 @@ class Gateway {
     };
     const next = this.stateWriteChain.then(write, write);
     this.stateWriteChain = next;
-    return next; }
+    return next;
+  }
   action(payload, ttl = 10 * 60_000) {
     const now = Date.now();
     for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
     const token = randomBytes(6).toString("base64url");
     this.actions.set(token, { ...payload, expires: now + ttl });
-    return `a:${token}`; }
-  startHerdrWatcher() {
-    if (this.herdrWatcher) return;
-    const env = [...this.sessions.values()].find((s) => s.pi?.herdrEnv?.HERDR_BIN_PATH)?.pi?.herdrEnv
-      || this.herdrEnvironment;
-    if (!env?.HERDR_BIN_PATH || !env?.HERDR_SOCKET_PATH) return;
-    this.herdrWatcher = new HerdrWatcher({
-      bin: env.HERDR_BIN_PATH,
-      socketPath: env.HERDR_SOCKET_PATH,
-      // Own remote_ask dialogs already have buttons; other TUI dialogs only get Enter/Esc.
-      isExcluded: (paneId) => [...this.sessions.values()].some((s) => s.binding.paneId === paneId && s.uiMessages?.size),
-      onTransition: ({ paneId, status, agent }) => status === "blocked" ? this.sendHerdrAgent(paneId, status, agent) : undefined,
-    });
-    this.herdrWatcher.start(); }
-  async sendHerdrAgent(paneId, status, agent) {
-    const watcher = this.herdrWatcher;
-    const blocked = status === "blocked";
-    const screen = await watcher.cli(["agent", "read", paneId, "--source", blocked ? "visible" : "recent-unwrapped", "--lines", "60"]).catch(() => "");
-    const tail = herdrTail(screen);
-    const label = watcher.label(paneId);
-    const head = blocked ? `✋ ${label} needs your confirmation`
-      : status === "done" ? `✅ ${label} finished`
-      : `${HERDR_STATUS_ICON[status] || "❔"} ${label} — ${status}`;
-    const text = [
-      head,
-      agent?.terminal_title_stripped ? `\`${agent.terminal_title_stripped.replace(/`/g, "'")}\`` : "",
-      tail ? expandableBlockquote(tail) : "",
-      blocked ? "Use Enter or Esc below, or answer in the terminal." : "Enable /remote-control in the pane to chat with this agent.",
-    ].filter(Boolean).join("\n\n");
-
-    const ttl = 24 * 60 * 60_000;
-    const group = randomBytes(4).toString("hex");
-    const keyButton = (label, keys) => ({ text: label.slice(0, 60), callback_data: this.action({ type: "herdr_keys", paneId, keys, label, group }, ttl) });
-    const rows = [];
-    if (blocked) {
-      rows.push([keyButton("⏎ Enter", ["enter"]), keyButton("⎋ Esc", ["esc"])]);
-    }
-    rows.push([{ text: "🔄 Refresh", callback_data: this.action({ type: "herdr_peek", paneId }, ttl) }]);
-    const bridge = [...this.sessions.values()].find((s) => s.binding.paneId === paneId);
-    const userPresent = this.isUserPresent();
-    const disableNotification = userPresent || (bridge?.threadId ? !blocked : false);
-    const extra = {
-      reply_markup: { inline_keyboard: rows },
-      ...(bridge?.threadId ? { message_thread_id: bridge.threadId } : {}),
-      ...(disableNotification ? { disable_notification: true } : {}),
-    };
-    const sent = await this.telegram.send(this.chatId, text, extra);
-    if (sent?.message_id) {
-      this.herdrMessages.set(sent.message_id, paneId);
-      if (this.herdrMessages.size > 200) this.herdrMessages.delete(this.herdrMessages.keys().next().value);
-    }
+    return `a:${token}`;
   }
-
-  async showHerdrAgents() {
-    if (!this.herdrWatcher) return this.telegram.send(this.chatId, "Herdr is not available; ensure its server is running.");
-    await this.herdrWatcher.sync();
-    const ownPanes = new Set(this.getOwnedPaneIds());
-    const agents = [...this.herdrWatcher.agents.values()];
-    if (!agents.length) return this.telegram.send(this.chatId, "No agents running in Herdr.");
-    const byWorkspace = new Map();
-    for (const agent of agents) {
-      const ws = this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.workspace_id;
-      if (!byWorkspace.has(ws)) byWorkspace.set(ws, []);
-      byWorkspace.get(ws).push(agent);
-    }
-    const lines = [];
-    for (const [ws, list] of byWorkspace) {
-      lines.push(`**${ws}**`);
-      for (const agent of list) {
-        const isOwn = ownPanes.has(agent.pane_id);
-        const badge = isOwn ? " 📱" : (herdrOptedIn(agent) ? " 📡" : "");
-        const title = agent.terminal_title_stripped ? ` — ${agent.terminal_title_stripped.replace(/[`*_\[\]]/g, "")}` : "";
-        lines.push(`${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} \`${agent.pane_id}\` ${agent.agent_status}${badge}${title}`);
+  herdr(args) {
+    const env = this.herdrEnvironment;
+    if (!env?.HERDR_BIN_PATH) throw new Error("Herdr is unavailable");
+    return runCommand(env.HERDR_BIN_PATH, ["agent", ...args], { env: { ...process.env, ...env }, timeout: 5000 });
+  }
+  startBlockedPoller() {
+    if (HERDR_DISABLED_FOR_TEST || this.blockedTimer) return;
+    this.blockedTimer = setInterval(() => {
+      this.pollBlocked().catch((error) => console.error("Blocked poll:", error.message));
+    }, 3000);
+    this.blockedTimer.unref();
+  }
+  // ref: https://herdr.dev/docs/cli-reference/ — agent_status is authoritative; never parse numbered screen choices.
+  async pollBlocked() {
+    const sessions = [...this.sessions.values()].filter((s) => s.binding.paneId);
+    if (this.blockedPolling || !sessions.some((s) => s.isStreaming)) return;
+    this.blockedPolling = true;
+    try {
+      const agents = JSON.parse(await this.herdr(["list"])).result.agents;
+      const current = new Map(agents.map((a) => [a.pane_id, a.agent_status]));
+      for (const session of sessions) {
+        const paneId = session.binding.paneId;
+        if (current.get(paneId) !== "blocked" || this.blockedStatuses.get(paneId) === "blocked" || session.uiMessages?.size) continue;
+        const screen = await this.herdr(["read", paneId, "--source", "visible", "--lines", "40"]);
+        if (session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
+        const group = randomBytes(6).toString("hex");
+        await session.send(`✋ Pi needs your confirmation\n\n${expandableBlockquote(herdrTail(screen, 40))}`, {
+          ...session.keyboard([["⏎ Enter", "enter"], ["⎋ Esc", "esc"]].map(([label, key]) => ({
+            label, action: { type: "herdr_keys", paneId, key, group },
+          }))),
+          disable_notification: this.isUserPresent(),
+        });
       }
-      lines.push("");
-    }
-    lines.push("📱 = Telegram session. 📡 = pushed to Telegram. Tap an agent to see its screen.");
-    return this.telegram.send(this.chatId, lines.join("\n"), this.keyboard(agents.map((agent) => ({
-      label: `${HERDR_STATUS_ICON[agent.agent_status] || "❔"} ${agent.name || agent.agent} · ${this.herdrWatcher.workspaces.get(agent.workspace_id) || agent.pane_id}`,
-      action: { type: "herdr_peek", paneId: agent.pane_id },
-    })))); }
-  async replyToHerdrAgent(paneId, message) {
-    this.telegram.setReaction(this.chatId, message.message_id, "👀");
-    const target = [...this.sessions.values()].find((s) => s.binding.paneId === paneId && s.pi.proc);
-    if (!target) return this.telegram.send(this.chatId, "Enable /remote-control in that Pi pane first. Prompts are never sent with terminal keystrokes.");
-    return target.prompt(message.text.trim()); }
-  keyboard(items) {
-    return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action) }]) } }; }
+      this.blockedStatuses = new Map(sessions.map((s) => [s.binding.paneId, current.get(s.binding.paneId)]));
+    } finally { this.blockedPolling = false; }
+  }
   async handleCallback(callback, session = this.mainSession) {
     const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
     const action = this.actions.get(token);
@@ -2246,59 +1603,34 @@ class Gateway {
     this.telegram.answer(callback.id).catch(() => {});
     try {
       console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
-      if (action.type === "herdr_peek") {
-        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
-        if (!agent) return this.telegram.send(this.chatId, "Agent is gone");
-        await this.sendHerdrAgent(action.paneId, agent.agent_status, agent);
-      } else if (action.type === "herdr_keys") {
-        for (const [k, v] of this.actions) {
-          if (v.group === action.group) this.actions.delete(k);
-        }
-        const removeButtons = () => callback.message && this.telegram.call("editMessageReplyMarkup", {
-          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
-        }).catch(() => {});
-        const agent = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]))?.agent;
-        if (agent?.agent_status !== "blocked") {
-          await removeButtons();
-          await this.telegram.send(this.chatId, `⚠️ ${this.herdrWatcher.label(action.paneId)} is no longer waiting (${agent?.agent_status || "gone"}); nothing sent.`);
-          return;
-        }
-        await this.herdrWatcher.cli(["agent", "send-keys", action.paneId, ...action.keys]);
-        await removeButtons();
-        await sleep(1500);
-        const after = (await this.herdrWatcher.cliJson(["agent", "get", action.paneId]).catch(() => null))?.agent?.agent_status || "unknown";
-        await this.telegram.send(this.chatId, `➡️ ${action.label} → ${this.herdrWatcher.label(action.paneId)} · now ${HERDR_STATUS_ICON[after] || ""} ${after}`, { disable_notification: true });
-      } else if (action.type === "close_topic") {
-        if (action.confirmed) {
-          const threadId = action.threadId;
-          const sessionKey = `t:${threadId}`;
-          const targetSession = this.sessions.get(sessionKey);
-          if (targetSession) {
-            await this.closePaneSession(targetSession);
-            this.sessions.delete(sessionKey);
-          }
-          delete this.state.topics[threadId];
-          if (this.state.herdrPanes) {
-            delete this.state.herdrPanes[sessionKey];
-          }
-          await this.saveState({ topics: this.state.topics, herdrPanes: this.state.herdrPanes });
-          await this.telegram.call("deleteForumTopic", {
-            chat_id: this.chatId,
-            message_thread_id: threadId,
-          }).catch(() => {});
-          if (callback.message) {
-            await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Topic closed.").catch(() => {});
-          }
-          return;
+      if (action.type === "herdr_keys") {
+        for (const [key, value] of this.actions) if (value.group === action.group) this.actions.delete(key);
+        const target = this.sessions.get(action.sessionKey);
+        const agent = JSON.parse(await this.herdr(["get", action.paneId])).result?.agent;
+        if (target?.binding.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
+          await this.herdr(["send-keys", action.paneId, action.key]);
         } else {
-          if (callback.message) {
-            await this.telegram.edit(callback.message.chat.id, callback.message.message_id, "Close cancelled.").catch(() => {});
-          }
-          return;
+          await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
         }
+        if (callback.message) await this.telegram.call("editMessageReplyMarkup", {
+          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
+        });
+      } else if (action.type === "close_topic") {
+        const key = `t:${action.threadId}`;
+        if (action.confirmed) {
+          const target = this.sessions.get(key);
+          if (target) await this.closePaneSession(target);
+          this.sessions.delete(key);
+          delete this.state.topics[action.threadId];
+          delete this.state.herdrPanes?.[key];
+          await this.saveState({ topics: this.state.topics, herdrPanes: this.state.herdrPanes });
+          await this.telegram.call("deleteForumTopic", { chat_id: this.chatId, message_thread_id: action.threadId }).catch(() => {});
+        }
+        if (callback.message) await this.telegram.edit(
+          callback.message.chat.id, callback.message.message_id, action.confirmed ? "Topic closed." : "Close cancelled.",
+        ).catch(() => {});
       } else {
-        const sessionKey = action.sessionKey || sessionKeyOf(callback);
-        const targetSession = sessionKey ? (this.sessions.get(sessionKey) || this.mainSession) : (session || this.mainSession);
+        const targetSession = this.sessions.get(action.sessionKey || sessionKeyOf(callback)) || session || this.mainSession;
         await targetSession.handleCallbackAction(action, callback);
       }
     } catch (error) {
@@ -2306,7 +1638,6 @@ class Gateway {
       await targetSession.send(`❌ ${error.message}`);
     }
   }
-
   // ref: Telegram Bot API 9.3 & 9.4 (2026-02-09): createForumTopic in private chats
   async handleTopicCommand(session, argument) {
     const me = await this.telegram.call("getMe");
@@ -2325,17 +1656,12 @@ class Gateway {
       return session.send(`Not a valid directory: ${target}`);
     }
     const name = (basename(realTarget) || "topic").slice(0, 128);
-    const created = await this.telegram.call("createForumTopic", {
-      chat_id: this.chatId,
-      name,
-    });
-    const threadId = created.message_thread_id;
+    const { message_thread_id: threadId } = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name });
     const newSession = new ChatSession(this, { threadId, cwd: realTarget });
     newSession.lastTopicName = name;
     this.sessions.set(`t:${threadId}`, newSession);
     this.state.topics[threadId] = { cwd: realTarget };
     await this.saveState({ topics: this.state.topics });
-
     await newSession.pi.start();
     const state = await newSession.pi.request("get_state");
     const text = formatSessionReset({ model: state.model, cwd: realTarget });
@@ -2344,77 +1670,54 @@ class Gateway {
       await session.send(`✅ Created topic "${name}" (thread #${threadId})`);
     }
   }
-
   // ref: Telegram Bot API 9.3 deleteForumTopic in private chats
   async handleCloseCommand(session) {
     if (session.threadId === null) {
       return session.send("/close only works inside a topic.");
     }
-    const keyboard = {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Confirm", callback_data: this.action({ type: "close_topic", threadId: session.threadId, confirmed: true }) },
-            { text: "Cancel", callback_data: this.action({ type: "close_topic", threadId: session.threadId, confirmed: false }) },
-          ],
-        ],
-      },
-    };
-    return session.send(`Close topic "${basename(session.cwd)}"? ${session.binding.owned ? "This will quit its Pi and close its pane." : "This only detaches Telegram; your desktop Pi keeps running."} The topic will be removed.`, keyboard); }
+    const keyboard = session.keyboard(["Confirm", "Cancel"].map((label) => ({
+      label, action: { type: "close_topic", threadId: session.threadId, confirmed: label === "Confirm" },
+    })));
+    return session.send(`Close topic "${basename(session.cwd)}"? ${session.binding.owned ? "This will quit its Pi and close its pane." : "This only detaches Telegram; your desktop Pi keeps running."} The topic will be removed.`, keyboard);
+  }
   async acquireLock() {
     const sockPath = join(this.config.stateDir, "gateway.sock");
     const pidFile = join(this.config.stateDir, "gateway.pid");
-    await new Promise((resolveLock, reject) => {
-      const client = net.connect({ path: sockPath }, () => {
+    this.lockServer = await new Promise((done, reject) => {
+      const client = net.connect(sockPath, () => {
         client.end();
         const pid = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
         reject(new Error(`Another gateway is already running${pid ? ` (pid ${pid})` : ""}. Run ./install.sh stop first`));
       });
-      client.on("error", (err) => {
-        if (["ECONNREFUSED", "ENOENT", "ENOTSOCK"].includes(err.code)) {
-          try { unlinkSync(sockPath); } catch {}
-          const server = net.createServer();
-          server.unref();
-          server.listen(sockPath, () => {
-            this.lockServer = server;
-            this.sockPath = sockPath;
-            writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
-            this.pidFile = pidFile;
-            resolveLock();
-          });
-          server.on("error", reject);
-        } else {
-          reject(err);
-        }
+      client.on("error", (error) => {
+        if (!["ECONNREFUSED", "ENOENT", "ENOTSOCK"].includes(error.code)) return reject(error);
+        try { unlinkSync(sockPath); } catch {}
+        const server = net.createServer();
+        server.on("error", reject);
+        server.listen(sockPath, () => done(server));
       });
-    }); }
+    });
+    this.lockServer.unref();
+    this.sockPath = sockPath;
+    this.pidFile = pidFile;
+    writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+  }
   stop() {
-    if (this.downloadCleanupTimer) {
-      clearInterval(this.downloadCleanupTimer);
-      this.downloadCleanupTimer = null;
-    }
+    clearInterval(this.downloadCleanupTimer);
+    this.downloadCleanupTimer = null;
     this.telegram?.stopPolling?.();
-    this.herdrWatcher?.stop();
+    clearInterval(this.blockedTimer);
+    this.blockedTimer = null;
     this.bridge?.stop().catch((error) => console.error(`[bridge] stop: ${error.message}`));
-    if (this.lockServer) {
-      try { this.lockServer.close(); } catch {}
-      this.lockServer = null;
-    }
-    try {
-      if (this.sockPath && existsSync(this.sockPath)) unlinkSync(this.sockPath);
-    } catch {}
+    try { this.lockServer?.close(); } catch {}
+    this.lockServer = null;
+    try { if (this.sockPath) unlinkSync(this.sockPath); } catch {}
     try {
       if (this.pidFile && existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) {
         unlinkSync(this.pidFile);
       }
     } catch {}
-    if (this.sessions) {
-      for (const session of this.sessions.values()) {
-        session.stop();
-      }
-    } else {
-      this.pi?.stop?.();
-    }
+    for (const session of this.sessions.values()) session.stop();
   }
 }
 
@@ -2424,25 +1727,35 @@ async function main() {
     await selfTest();
   } else {
     const gateway = new Gateway(loadConfig());
-    for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { gateway.stop(); process.exit(0); });
-    gateway.start().catch((error) => { console.error(error); gateway.stop(); process.exit(1); });
+    for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
+      gateway.stop();
+      process.exit(0);
+    });
+    gateway.start().catch((error) => {
+      console.error(error);
+      gateway.stop();
+      process.exit(1);
+    });
   }
 }
 
 if (import.meta.main) {
-  main().catch((error) => { console.error(error); process.exit(1); });
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
 }
 
 export {
   BOT_COMMANDS, RESERVED_COMMANDS, HELP, MAX_MESSAGE,
-  ChatSession, Gateway, HerdrWatcher, PaneRpc, Telegram,
-  attachmentPrompt, buildDevPath, chunks, encodeCwdSessionDir,
+  ChatSession, Gateway, PaneRpc, Telegram,
+  attachmentPrompt, buildDevPath, chunks,
   expandableBlockquote, extensionFromMime, extractText,
   formatAssistantError, formatContextTokens, formatSessionReset,
-  herdrOptedIn, herdrTail, isConnectPhaseError, loadConfig, loadState,
-  paneHasForegroundShell, parseCommand, pollBackoffMs, previewText,
-  renderToolPanel, resolveAgentSessionFile, resolveHerdrEnvironment,
+  herdrTail, isConnectPhaseError, loadConfig, loadState,
+  paneHasForegroundShell, parseCommand, pollBackoffMs,
+  resolveAgentSessionFile, resolveHerdrEnvironment,
   resolvePath, retryableTelegramStatus, runCommand, runStt,
-  scanDesktopSessions, sessionKeyOf, setTestMode, shellQuote,
+  sessionKeyOf, setTestMode, shellQuote,
   shouldRetryTelegram, telegramCommandName, telegramHtml, toolSummary,
 };

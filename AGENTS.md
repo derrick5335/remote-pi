@@ -24,11 +24,11 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 
 ## 架构
 
-- `gateway.mjs`：单文件核心，仅依赖 `markdown-it` 渲染 Telegram HTML。轮询 Telegram → `PaneRpc` → 本地 Unix socket → Herdr 窗格内的交互式 Pi；流式输出采用静音消息 + 原地编辑（`sendMessage` + `editMessageText`）。
+- `gateway.mjs`：单文件核心，仅依赖 `markdown-it` 渲染 Telegram HTML。轮询 Telegram → `PaneRpc` → 本地 Unix socket → Herdr 窗格内的交互式 Pi；流式输出采用临时 `sendMessageDraft` + 最终 `sendMessage`，状态通过用户消息 reaction 显示；工具调用/终端发起静音，桌面在线时不响铃。
 - `remote-pi.ts`：统一 Pi extension，通过公开 Extension API 实现 RPC 形状的桥接命令与事件转发，提供 `/remote-control on|off|status`。Herdr 原生 pane metadata token `remote_pi=on` 保存开关，扩展自动重连；会话替换后由新 runtime 的 hello 恢复绑定。
 - `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
-- `HerdrWatcher`：仅用于 `/agents` 的只读列表/屏幕预览与 blocked 提醒；Pi 自行通过 Herdr 原生集成汇报状态。手机指令走 socket，不用模拟按键或抓取会话日志驱动 Pi。
+- blocked 轮询：绑定会话工作期间每 3 秒读取 Herdr 原生 agent 状态，仅推送绑定窗格的 blocked 变化；已有 `remote_ask` 按钮时不重复提醒。Enter/Esc 回调重新验证 blocked；普通指令仍走 socket，不用模拟按键驱动 Pi。
 - `install.sh`：安装 launchd 服务，并将 `remote-pi.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`；安装/升级时替换已有软链目标，不覆盖用户普通文件。`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - Telegram 命令：`/sh`（直跑 shell）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。`/resume` 使用统一原生会话列表，已运行的会话只切换视图。
-- Pi 1.3.0 限制：无公开原生队列检查/清空 API，`clear_queue` 仅返回空结果并重置网关显示；无公开自动重试事件钩子，不转发重试开始/结束通知。
+- Pi 1.3.0：`/resume` 经扩展调用公开 `SessionManager.list`，不由网关扫描会话文件；无公开原生队列检查/清空 API 及自动重试事件钩子。
 - 安全：只接受配置的私聊用户；Telegram 非端到端加密，控制该账号即等于控制本机用户权限，勿拉群。

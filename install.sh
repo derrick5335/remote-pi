@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve the launcher symlink before computing ROOT; it normally lives in ~/.local/bin.
 SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 LABEL="local.remote-pi"
-
 DOMAIN="gui/$(id -u)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONFIG_DIR="$HOME/.config/remote-pi"
@@ -26,15 +26,16 @@ install_command() {
     mkdir -p "$(dirname "$COMMAND")" "$PI_EXTENSION_DIR"
     ln -sf "$ROOT/install.sh" "$COMMAND"
     if [[ -e "$PI_EXTENSION" && ! -L "$PI_EXTENSION" ]]; then echo "❌ Refusing to overwrite non-symlink extension: $PI_EXTENSION" >&2; return 1; fi
+    # ref: https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html — -sfn replaces the link, not its directory target.
     ln -sfn "$ROOT/remote-pi.ts" "$PI_EXTENSION"
 }
 
 secure_log() {
+    # ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — restrict log directory and file permissions.
     mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
     [[ -f "$LOG_FILE" ]] || (umask 077 && touch "$LOG_FILE")
     chmod 600 "$LOG_FILE"
 }
-
 setup_plist() {
     secure_log
     local esc_node esc_gateway esc_root esc_log
