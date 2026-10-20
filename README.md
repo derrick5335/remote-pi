@@ -32,7 +32,7 @@
 - ⚡ **Lightweight & Minimalist**: Built around a clean, single-file core (`gateway.mjs`) using only the Node.js standard library plus `markdown-it` for Telegram HTML rendering. No heavy frameworks.
 - 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspaces and pane/session bindings are tracked in `state.json`; sessions stay in Pi’s native session directory.
 - 🎯 **100% Pi-Native**: Uses Pi 1.3.0’s public Extension API, Pi CLI, and Herdr socket API. One interactive Pi process owns each session; Telegram and the terminal are views of that process. No private patches or side-channel files.
-- 🌊 **Live Drafts**: `sendMessageDraft` shows temporary text and current tool progress, independently for each topic. Updates are throttled to 1.5 seconds with 20-second keepalives; final replies are sent as persistent text messages. If drafts fail, previews stop for that run without falling back to edits.
+- 🌊 **Live Drafts**: `sendMessageDraft` shows temporary text and current tool progress, independently for each topic. Updates are throttled to 1.5 seconds with 20-second keepalives; final replies are sent as persistent text messages. After a reply, an empty “Thinking…” placeholder is never sent again in that run. If drafts fail, previews stop for that run without falling back to edits.
 - 🔁 **Retry Errors**: Assistant error replies include a single `🔁 Retry` button to resend the last prompt. Long replies are delivered as text chunks.
 - 🎮 **One Remote-Control Extension**:
   - `remote-pi.ts` provides `remote_attach` (send local files) and `remote_ask` (multiple-choice questions in Telegram and the terminal; first answer wins). Tools are active only while connected.
@@ -43,7 +43,7 @@
   - **Vision & Attachments**: Send photos (inlined as visual context) or documents, PDFs, and code files (saved locally and passed into context).
 - 💬 **Live Steering & Reaction ACK**:
   - Send messages while Pi is working to dynamically steer the agent turn without waiting for it to finish.
-  - On the triggering user message: `👀` received → `👨‍💻` working → `👌` replied, `💔` error, or `🤷` no text reply. Abort clears the reaction. Terminal-originated runs do not set reactions.
+  - On the triggering user message: `👀` received → `👨‍💻` working → `👌` replied, `💔` error, or `🤷` no text reply. The final error state follows the latest assistant message, so a successful internal retry ends with `👌`. Abort clears the reaction. Terminal-originated runs do not set reactions.
 - 🔒 **Single-Instance Mutex & Strict Whitelist**:
   - Unix domain socket file lock prevents concurrent instances from interfering with the same session.
   - Strict numeric `allowedUserId` whitelist only accepts messages from your private chat; rejects unauthorized users and ignores all group chats.
@@ -61,7 +61,7 @@
 | `/close` | Close the current topic after confirmation: quit/close gateway-created Pi panes; desktop-attached panes only detach. Delete the topic |
 | `/model [query]` | Show inline keyboard to select a model, or switch directly by keyword/ID |
 | `/thinking [level]` | View or set model thinking level (e.g. `off`, `low`, `high`) |
-| `/new` | Start a fresh session, reset context, and show the active model |
+| `/new` | Start a fresh session even when disconnected, reset context, and show the active model |
 | `/resume` | List sessions for the current workspace from Pi’s native directory; if already open, offer to view the existing pane |
 | `/sh <command>` | Execute a shell command directly in the workspace directory (0 tokens, millisecond response). Note: the block on service restart/stop commands here is only an accident guard, not a security boundary — the bot holder already has full shell access |
 | `/followup <prompt>` | Queue a follow-up prompt without interrupting the current agent turn |
@@ -77,7 +77,7 @@
 | Command | Description |
 | :--- | :--- |
 | `/name <name>` | Set the session name |
-| `/restart` | Restart the gateway; once ready, update the original notice to “✅ Gateway restarted” |
+| `/restart` | Restart immediately, bypassing stuck session updates; once ready, update the original notice to “✅ Gateway restarted” |
 
 > **Tip**: Installed Pi skills and custom commands use the native command router. The internal `/remote-pi-new` and `/remote-pi-switch` bridge commands are hidden from Telegram discovery; terminal autocomplete is not modified.
 
@@ -119,7 +119,7 @@ npm install --omit=dev
 
 ### 2. Run Offline Self-Test
 
-Verify parsing, commands, and core logic without connecting to Telegram:
+Verify core invariants using fake Telegram/Herdr adapters and temporary local bridge sockets, without connecting to real Telegram or Herdr:
 
 ```bash
 npm test
@@ -131,6 +131,8 @@ Lint (ESLint safety and readability rules):
 ```bash
 npm run lint
 ```
+
+The self-test enforces the line budgets (including comments and blank lines): `gateway.mjs` ≤1500, `remote-pi.ts` ≤360, `install.sh` ≤140, core total ≤2000, and `self-test.mjs` ≤900. ESLint readability rules remain enabled; budget reductions must not cram statements onto a line.
 
 ### 3. Configure
 
@@ -233,7 +235,7 @@ The gateway supports running multiple independent Pi sessions in parallel using 
    - Tap **Open** to launch the BotFather Mini App → select your bot → **Bot Settings** → **Threads Settings** → enable **Threaded Mode** (the classic `/mybots` text menu does not expose this setting).
 2. **Create a Topic Session**:
    - Send `/topic [path]` to spin up an independent topic for a project directory. Without an argument, it uses the current session's workspace.
-   - Each newly created topic starts an interactive Pi in its own Herdr pane/workspace. Sessions use Pi’s native directory, not a separate Telegram history.
+   - Each newly created topic starts an interactive Pi in its own Herdr pane/workspace. When ready, it reports the provider/model and directory in one line. Sessions use Pi’s native directory, not a separate Telegram history.
 3. **Manage Topics**:
    - Use `/topic <path>` to create a separate topic for another project. A manually opened topic inherits the main session's workspace.
    - `/close` asks for confirmation and deletes the topic. The last view of a gateway-created Pi quits it and closes its pane; a desktop-attached Pi is only detached and keeps running.
@@ -285,9 +287,10 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 ```
 
 - **One owner, many views**: Each session belongs to one interactive Pi process. `state.json` stores pane/session bindings; native Pi session files remain in `~/.pi/agent/sessions` (subject to Pi’s native environment overrides).
+- **Per-session ordering**: Each view serializes its events and incoming updates; there is no global Telegram output queue or method monkey-patching. Attachment uploads use a separate per-session promise chain, preserving file order without blocking events or other sessions. Only `/abort` and `/restart` bypass the update chain, so a stuck command cannot block recovery. New topics are registered and their updates enqueued synchronously; persistence and the welcome message run in the background with error logging.
 - **Native lifecycle**: Herdr creates/starts panes; Pi handles prompts, models, compaction, and session replacement. The gateway preserves its RPC-shaped client interface with `PaneRpc`, without spawning another Pi through a subprocess RPC mode.
 - **Power Management**: On macOS, launchd invokes `/usr/bin/caffeinate -s -i -- node gateway.mjs`. This prevents idle sleep on AC power while preserving manual sleep and lid-close behavior.
-- **References**: [Pi Extension API](https://pi.dev/docs/latest/extensions) (implementation targets installed Pi 1.3.0), [Herdr CLI](https://herdr.dev/docs/cli-reference/), and [Herdr integrations](https://herdr.dev/docs/integrations/).
+- **References**: [Pi Extension API](https://pi.dev/docs/latest/extensions) (implementation targets installed Pi 1.3.0), [Herdr CLI](https://herdr.dev/docs/cli-reference/), [Herdr integrations](https://herdr.dev/docs/integrations/), [Telegram draft lifecycle](https://core.telegram.org/bots/api#sendmessagedraft), [Telegram retry parameters](https://core.telegram.org/bots/api#responseparameters), and [Node socket lifecycle](https://nodejs.org/api/net.html#event-close).
 
 ---
 

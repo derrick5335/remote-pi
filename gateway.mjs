@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir } from "node:os";
@@ -11,12 +11,11 @@ import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import MarkdownIt from "markdown-it";
 import { readJsonLines, writeJsonLine } from "./remote-pi.ts";
-
 const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 let HERDR_DISABLED_FOR_TEST = false;
-
 const setTestMode = (on) => { HERDR_DISABLED_FOR_TEST = Boolean(on); };
+const log = (tag, ...args) => console.log(`${new Date().toISOString()} [${tag}]`, ...args);
 let stateWriteCounter = 0;
 const BOT_COMMANDS = [
   { command: "help", description: "Show help and Pi native commands" },
@@ -37,43 +36,32 @@ const BOT_COMMANDS = [
 ];
 const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start"]);
 const HELP = `Remote Pi\n\nJust send text to chat with Pi; messages sent while it is working act as steering.\n\n` + BOT_COMMANDS.map((c) => `/${c.command.padEnd(19)} ${c.description}`).join("\n");
-
 function parseCommand(text) {
   const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
   return match ? { name: match[1].toLowerCase(), argument: match[2]?.trim() ?? "" } : null;
 }
-
 function buildDevPath(basePath = process.env.PATH) {
   const home = homedir();
   const extra = [join(home, ".local/bin"), join(home, ".bun/bin"), join(home, ".cargo/bin"), join(home, ".opencode/bin"), join(home, ".antigravity/antigravity/bin"), "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", dirname(process.execPath)];
   return [...new Set([...extra, ...(basePath || "/usr/bin:/bin:/usr/sbin:/sbin").split(":")].filter(Boolean))].join(":");
 }
-
 process.env.PATH = buildDevPath(process.env.PATH);
-
-const retryableTelegramStatus = (status) => status === 429 || status >= 500;
-
 // ref: AWS Architecture Blog — Exponential Backoff And Jitter (https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
 function pollBackoffMs(failures, random = Math.random) {
-  const f = Math.max(1, failures);
-  return Math.max(500, Math.round(random() * Math.min(60_000, 1000 * (2 ** (f - 1)))));
+  return Math.max(500, Math.round(random() * Math.min(60_000, 1000 * (2 ** (Math.max(1, failures) - 1)))));
 }
-
 const NON_IDEMPOTENT_METHODS = new Set(["sendMessage", "sendDocument", "sendPhoto", "sendMediaGroup", "copyMessage", "forwardMessage"]);
 const CONNECT_PHASE_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
-const isConnectPhaseError = (error) => CONNECT_PHASE_CODES.has(error?.cause?.code || error?.code);
 // ref: https://core.telegram.org/bots/api#making-requests — avoid replaying non-idempotent requests after ambiguous failures.
 function shouldRetryTelegram(method, { status, error } = {}) {
-  const nonIdempotent = NON_IDEMPOTENT_METHODS.has(method);
-  if (typeof status === "number") return nonIdempotent ? status === 429 : retryableTelegramStatus(status);
-  return error != null && (!nonIdempotent || isConnectPhaseError(error));
+  const safe = !NON_IDEMPOTENT_METHODS.has(method);
+  return typeof status === "number" ? status === 429 || safe && status >= 500
+    : error != null && (safe || CONNECT_PHASE_CODES.has(error.cause?.code || error.code));
 }
-
 function telegramCommandName(command) {
   const name = command.source === "skill" ? `skill_${command.name.slice("skill:".length)}` : command.name;
   return name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 32);
 }
-
 // ref: https://core.telegram.org/bots/api#botcommand — normalization and the 32-character limit can collapse distinct Pi names.
 function commandRoutes(commands) {
   const routes = new Map();
@@ -88,20 +76,16 @@ function commandRoutes(commands) {
   }
   return routes;
 }
-
 function expandableBlockquote(text) {
   const clean = String(text || "").trim();
   return clean ? `\`\`\`expandable\n${clean}\n\`\`\`` : "";
 }
-
 // markdown-it + 自定义 renderer → Telegram HTML 子集（b/i/s/u/code/pre/a/blockquote）
 // html:false：模型输出里的原始 HTML 一律转义，防注入；linkify:true：裸 URL 自动成链接
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
-
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const { rules } = md.renderer;
-
 rules.code_inline = (t, i) => `<code>${esc(t[i].content)}</code>`;
 rules.fence = (t, i) => {
   const info = (t[i].info || "").trim().split(/\s+/)[0];
@@ -113,13 +97,11 @@ rules.fence = (t, i) => {
 };
 rules.code_block = (t, i) => `<pre>${esc(t[i].content)}</pre>\n\n`;
 
-rules.paragraph_open = () => "";
+for (const [type, text] of Object.entries({
+  paragraph_open: "", heading_open: "<b>", heading_close: "</b>\n\n", blockquote_open: "<blockquote>", blockquote_close: "</blockquote>\n\n",
+  link_close: "</a>", hardbreak: "\n", softbreak: "\n", hr: "─ ─ ─\n\n", list_item_close: "\n",
+})) rules[type] = () => text;
 rules.paragraph_close = () => (listStack.length ? "" : "\n");
-rules.heading_open = () => "<b>";
-rules.heading_close = () => "</b>\n\n";
-rules.blockquote_open = () => "<blockquote>";
-rules.blockquote_close = () => "</blockquote>\n\n";
-
 // 列表：去掉 ul/ol 包装；有序序号自计数；嵌套按层级缩进（render 同步执行，模块级栈安全）
 let listStack = [];
 // ref: https://markdown-it.github.io/markdown-it/#Renderer.rules — share rendering for equivalent token types.
@@ -134,25 +116,17 @@ rules.bullet_list_close = rules.ordered_list_close = () => {
   return listStack.length ? "" : "\n";
 };
 rules.list_item_open = () => {
-  const depth = listStack.length;
-  const top = listStack[depth - 1];
+  const depth = listStack.length, top = listStack[depth - 1];
   if (top === null) return `${"  ".repeat(depth - 1)}• `;
   listStack[depth - 1] = top + 1;
   return `${"  ".repeat(depth - 1)}${top + 1}. `;
 };
-rules.list_item_close = () => "\n";
-
 rules.link_open = (t, i) => `<a href="${escAttr(t[i].attrGet("href") || "")}">`;
-rules.link_close = () => "</a>";
 rules.image = (t, i) => {
   const src = t[i].attrGet("src") || "";
   const alt = (t[i].children || []).map((c) => c.content).join("") || src;
   return `<a href="${escAttr(src)}">${esc(alt)}</a>`;
 };
-
-rules.hardbreak = () => "\n";
-rules.softbreak = () => "\n";
-rules.hr = () => "─ ─ ─\n\n";
 
 const rawRender = md.renderer.render.bind(md.renderer);
 md.renderer.render = (tokens, options, env) => {
@@ -164,11 +138,8 @@ md.renderer.render = (tokens, options, env) => {
       .replaceAll("\n</blockquote>", "</blockquote>")
       // Telegram 无 <table>：拆成手机友好的标题行 + bullet 行（保留单元格内行内标记）
       .replace(/<table>[\s\S]*?<\/table>/g, (m) => {
-        const rows = m.match(/<tr>[\s\S]*?<\/tr>/g) || [];
-        const cells = rows
-          .map((r) => (r.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/g) || [])
-            .map((c) => c.replace(/<\/?t[hd][^>]*>/g, "").trim()));
-        const body = cells.filter((cs) => !cs.every((c) => !c || /^:?-+:?$/.test(c.replace(/<[^>]+>/g, ""))));
+        const body = (m.match(/<tr>[\s\S]*?<\/tr>/g) || []).map((r) => (r.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/g) || [])
+          .map((c) => c.replace(/<\/?t[hd][^>]*>/g, "").trim())).filter((cs) => !cs.every((c) => !c || /^:?-+:?$/.test(c.replace(/<[^>]+>/g, ""))));
         if (body.length < 2) return m;
         const [head, ...data] = body;
         return [`<b>${head.join(" · ")}</b>`, ...data.map((r) => `• ${r.join(" — ")}`)].join("\n") + "\n\n";
@@ -178,11 +149,8 @@ md.renderer.render = (tokens, options, env) => {
     listStack = [];
   }
 };
-
 const telegramHtml = (text) => md.render(String(text || ""));
-
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-
 function scanFence(text) {
   let open = null;
   for (const line of text.split("\n")) {
@@ -193,16 +161,12 @@ function scanFence(text) {
   }
   return open;
 }
-
 function renderChunk(text, from, to) {
-  const slice = text.slice(from, to);
-  const openStart = scanFence(text.slice(0, from));
-  const openEnd = scanFence(text.slice(0, to));
+  const slice = text.slice(from, to), openStart = scanFence(text.slice(0, from)), openEnd = scanFence(text.slice(0, to));
   const pre = openStart ? `${openStart.marker}${openStart.info}\n` : "";
   const suf = openEnd ? `${slice.endsWith("\n") ? "" : "\n"}${openEnd.marker}` : "";
   return pre + slice + suf;
 }
-
 function chunks(text, limit = MAX_MESSAGE) {
   const str = String(text || "(empty)");
   if (str.length <= limit) return [str];
@@ -219,41 +183,17 @@ function chunks(text, limit = MAX_MESSAGE) {
   if (from < str.length) parts.push(renderChunk(str, from, str.length));
   return parts;
 }
-
 const extractText = (content) => typeof content === "string" ? content
   : Array.isArray(content) ? content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : "";
-
 function toolSummary(name, args = {}) {
   const val = args?.command || args?.path || args?.pattern || args?.query || (Array.isArray(args?.queries) && args.queries.join(", ")) || args?.url || Object.values(args || {}).find((v) => typeof v === "string");
   if (val) return `${name}: ${val}`;
   const json = JSON.stringify(args || {});
   return json && json !== "{}" ? `${name} ${json}` : name;
 }
-
-function formatContextTokens(count) {
-  if (!count || typeof count !== "number") return "";
-  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-  if (count >= 1_000) return `${Math.round(count / 1_000)}K`;
-  return String(count);
-}
-
-function formatSessionReset({ model, cwd }) {
-  const context = formatContextTokens(model?.contextWindow);
-  return [
-    "✨ Session reset! Starting fresh.\n",
-    `◆ Model: ${model?.id || "unknown"}`, `◆ Provider: ${model?.provider || "unknown"}`,
-    `◆ Context: ${context ? `${context} tokens (detected)` : "unknown"}`,
-    `◆ Endpoint: ${model?.baseUrl || "unknown"}`, `◆ CWD: ${cwd}`,
-  ].join("\n");
-}
-
-function extensionFromMime(mime = "") {
-  const map = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "video/quicktime": ".mov", "application/pdf": ".pdf" };
-  return map[String(mime).toLowerCase()] || "";
-}
-
+const MIME_EXTENSIONS = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "video/quicktime": ".mov", "application/pdf": ".pdf" };
+const extensionFromMime = (mime = "") => MIME_EXTENSIONS[String(mime).toLowerCase()] || "";
 const attachmentPrompt = (caption, files) => `${caption}\n\nAttachments saved locally:\n${files.map((file) => `- ${file.path}`).join("\n")}`;
-
 function formatAssistantError(errorMessage) {
   const message = String(errorMessage || "Model call failed");
   const tip = /usage limit|quota|balance|credit|insufficient|budget/i.test(message)
@@ -261,7 +201,6 @@ function formatAssistantError(errorMessage) {
     : /rate limit|too many requests|429/i.test(message) ? "provider rate limit hit. Retry shortly, or use /model to switch models." : "";
   return tip ? `⚠️ ${message}\n\n💡 Tip: ${tip}` : `❌ ${message}`;
 }
-
 async function runStt(sttCommand, audioPath) {
   try {
     const text = await runCommand("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
@@ -269,13 +208,11 @@ async function runStt(sttCommand, audioPath) {
     return text;
   } catch (error) { throw new Error(`Speech-to-text failed: ${error.message.slice(-300)}`); }
 }
-
 function resolvePath(pathStr, baseDir = process.cwd()) {
   if (!pathStr || typeof pathStr !== "string") return "";
   const expanded = pathStr.startsWith("~/") ? join(homedir(), pathStr.slice(2)) : pathStr === "~" ? homedir() : pathStr;
   return resolve(baseDir, expanded);
 }
-
 // pure routing: 判定消息归属的主会话 ("main") 或私聊 Topic ("t:<threadId>")
 // ref: Telegram Bot API 9.3 (2025-12-31) Topics in private chats (https://core.telegram.org/bots/api-changelog)
 function sessionKeyOf(message) {
@@ -283,25 +220,18 @@ function sessionKeyOf(message) {
   if (!m || m.chat?.type && m.chat.type !== "private" || !m.message_thread_id || m.is_topic_message === false) return "main";
   return `t:${m.message_thread_id}`;
 }
-
 function loadState(stateDir) {
   try {
     const raw = JSON.parse(readFileSync(join(stateDir, "state.json"), "utf8"));
-    const topics = {};
-    if (typeof raw.topics === "object" && raw.topics !== null) {
-      for (const [threadId, info] of Object.entries(raw.topics)) {
-        if (typeof info?.cwd === "string" && existsSync(info.cwd)) topics[threadId] = { cwd: info.cwd };
-      }
-    }
+    const topics = Object.fromEntries(Object.entries(raw.topics || {})
+      .filter(([, info]) => typeof info?.cwd === "string" && existsSync(info.cwd)).map(([id, info]) => [id, { cwd: info.cwd }]));
     const herdrPanes = {};
-    if (typeof raw.herdrPanes === "object" && raw.herdrPanes !== null) {
-      for (const [key, paneId] of Object.entries(raw.herdrPanes)) {
-        if (typeof paneId === "string" && paneId) herdrPanes[key] = paneId;
-        else if (paneId && typeof paneId === "object" && typeof paneId.cwd === "string") {
-          const { cwd, sessionFile, workspaceId, owned } = paneId;
-          herdrPanes[key] = { cwd, ...(paneId.paneId ? { paneId: paneId.paneId } : {}),
-            ...(sessionFile ? { sessionFile } : {}), ...(workspaceId ? { workspaceId } : {}), owned: owned === true };
-        }
+    for (const [key, pane] of Object.entries(typeof raw.herdrPanes === "object" && raw.herdrPanes || {})) {
+      if (typeof pane === "string" && pane) herdrPanes[key] = pane;
+      else if (pane && typeof pane === "object" && typeof pane.cwd === "string") {
+        const { cwd, paneId, sessionFile, workspaceId, owned } = pane;
+        herdrPanes[key] = { cwd, ...(paneId ? { paneId } : {}), ...(sessionFile ? { sessionFile } : {}),
+          ...(workspaceId ? { workspaceId } : {}), owned: owned === true };
       }
     }
     return { cwd: typeof raw.cwd === "string" ? raw.cwd : null, topics, herdrPanes, pendingRestartMessageId: Number.isSafeInteger(raw.pendingRestartMessageId) && raw.pendingRestartMessageId > 0 ? raw.pendingRestartMessageId : null };
@@ -323,24 +253,18 @@ function loadConfig() {
   const targetCwd = savedState.cwd || (file.cwd ? resolvePath(file.cwd, configDir) : null);
   if (!targetCwd) throw new Error(`"cwd" is required: set "cwd" in ${path}`);
 
-  const telegram = typeof file.telegram === "object" && file.telegram !== null ? file.telegram : {};
+  const telegram = file.telegram && typeof file.telegram === "object" ? file.telegram : {};
   const config = {
-    botToken: telegram.botToken,
-    allowedUserId: String(telegram.allowedUserId || ""),
-    cwd: targetCwd,
-    configPath: path,
-    stateDir,
+    botToken: telegram.botToken, allowedUserId: String(telegram.allowedUserId || ""),
+    cwd: targetCwd, configPath: path, stateDir, downloadsDir: join(stateDir, "downloads"),
     presenceFile: file.presenceFile ? resolvePath(file.presenceFile, configDir) : "",
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     sttCommand: file.sttCommand || "",
   };
-  config.downloadsDir = join(config.stateDir, "downloads");
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid telegram.botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid telegram.allowedUserId in ${path}`);
-  let cwdIsDir = false;
-  try { cwdIsDir = statSync(config.cwd).isDirectory(); } catch {}
-  if (!cwdIsDir) throw new Error(`Pi working directory does not exist or is not a directory: ${config.cwd}`);
-  return config;
+  try { if (statSync(config.cwd).isDirectory()) return config; } catch {}
+  throw new Error(`Pi working directory does not exist or is not a directory: ${config.cwd}`);
 }
 
 class Telegram {
@@ -351,15 +275,14 @@ class Telegram {
     });
   }
   async call(method, body = {}, timeout = 35_000, maxAttempts = 3, signal = null, quiet = false) {
-    let lastError;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       let status, retryAfter;
       try {
         const reqSignal = signal ? AbortSignal.any([AbortSignal.timeout(timeout), signal]) : AbortSignal.timeout(timeout);
         const res = await fetch(`${this.base}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: reqSignal });
         const data = await res.json();
         if (res.ok && data.ok) {
-          if (method !== "getUpdates" || data.result?.length) console.log(`${new Date().toISOString()} [tg:call] ${method} ok${method === "getUpdates" ? ` (updates: ${data.result.length})` : ""}`);
+          if (method !== "getUpdates" || data.result?.length) log("tg:call", `${method} ok${method === "getUpdates" ? ` (updates: ${data.result.length})` : ""}`);
           return data.result;
         }
         status = res.status;
@@ -367,32 +290,35 @@ class Telegram {
         throw new Error(`Telegram ${method}: ${data.description || status}`);
       } catch (error) {
         if (signal?.aborted) throw error;
-        if (!quiet) console.error(`${new Date().toISOString()} [tg:call] ${method} attempt ${attempt + 1}/${maxAttempts} failed:`, error.message);
-        lastError = error;
-        if (!shouldRetryTelegram(method, { status, error }) || attempt === maxAttempts - 1) throw error;
+        if (!quiet) log("tg:call", `${method} attempt ${attempt}/${maxAttempts} failed:`, error.message);
+        if (attempt >= maxAttempts || !shouldRetryTelegram(method, { status, error })) throw error;
         // ref: https://core.telegram.org/bots/api#responseparameters — 429 retries honor retry_after.
-        await sleep((retryAfter || attempt + 1) * 1000);
+        await sleep((retryAfter || attempt) * 1000);
       }
     }
-    throw lastError;
   }
-  async sendOne(chatId, text, extra = {}) {
-    const plain = String(text || "(empty)");
+  async htmlMessage(method, fields, text, extra = {}) {
+    const plain = String(text || "(empty)"), editing = method === "editMessageText";
     try {
-      return await this.call("sendMessage", { chat_id: chatId, text: telegramHtml(plain), parse_mode: "HTML", ...extra });
+      return await this.call(method, { ...fields, text: telegramHtml(plain), parse_mode: "HTML", ...extra });
     } catch (error) {
       const msg = String(error.message || "");
-      if (!msg.includes("can't parse entities") && !msg.includes("message is too long")) throw error;
-      // ref: https://core.telegram.org/bots/api#sendmessage — HTML parse/length failures may fall back to plain text.
-      console.error("HTML parse/length fallback:", error.message);
-      let lastMsg;
-      const base = { message_thread_id: extra.message_thread_id, disable_notification: extra.disable_notification };
-      for (let i = 0; i < plain.length; i += 4000) {
-        lastMsg = await this.call("sendMessage", { chat_id: chatId, text: plain.slice(i, i + 4000), ...(i + 4000 >= plain.length ? extra : base) });
+      if (!msg.includes("can't parse entities") && !msg.includes("message is too long")) {
+        if (editing && msg.includes("message is not modified")) return;
+        throw error;
       }
-      return lastMsg;
+      // ref: https://core.telegram.org/bots/api#sendmessage — HTML parse/length failures may fall back to plain text.
+      log("tg:call", "HTML parse/length fallback:", error.message);
+      const length = editing ? Math.min(4000, plain.length) : plain.length;
+      const base = { message_thread_id: extra.message_thread_id, disable_notification: extra.disable_notification };
+      let last;
+      for (let i = 0; i < length; i += 4000) last = await this.call(method, {
+        ...fields, text: plain.slice(i, i + 4000), ...(i + 4000 >= length ? extra : base),
+      });
+      return last;
     }
   }
+  sendOne(chatId, text, extra = {}) { return this.htmlMessage("sendMessage", { chat_id: chatId }, text, extra); }
   async send(chatId, text, extra = {}) {
     let last;
     const parts = chunks(text), base = {};
@@ -401,22 +327,8 @@ class Telegram {
     for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : base);
     return last;
   }
-  async edit(chatId, messageId, text) {
-    const plain = String(text || "(empty)");
-    try {
-      return await this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: telegramHtml(plain), parse_mode: "HTML" });
-    } catch (error) {
-      const msg = String(error.message || "");
-      if (msg.includes("can't parse entities") || msg.includes("message is too long")) {
-        console.error("HTML parse/length fallback:", error.message);
-        return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text: plain.slice(0, 4000) });
-      }
-      if (!error.message.includes("message is not modified")) throw error;
-    }
-  }
-  answer(callbackQueryId, text = "") {
-    return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch(console.error);
-  }
+  edit(chatId, messageId, text) { return this.htmlMessage("editMessageText", { chat_id: chatId, message_id: messageId }, text); }
+  answer(callbackQueryId, text = "") { return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch((error) => log("tg:call", error)); }
   async sendDocument(chatId, path, extra = {}) {
     const form = new FormData();
     form.set("chat_id", String(chatId));
@@ -425,21 +337,17 @@ class Telegram {
     const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
-    console.log(`${new Date().toISOString()} [tg:call] sendDocument ok`);
+    log("tg:call", `sendDocument ok`);
   }
   // ref: https://core.telegram.org/bots/api#sendmessagedraft — drafts are temporary; persist finals with sendMessage.
   draft(chatId, draftId, text, extra = {}) {
-    return this.call("sendMessageDraft", {
-      chat_id: chatId, draft_id: draftId, text: text ? telegramHtml(text) : "", parse_mode: "HTML", ...extra,
-    }, 10_000, 1);
+    return this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: text ? telegramHtml(text) : "", parse_mode: "HTML", ...extra }, 10_000, 1);
   }
   // ref: https://core.telegram.org/bots/api#setmessagereaction — one emoji per bot, [] clears it.
   async react(chatId, messageId, emoji) {
     if (!messageId) return null;
     try {
-      return await this.call("setMessageReaction", {
-        chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: "emoji", emoji }] : [],
-      }, 10_000, 1);
+      return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: "emoji", emoji }] : [] }, 10_000, 1);
     } catch { return null; }
   }
   stopPolling() {
@@ -458,64 +366,44 @@ class Telegram {
         this.currentPollAc = null;
         if (!this.polling) break;
         this.inConflict = false;
-        if (this.pollFailures > 0) {
-          const s = Math.round((Date.now() - this.outageStart) / 1000);
-          console.log(`${new Date().toISOString()} [tg:poll] back online after ${s}s (${this.pollFailures} failed polls)`);
-          this.pollFailures = 0;
-          this.outageStart = 0;
-        }
+        if (this.pollFailures) log("tg:poll", `back online after ${Math.round((Date.now() - this.outageStart) / 1000)}s (${this.pollFailures} failed polls)`);
+        this.pollFailures = this.outageStart = 0;
         for (const update of updates) {
           if (!this.polling) break;
           offset = update.update_id + 1;
-          const done = handler(update);
-          if (done) {
-            const mark = update.update_id + 1;
-            persistChain = persistChain.then(() => done).then(async () => {
-              const tmp = `${this.offsetPath}.tmp`;
-              await writeFile(tmp, String(mark), { mode: 0o600 });
-              await rename(tmp, this.offsetPath);
-            }).catch((err) => console.error(`${new Date().toISOString()} [tg:poll] offset persist:`, err.message));
-          }
+          const done = handler(update), mark = offset;
+          if (done) persistChain = persistChain.then(() => done).then(async () => {
+            const tmp = `${this.offsetPath}.tmp`;
+            await writeFile(tmp, String(mark), { mode: 0o600 });
+            await rename(tmp, this.offsetPath);
+          }).catch((err) => log("tg:poll", `offset persist:`, err.message));
         }
       } catch (error) {
         this.currentPollAc = null;
         if (!this.polling) break;
         const conflict = error.message?.includes("Conflict");
-        if (conflict) {
-          if (!this.inConflict) console.error(`${new Date().toISOString()} [tg:poll] conflict: ${error.message}`);
-          this.inConflict = true;
-        } else {
-          this.inConflict = false;
-          if (++this.pollFailures === 1) {
-            this.outageStart = Date.now();
-            console.error(`${new Date().toISOString()} [tg:poll] offline: ${error.message}; retrying with backoff`);
-          }
+        if (conflict && !this.inConflict) log("tg:poll", `conflict: ${error.message}`);
+        if (!conflict && ++this.pollFailures === 1) {
+          this.outageStart = Date.now();
+          log("tg:poll", `offline: ${error.message}; retrying with backoff`);
         }
-        const backoffMs = conflict ? 15_000 : pollBackoffMs(this.pollFailures);
-        try {
-          this.currentPollAc = new AbortController();
-          await sleep(backoffMs, undefined, { signal: this.currentPollAc.signal });
-        } catch {} finally {
-          this.currentPollAc = null;
-        }
+        this.inConflict = conflict;
+        this.currentPollAc = new AbortController();
+        await sleep(conflict ? 15_000 : pollBackoffMs(this.pollFailures), undefined, { signal: this.currentPollAc.signal }).catch(() => {});
+        this.currentPollAc = null;
       }
     }
   }
 }
 
 function runCommand(cmd, args = [], options = {}) {
-  if (HERDR_DISABLED_FOR_TEST && (cmd.includes("herdr") || args.some((a) => String(a).includes("herdr")))) {
-    throw new Error(`Self-test must never call herdr: ${cmd} ${args.join(" ")}`);
-  }
+  if (HERDR_DISABLED_FOR_TEST && (cmd.includes("herdr") || args.some((a) => String(a).includes("herdr")))) throw new Error(`Self-test must never call herdr: ${cmd} ${args.join(" ")}`);
   const { okCodes = [0], ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
     const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], killSignal: "SIGKILL", ...spawnOptions });
-    let stdout = "";
-    let stderr = "";
-    cp.stdout?.setEncoding("utf8");
-    cp.stderr?.setEncoding("utf8");
-    cp.stdout?.on("data", (d) => { stdout += d; });
-    cp.stderr?.on("data", (d) => { stderr += d; });
+    let stdout = "", stderr = "";
+    cp.stdout?.setEncoding("utf8").on("data", (d) => { stdout += d; });
+    cp.stderr?.setEncoding("utf8").on("data", (d) => { stderr += d; });
     cp.on("error", reject); // ref: https://nodejs.org/api/child_process.html#event-exit — inherited stdio may outlive the timed-out child.
     cp.on("exit", () => {
       if (cp.killed) reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
@@ -527,40 +415,11 @@ function runCommand(cmd, args = [], options = {}) {
   });
 }
 
-// ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-async function resolveHerdrEnvironment(cwd, {
-  excludePaneIds = [], threadId, persistedPaneId, paneEnv = {}, runCmd = runCommand, herdrBin, socketPath,
-} = {}) {
-  if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand || !herdrBin || !socketPath) return {};
-  let pane, created = false;
-  if (persistedPaneId && !excludePaneIds.includes(persistedPaneId)) {
-    try { pane = JSON.parse(await runCmd(herdrBin, ["pane", "get", persistedPaneId], { timeout: 3000 })).result?.pane; } catch {}
-  }
-  if (!pane?.pane_id) {
-    try {
-      const label = `${basename(cwd) || "remote-pi"}${threadId ? `#${threadId}` : ""}`;
-      const args = ["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus",
-        ...Object.entries(paneEnv).flatMap(([k, v]) => ["--env", `${k}=${v}`])];
-      const result = JSON.parse(await runCmd(herdrBin, args, { timeout: 5000 })).result;
-      pane = { ...result?.root_pane, workspace_id: result?.workspace?.workspace_id, tab_id: result?.tab?.tab_id };
-      created = Boolean(pane.pane_id);
-    } catch (error) { console.warn(`[herdr] failed to create workspace for ${cwd}: ${error.message}`); }
-  }
-  if (!pane?.pane_id) return {};
-  return {
-    HERDR_ENV: "1", HERDR_BIN_PATH: herdrBin, HERDR_SOCKET_PATH: socketPath,
-    HERDR_PANE_ID: pane.pane_id, HERDR_WORKSPACE_ID: pane.workspace_id, HERDR_TAB_ID: pane.tab_id,
-    REMOTE_PI_CREATED_PANE: created ? "1" : "0",
-  };
-}
-
 // ref: Herdr pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
 function resolveAgentSessionFile(agent) {
   const session = agent?.agent_session;
-  if (session?.kind === "path" && session.value) return session.value;
-  if (typeof session?.path === "string") return session.path;
-  if (typeof session === "string") return session;
-  return agent?.tokens?.remote_pi_session || null;
+  return session?.kind === "path" && session.value ? session.value : typeof session?.path === "string" ? session.path
+    : typeof session === "string" ? session : agent?.tokens?.remote_pi_session || null;
 }
 
 const herdrTail = (screen, maxLines = 30, maxChars = 2500) =>
@@ -568,9 +427,9 @@ const herdrTail = (screen, maxLines = 30, maxChars = 2500) =>
 
 const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
 
-async function waitForShell(bin, paneId, options, attempts) {
+async function waitForShell(bin, paneId, options, attempts, runCmd = runCommand) {
   for (let i = 0; i < attempts; i++) {
-    const raw = await runCommand(bin, ["pane", "process-info", "--pane", paneId], options);
+    const raw = await runCmd(bin, ["pane", "process-info", "--pane", paneId], options);
     if (paneHasForegroundShell(JSON.parse(raw).result?.process_info)) return true;
     if (i + 1 < attempts) await sleep(100);
   }
@@ -601,8 +460,7 @@ class PaneServer {
       this.sockets.add(socket);
       let connection;
       let chain = Promise.resolve();
-      const handshake = setTimeout(() => socket.destroy(), 5000);
-      handshake.unref?.();
+      const handshake = setTimeout(() => socket.destroy(), 5000).unref();
       socket.on("error", () => {});
       socket.on("close", () => {
         clearTimeout(handshake);
@@ -636,17 +494,10 @@ class PaneServer {
         }).catch((error) => socket.destroy(error));
       });
     });
-    server.on("error", (error) => console.error(`[bridge] ${error.message}`));
-    await new Promise((done, reject) => {
-      server.once("error", reject);
-      server.listen(this.path, () => {
-        server.off("error", reject);
-        done();
-      });
-    });
+    server.on("error", (error) => log("bridge", `${error.message}`));
+    await once(server.listen(this.path), "listening");
     await chmod(this.path, 0o600);
-    this.server = server;
-    server.unref();
+    this.server = server.unref();
   }
   find({ paneId, sessionFile }) {
     return [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable &&
@@ -710,9 +561,7 @@ class PaneRpc {
     this.session.binding = { ...this.session.binding, paneId: connection.hello.paneId, sessionFile: connection.hello.sessionFile, cwd: connection.hello.cwd };
     this.session.cwd = connection.hello.cwd;
     for (const [id, pending] of this.pending) {
-      if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume"].includes(connection.hello.reason)) {
-        this.finish(id, null, { cancelled: false });
-      }
+      if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume"].includes(connection.hello.reason)) this.finish(id, null, { cancelled: false });
     }
   }
   receive(record) {
@@ -725,8 +574,7 @@ class PaneRpc {
   }
   disconnected(connection) {
     if (this.connection !== connection) return;
-    this.proc = null;
-    this.connection = null;
+    this.proc = this.connection = null;
     connection.clients.delete(this);
     const replacing = [...this.pending.values()].some((p) => p.replacing);
     for (const [id, pending] of this.pending) {
@@ -751,8 +599,7 @@ class PaneRpc {
   stop() {
     this.stopping = true;
     this.connection?.clients.delete(this);
-    this.connection = null;
-    this.proc = null;
+    this.proc = this.connection = null;
     for (const id of this.pending.keys()) this.finish(id, new Error("Pi view detached"));
   }
 }
@@ -760,29 +607,21 @@ class PaneRpc {
 // A Telegram view of a native interactive Pi; multiple views may share the same PaneRpc connection.
 class ChatSession {
   constructor(gateway, { threadId = null, cwd }) {
-    this.gateway = gateway;
-    this.threadId = threadId;
-    this.key = threadId ? `t:${threadId}` : "main";
-    this.cwd = cwd;
+    Object.assign(this, { gateway, threadId, key: threadId ? `t:${threadId}` : "main", cwd, chatId: gateway.chatId });
     const stored = gateway.state.herdrPanes?.[this.key];
     this.binding = typeof stored === "string" ? { paneId: stored, cwd, owned: true } : { cwd, ...stored };
-    this.chatId = gateway.chatId;
     Object.assign(this, {
       run: null, lastDraftAt: -Infinity, nextOrigin: "telegram", nextTrigger: null,
       isStreaming: false, lastModel: null, lastPrompt: null, lastTopicName: null,
-      mediaGroups: new Map(), eventChain: Promise.resolve(), updateChain: Promise.resolve(),
+      mediaGroups: new Map(), eventChain: Promise.resolve(), updateChain: Promise.resolve(), uploadChain: Promise.resolve(),
     });
-    this.pi = new PaneRpc(this, (event) => this.queueEvent(event), (exit) => {
-      this.handlePiExit(exit).catch((error) => console.warn(`[bridge] disconnect: ${error.message}`));
-    });
+    this.pi = new PaneRpc(this, (event) => this.queueEvent(event), ({ expected }) => { if (!expected) this.clearRun(true); });
   }
   threadExtra(extra = {}) { return this.threadId ? { message_thread_id: this.threadId, ...extra } : extra; }
   send(text, extra = {}) { return this.gateway.telegram.send(this.chatId, text, this.threadExtra(extra)); }
   action(payload, ttl = 10 * 60_000) { return this.gateway.action({ ...payload, sessionKey: this.key }, ttl); }
   keyboard(items, ttl) { return { reply_markup: { inline_keyboard: items.map(({ label, action }) => [{ text: label.slice(0, 60), callback_data: this.action(action, ttl) }]) } }; }
-  queueEvent(event) {
-    this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => console.error(`Pi event [${this.key}]:`, error));
-  }
+  queueEvent(event) { this.eventChain = this.eventChain.then(() => this.handleEvent(event)).catch((error) => log("bridge", `Pi event [${this.key}]:`, error)); }
   clearRun(aborted = false) {
     const run = this.run;
     if (run) {
@@ -790,31 +629,25 @@ class ChatSession {
       const emoji = run.error ? "💔" : aborted || run.aborted ? null : run.replied ? "👌" : "🤷";
       void this.gateway.telegram.react(this.chatId, run.trigger, emoji);
     }
-    this.run = null;
-    this.isStreaming = false;
+    Object.assign(this, { run: null, isStreaming: false });
   }
   async tickRun(now = Date.now()) {
     const run = this.run;
     if (!run || run.disabled || run.delivering || run.pending || now - this.lastDraftAt < 1500) return;
     const tail = run.text ? chunks(run.text, 3500).at(-1) : "";
     const text = [tail, run.tool ? `⚙️ ${run.tool.slice(0, 300)}` : ""].filter(Boolean).join("\n\n");
-    if (text === run.sent && now - this.lastDraftAt < 20_000) return;
+    if (!text && run.replied || text === run.sent && now - this.lastDraftAt < 20_000) return;
     run.sent = text;
     this.lastDraftAt = now;
     run.pending = this.gateway.telegram.draft(this.chatId, run.draftId, text, this.threadExtra()).catch((error) => {
       run.disabled = true;
-      console.error(`Draft [${this.key}] disabled:`, error.message);
+      log("draft", `[${this.key}] disabled:`, error.message);
     }).finally(() => { run.pending = null; });
     await run.pending;
   }
-  async handlePiExit({ expected }) {
-    if (expected) return;
-    this.clearRun(true);
-  }
   resetSessionState() {
     this.clearRun(true);
-    this.nextTrigger = null;
-    this.nextOrigin = "telegram";
+    Object.assign(this, { nextTrigger: null, nextOrigin: "telegram" });
     for (const group of this.mediaGroups.values()) {
       clearTimeout(group.timer);
       group.cancelled = true;
@@ -844,62 +677,48 @@ class ChatSession {
     }
     if (behavior === "followUp") await this.send("↪ Queued as follow-up", { disable_notification: true });
   }
+  async abortRun(shouldAbort = this.pi.proc) {
+    this.clearRun(true);
+    if (shouldAbort) await this.pi.request("abort").catch(() => {});
+    this.resetSessionState();
+  }
+  async newSession() {
+    await this.abortRun();
+    const before = this.pi.proc ? await this.pi.request("get_state").catch(() => null) : null;
+    const target = before?.model?.provider && before.model.id ? { provider: before.model.provider, modelId: before.model.id } : this.lastModel;
+    if ((await this.pi.request("new_session")).cancelled) return this.send("New session cancelled");
+    if (target) {
+      await this.pi.request("set_model", target).catch((err) => {
+        log("new", `failed to restore model ${target.provider}/${target.modelId}: ${err.message}`);
+      });
+      this.lastModel = target;
+    }
+    const state = await this.pi.request("get_state").catch(() => null);
+    return this.send(`✅ New session started${state?.model ? ` · ${state.model.provider}/${state.model.id}` : ""}`);
+  }
   async handleCommand({ name, argument }, original, updateId = null, triggerMessageId = null) {
+    const simple = {
+      start: "showHelp", help: "showHelp", model: "showModels", thinking: "showThinking",
+      resume: "showSessions", status: "showSession", new: "newSession",
+    };
+    if (Object.hasOwn(simple, name)) return this[simple[name]](argument);
     switch (name) {
-      case "start":
-      case "help":
-        await this.send(HELP);
-        return this.showCommands();
       case "topic": return this.gateway.handleTopicCommand(this, argument);
       case "close": return this.gateway.handleCloseCommand(this);
-      case "model": return this.showModels(argument);
-      case "thinking": return this.showThinking(argument);
-      case "resume": return this.showSessions();
-      case "new": {
-        this.clearRun(true);
-        if (this.pi.proc) {
-          await this.pi.request("abort").catch(() => {});
-        }
-        const stateBefore = this.pi.proc ? await this.pi.request("get_state").catch(() => null) : null;
-        const targetModel = (stateBefore?.model?.provider && stateBefore?.model?.id)
-          ? { provider: stateBefore.model.provider, modelId: stateBefore.model.id }
-          : (this.lastModel || null);
-        this.resetSessionState();
-        if (this.pi.proc) {
-          const result = await this.pi.request("new_session");
-          if (result.cancelled) return this.send("New session cancelled");
-        }
-        if (targetModel) {
-          await this.pi.request("set_model", targetModel).catch((err) => {
-            console.warn(`[new] failed to restore model ${targetModel.provider}/${targetModel.modelId}: ${err.message}`);
-          });
-          this.lastModel = targetModel;
-        }
-        const state = await this.pi.request("get_state").catch(() => null);
-        const modelStr = state?.model ? `${state.model.provider}/${state.model.id}` : "";
-        const modelNote = modelStr ? ` · ${modelStr}` : "";
-        return this.send(`✅ New session started${modelNote}`);
-      }
-      case "name": {
+      case "name":
         if (!argument) return this.send("Usage: /name <session-name>");
         await this.pi.request("set_session_name", { name: argument });
         return this.send(`✅ Session name set to: ${argument}`);
-      }
-      case "status": return this.showSession();
       case "compact": {
         const res = await this.pi.request("compact", argument ? { customInstructions: argument } : {});
         return this.send(res?.tokensBefore ? `Context compacted: ${res.tokensBefore} → ~${res.estimatedTokensAfter} tokens` : "Context compacted.");
       }
-      case "followup": {
+      case "followup":
         if (!argument) return this.send("Usage: /followup <message>");
         return this.prompt(argument, undefined, "followUp", triggerMessageId);
-      }
-      case "abort": {
-        this.clearRun(true);
-        if (this.pi.proc) await this.pi.request("abort").catch(() => {});
-        this.resetSessionState();
+      case "abort":
+        await this.abortRun();
         return this.send("⏹ Stopped (queued messages kept)");
-      }
       case "restart": {
         const message = await this.send("🔄 Restarting gateway…");
         await this.gateway.saveState({ pendingRestartMessageId: message.message_id });
@@ -914,9 +733,7 @@ class ChatSession {
       }
       case "sh": {
         if (!argument) return this.send("Usage: /sh <command>");
-        if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) {
-          return this.send("❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
-        }
+        if (/install\.sh\s+(restart|stop|uninstall)|launchctl\s+(bootout|kickstart)/i.test(argument)) return this.send("❌ Service restart/stop commands are blocked here. Send /restart to restart the gateway.");
         try {
           const res = await this.pi.request("bash", { command: argument });
           const output = res.output ? res.output.trim() : "(no output)";
@@ -926,14 +743,12 @@ class ChatSession {
         }
         return;
       }
-      default: {
-        const data = await this.pi.request("get_commands");
-        const targets = commandRoutes(data.commands).get(name);
-        if (targets?.size > 1) return this.send(`Ambiguous command: /${name}\nMatches: ${[...targets].map((target) => `/${target}`).join(", ")}\nUse an unambiguous native name from /help, or run it in the Pi terminal.`);
-        if (targets?.size === 1) return this.prompt(`/${[...targets][0]}${argument ? ` ${argument}` : ""}`, undefined, undefined, triggerMessageId);
-        return this.send(`Unknown command: /${name}\nUse /help`);
-      }
     }
+    const data = await this.pi.request("get_commands");
+    const targets = commandRoutes(data.commands).get(name);
+    if (targets?.size > 1) return this.send(`Ambiguous command: /${name}\nMatches: ${[...targets].map((target) => `/${target}`).join(", ")}\nUse an unambiguous native name from /help, or run it in the Pi terminal.`);
+    if (targets?.size === 1) return this.prompt(`/${[...targets][0]}${argument ? ` ${argument}` : ""}`, undefined, undefined, triggerMessageId);
+    return this.send(`Unknown command: /${name}\nUse /help`);
   }
   async handleMediaGroup(messages) {
     const media = (await Promise.all(messages.map((m) => this.gateway.extractMedia(m)))).filter(Boolean);
@@ -943,6 +758,10 @@ class ChatSession {
       await this.prompt(files.length ? attachmentPrompt(caption || "Please review these files.", files) : caption,
         images.length ? images : undefined, undefined, messages[0]?.message_id);
     }
+  }
+  async showHelp() {
+    await this.send(HELP);
+    return this.showCommands();
   }
   async showCommands() {
     if (!this.pi.proc) return;
@@ -961,7 +780,7 @@ class ChatSession {
     const data = await this.pi.request("get_available_models");
     const models = data.models || [];
     const exact = query && models.find((m) => `${m.provider}/${m.id}` === query || m.id === query);
-    if (exact) return this.handleCallbackAction({ type: "model", provider: exact.provider, modelId: exact.id });
+    if (exact) return this.gateway.handleCallback(null, this, { type: "model", provider: exact.provider, modelId: exact.id });
     const filtered = models.filter((m) => !query || `${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase()));
     if (!filtered.length) return this.send(`No matching model: ${query}`);
     const display = filtered.slice(0, 18);
@@ -972,7 +791,7 @@ class ChatSession {
     const data = await this.pi.request("get_available_thinking_levels");
     if (argument) {
       if (!data.levels.includes(argument)) return this.send(`Available levels: ${data.levels.join(", ")}`);
-      return this.handleCallbackAction({ type: "thinking", level: argument });
+      return this.gateway.handleCallback(null, this, { type: "thinking", level: argument });
     }
     return this.send("Pick a thinking level:", this.keyboard(data.levels.map((l) => ({ label: l, action: { type: "thinking", level: l } }))));
   }
@@ -992,59 +811,9 @@ class ChatSession {
     ];
     await this.send(lines.join("\n"));
   }
-  async handleCallbackAction(action, callback) {
-    if (action.type === "jump_pane") {
-      const connection = this.gateway.bridge.connections.get(action.paneId);
-      if (!connection) return this.send("That Pi is not connected. Enable /remote-control in its pane first.");
-      const old = this.binding;
-      this.pi.stop();
-      this.resetSessionState();
-      this.cwd = connection.hello.cwd;
-      this.binding = { paneId: action.paneId, sessionFile: connection.hello.sessionFile, cwd: this.cwd, owned: false };
-      this.pi.bind(connection);
-      await this.gateway.persistPaneSession(this);
-      await this.send(`✅ This topic now views Pi in ${action.paneId}. Previous session ${old.paneId || ""} was not stopped.`);
-      return;
-    }
-    if (action.type === "model") {
-      await this.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
-      this.lastModel = { provider: action.provider, modelId: action.modelId };
-      await this.send(`✅ ${action.provider}/${action.modelId}`);
-    } else if (action.type === "retry") {
-      if (!this.lastPrompt) return this.send("No prompt to retry");
-      if (this.isStreaming) return this.send("⚠️ Still streaming; /abort first");
-      const { message, images, triggerMessageId } = this.lastPrompt;
-      await this.send(`🔁 Retrying last prompt (${message.length} chars)…`);
-      await this.prompt(message, images, undefined, triggerMessageId);
-    } else if (action.type === "thinking") {
-      await this.pi.request("set_thinking_level", { level: action.level });
-      await this.send(`✅ thinking: ${action.level}`);
-    } else if (action.type === "resume") {
-      const paneId = await this.gateway.liveSessionPane(action.path);
-      if (paneId && paneId !== this.binding.paneId) {
-        return this.send(`This session is already open in ${paneId}; no second Pi was started.`, this.keyboard([
-          { label: "View that Pi here", action: { type: "jump_pane", paneId } },
-        ]));
-      }
-      if (this.isStreaming) await this.pi.request("abort").catch(() => {});
-      this.resetSessionState();
-      const result = await this.pi.request("switch_session", { sessionPath: action.path });
-      await this.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
-    } else if (action.type === "ui") {
-      for (const [k, v] of this.gateway.actions) {
-        if (v.type === "ui" && v.requestId === action.requestId) this.gateway.actions.delete(k);
-      }
-      this.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
-      if (callback.message) {
-        const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
-        await this.gateway.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
-      }
-    }
-  }
   async handleEvent(event) {
     if (event.type === "remote_user_input") {
-      this.nextOrigin = "terminal";
-      this.nextTrigger = null;
+      Object.assign(this, { nextOrigin: "terminal", nextTrigger: null });
       await this.send(`🖥 ${event.text}`, { disable_notification: true });
       return;
     }
@@ -1056,7 +825,7 @@ class ChatSession {
       this.lastTopicName = newName;
       // ref: https://core.telegram.org/bots/api#editforumtopic — private chats support topic names.
       await this.gateway.telegram.call("editForumTopic", { chat_id: this.chatId, message_thread_id: this.threadId, name: newName })
-        .catch((error) => console.warn(`[topic] failed to rename topic ${this.threadId}: ${error.message}`));
+        .catch((error) => log("topic", `failed to rename topic ${this.threadId}: ${error.message}`));
       return;
     }
     if (event.type === "extension_ui_resolved") {
@@ -1082,41 +851,32 @@ class ChatSession {
     }
     if (event.type === "agent_settled") this.clearRun(event.aborted);
     if (!this.gateway.chatReady) return;
-    if (event.type === "compaction_end" && event.errorMessage) {
-      await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`, { disable_notification: true });
-    }
+    if (event.type === "compaction_end" && event.errorMessage) await this.send(`⚠️ Context compaction failed: ${event.errorMessage}`, { disable_notification: true });
     const run = this.run;
-    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta" && run) {
-      run.text += event.assistantMessageEvent.delta;
-    }
+    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta" && run) run.text += event.assistantMessageEvent.delta;
     if (event.type === "message_end" && event.message?.role === "assistant" && run) {
       const message = event.message;
       let text = extractText(message.content);
       if (message.stopReason === "aborted") run.aborted = true;
-      if (message.stopReason === "error" || message.errorMessage) {
-        run.error = true;
-        text = [text, formatAssistantError(message.errorMessage)].filter(Boolean).join("\n\n");
-      }
+      run.error = Boolean(message.stopReason === "error" || message.errorMessage);
+      if (run.error) text = [text, formatAssistantError(message.errorMessage)].filter(Boolean).join("\n\n");
       run.delivering = true;
       try {
         await run.pending;
         if (this.run !== run) return;
         if (text) {
           const extra = { disable_notification: message.stopReason === "toolUse" || run.origin !== "telegram" || this.gateway.isUserPresent() };
-          if ((message.stopReason === "error" || message.errorMessage) && this.lastPrompt) {
-            Object.assign(extra, this.keyboard([{ label: "🔁 Retry", action: { type: "retry" } }]));
-          }
+          if ((message.stopReason === "error" || message.errorMessage) && this.lastPrompt) Object.assign(extra, this.keyboard([{ label: "🔁 Retry", action: { type: "retry" } }]));
           await this.send(text, extra);
           run.replied = true;
         }
-        run.text = "";
-        run.draftId = randomBytes(4).readUInt32BE() || 1;
+        Object.assign(run, { text: "", draftId: randomBytes(4).readUInt32BE() || 1 });
       } finally { run.delivering = false; }
     }
     if (event.type === "tool_execution_start") {
       if (run) run.tool = toolSummary(event.toolName, event.args);
       // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — never log tool arguments.
-      console.log(`[tool] start: ${event.toolName}`);
+      log("tool", `start: ${event.toolName}`);
     }
     if (event.type === "tool_execution_end") {
       if (run) run.tool = null;
@@ -1124,8 +884,9 @@ class ChatSession {
         const rawPaths = event.result?.details?.paths || event.args?.paths || [];
         const paths = event.result?.details?.paths ? rawPaths : rawPaths.map((p) => resolve(this.cwd, p));
         for (const path of paths) {
-          this.gateway.queueUpload(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra())
-            .catch((error) => this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`)));
+          this.uploadChain = this.uploadChain.then(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra()))
+            .catch((error) => this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`))
+            .catch((error) => log("upload", error));
         }
       }
     }
@@ -1151,18 +912,12 @@ class Gateway {
     Object.assign(this, {
       config, chatId: config.allowedUserId, chatReady: false, state: loadState(config.stateDir),
       telegram: new Telegram(config.botToken, join(config.stateDir, "telegram-offset")), actions: new Map(),
-      als: new AsyncLocalStorage(), telegramChain: Promise.resolve(), uploadChain: Promise.resolve(),
       stateWriteChain: Promise.resolve(), paneStartChain: Promise.resolve(), downloadCleanupTimer: null,
       blockedTimer: null, blockedStatuses: new Map(), blockedPolling: false, herdrEnvironment: null,
       bridge: new PaneServer(join(config.stateDir, "bridge.sock"), (connection) => this.onPaneHello(connection)),
     });
-    for (const method of ["send", "sendOne", "edit"]) {
-      const original = this.telegram[method].bind(this.telegram);
-      this.telegram[method] = (...args) => this.queueTelegram(() => original(...args));
-    }
-    this.sessions = new Map();
     this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd });
-    this.sessions.set("main", this.mainSession);
+    this.sessions = new Map([["main", this.mainSession]]);
     // 延迟初始化 state.json 中持久化的有效 topic 会话
     for (const [threadId, info] of Object.entries(this.state.topics || {})) {
       if (info?.cwd && existsSync(info.cwd)) {
@@ -1173,9 +928,9 @@ class Gateway {
   }
   // ref: Claude Code Remote Control CLAUDE_CLIENT_PRESENCE_FILE skips phone pushes while present (https://code.claude.com/docs/en/remote-control)
   isUserPresent() {
-    try {
-      return Boolean(this.config?.presenceFile && statSync(this.config.presenceFile, { throwIfNoEntry: false }));
-    } catch { return false; }
+    try { return Boolean(this.config?.presenceFile && statSync(this.config.presenceFile, { throwIfNoEntry: false })); } catch {
+      return false;
+    }
   }
   async persistPaneSession(session) {
     this.state.herdrPanes = { ...this.state.herdrPanes, [session.key]: { ...session.binding, cwd: session.cwd } };
@@ -1189,16 +944,12 @@ class Gateway {
       if (!this.chatReady) return;
       const me = this.me || await this.telegram.call("getMe");
       if (!me?.has_topics_enabled) {
-        console.warn(`[bridge] Topics must be enabled to attach desktop pane ${hello.paneId}`);
+        log("bridge", `Topics must be enabled to attach desktop pane ${hello.paneId}`);
         return;
       }
-      const topicName = hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi";
-      const topicTitle = `📡 ${topicName}`.slice(0, 128);
-      const { message_thread_id: threadId } = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name: topicTitle });
-      const session = new ChatSession(this, { threadId, cwd: hello.cwd });
-      session.lastTopicName = topicTitle;
-      session.binding = { paneId: hello.paneId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false };
-      this.sessions.set(session.key, session);
+      const topicTitle = `📡 ${hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi"}`.slice(0, 128);
+      const session = await this.createTopic({ cwd: hello.cwd, name: topicTitle,
+        binding: { paneId: hello.paneId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false } });
       targets = [session];
       await session.send(`📡 Remote control on — ${hello.paneId}\n${hello.cwd}\nThe terminal and this topic share one Pi session.`);
       const recent = [["👤", hello.recent?.lastUserText], ["🤖", hello.recent?.lastAssistantText]]
@@ -1227,8 +978,7 @@ class Gateway {
     if (connected) return connected.hello.paneId;
     const env = this.herdrEnvironment;
     if (!env?.HERDR_BIN_PATH) return null;
-    const raw = await runCommand(env.HERDR_BIN_PATH, ["agent", "list"], { env: { ...process.env, ...env }, timeout: 5000 });
-    const data = JSON.parse(raw);
+    const data = JSON.parse(await runCommand(env.HERDR_BIN_PATH, ["agent", "list"], { env: { ...process.env, ...env }, timeout: 5000 }));
     return (data.result?.agents || data.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
   }
   ensurePaneSession(rpc, options = {}) {
@@ -1239,58 +989,55 @@ class Gateway {
   }
   // Returns true when rpc ends up bound to a live Pi pane. spawn:false attaches only —
   // a gateway (re)start must never create workspaces or launch Pi processes by itself.
-  async startPaneSession(rpc, { spawn = true } = {}) {
-    const session = rpc.session;
+  // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
+  async startPaneSession(rpc, { spawn = true, runCmd = runCommand } = {}) {
+    const session = rpc.session, file = session.binding.sessionFile;
     if (HERDR_DISABLED_FOR_TEST && !this.bridge.server) throw new Error("Self-test must provide a fake connected pane");
     await this.bridge.start();
     let connection = this.bridge.find(session.binding);
-    const file = session.binding.sessionFile;
-    const livePane = !connection && file ? await this.liveSessionPane(file) : null;
-    if (livePane) {
-      const env = this.herdrEnvironment;
-      const options = { env: { ...process.env, ...env }, timeout: 5000 };
-      if (!await waitForShell(env.HERDR_BIN_PATH, livePane, options, 1)) {
-        // A live Pi without hello is not permission to create another writer.
-        connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
-      }
-    }
-    if (connection) {
-      rpc.bind(connection);
-      await this.persistPaneSession(session);
-      return true;
-    }
-    if (!spawn) return false;
-    if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test must provide a fake connected pane");
-    const env = await resolveHerdrEnvironment(session.cwd, {
-      persistedPaneId: session.binding.paneId,
-      excludePaneIds: this.getOwnedPaneIds(session), threadId: session.threadId,
-      paneEnv: { REMOTE_PI_ATTACH: "1", REMOTE_PI_BRIDGE_SOCKET: this.bridge.path },
-      herdrBin: this.herdrEnvironment?.HERDR_BIN_PATH, socketPath: this.herdrEnvironment?.HERDR_SOCKET_PATH,
-    });
-    if (!env.HERDR_PANE_ID) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
-    this.herdrEnvironment = env;
-    rpc.herdrEnv = env;
-    const bin = env.HERDR_BIN_PATH;
+    const env = { ...this.herdrEnvironment }, bin = env.HERDR_BIN_PATH;
     const options = { env: { ...process.env, ...env }, timeout: 5000 };
-    const paneId = env.HERDR_PANE_ID;
-    session.binding = { ...session.binding, paneId, workspaceId: env.HERDR_WORKSPACE_ID, cwd: session.cwd, owned: env.REMOTE_PI_CREATED_PANE === "1" || session.binding.owned === true };
-    await this.persistPaneSession(session);
-    const raw = await runCommand(bin, ["pane", "get", paneId], options);
-    const pane = JSON.parse(raw).result?.pane;
-    const shell = await waitForShell(bin, paneId, options, env.REMOTE_PI_CREATED_PANE === "1" ? 10 : 1);
-    if (!shell && pane?.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
-    // ref: Herdr CLI agent start requires a foreground shell; never send an export into another application.
-    if (shell && env.REMOTE_PI_CREATED_PANE !== "1") {
-      await runCommand(bin, ["pane", "run", paneId, `export REMOTE_PI_ATTACH=1 REMOTE_PI_BRIDGE_SOCKET=${shellQuote(this.bridge.path)}`], options);
+    const livePane = !connection && file ? await this.liveSessionPane(file) : null;
+    if (livePane && !await waitForShell(bin, livePane, options, 1, runCmd)) {
+      // A live Pi without hello is not permission to create another writer.
+      connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
     }
-    const waiting = this.bridge.waitFor((c) => c.hello.paneId === paneId);
-    // Attach a rejection handler immediately; agent start can take longer than the hello deadline.
-    waiting.catch(() => {});
-    if (shell) {
-      await runCommand(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--", ...(file ? ["--session", file] : [])],
-        { ...options, timeout: 45_000 });
+    if (!connection) {
+      if (!spawn) return false;
+      if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand) throw new Error("Self-test must provide a fake connected pane");
+      if (!bin || !env.HERDR_SOCKET_PATH) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
+      let pane, created = false;
+      if (session.binding.paneId) {
+        try { pane = JSON.parse(await runCmd(bin, ["pane", "get", session.binding.paneId], options)).result?.pane; } catch {}
+      }
+      if (!pane?.pane_id) {
+        const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
+        try {
+          const result = JSON.parse(await runCmd(bin, ["workspace", "create", "--cwd", session.cwd, "--label", label, "--no-focus",
+            "--env", "REMOTE_PI_ATTACH=1", "--env", `REMOTE_PI_BRIDGE_SOCKET=${this.bridge.path}`], options)).result;
+          pane = { ...result?.root_pane, workspace_id: result?.workspace?.workspace_id, tab_id: result?.tab?.tab_id };
+          created = Boolean(pane.pane_id);
+        } catch (error) { log("herdr", `failed to create workspace for ${session.cwd}: ${error.message}`); }
+      }
+      if (!pane?.pane_id) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
+      const paneId = pane.pane_id;
+      Object.assign(env, { HERDR_ENV: "1", HERDR_PANE_ID: paneId, HERDR_WORKSPACE_ID: pane.workspace_id,
+        HERDR_TAB_ID: pane.tab_id, REMOTE_PI_CREATED_PANE: created ? "1" : "0" });
+      this.herdrEnvironment = rpc.herdrEnv = env;
+      options.env = { ...process.env, ...env };
+      session.binding = { ...session.binding, paneId, workspaceId: pane.workspace_id, cwd: session.cwd, owned: created || session.binding.owned === true };
+      await this.persistPaneSession(session);
+      const shell = await waitForShell(bin, paneId, options, created ? 10 : 1, runCmd);
+      if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
+      // ref: Herdr CLI agent start requires a foreground shell; never send an export into another application.
+      if (shell && !created) await runCmd(bin, ["pane", "run", paneId, `export REMOTE_PI_ATTACH=1 REMOTE_PI_BRIDGE_SOCKET=${shellQuote(this.bridge.path)}`], options);
+      const waiting = this.bridge.waitFor((c) => c.hello.paneId === paneId);
+      waiting.catch(() => {}); // agent start may outlive the hello deadline.
+      if (shell) await runCmd(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--",
+        ...(file ? ["--session", file] : [])], { ...options, timeout: 45_000 });
+      connection = await waiting;
     }
-    rpc.bind(await waiting);
+    rpc.bind(connection);
     await this.persistPaneSession(session);
     return true;
   }
@@ -1300,9 +1047,7 @@ class Gateway {
       other.binding.owned ||= session.binding.owned;
       await this.persistPaneSession(other);
     }
-    if (!otherViews.length && session.pi.proc) {
-      await session.pi.request(session.binding.owned ? "quit" : "remote_off", {}, 10_000);
-    }
+    if (!otherViews.length && session.pi.proc) await session.pi.request(session.binding.owned ? "quit" : "remote_off", {}, 10_000);
     if (session.binding.owned && !otherViews.length && session.binding.paneId) {
       const env = session.pi.herdrEnv;
       const bin = env.HERDR_BIN_PATH;
@@ -1315,22 +1060,24 @@ class Gateway {
     }
     session.stop();
   }
+  async createTopic({ cwd, name, binding, threadId }) {
+    threadId ??= (await this.telegram.call("createForumTopic", { chat_id: this.chatId, name })).message_thread_id;
+    const session = new ChatSession(this, { threadId, cwd });
+    if (binding) session.binding = binding;
+    session.lastTopicName = name;
+    this.sessions.set(session.key, session);
+    await this.persistPaneSession(session);
+    return session;
+  }
+  // ref: https://nodejs.org/api/process.html#when-to-use-queuemicrotask-vs-processnexttick — register and enqueue before yielding.
   getOrCreateSession(message) {
     const key = sessionKeyOf(message);
     if (this.sessions.has(key)) return this.sessions.get(key);
-    if (!key.startsWith("t:")) return this.mainSession;
-    const threadId = Number(key.slice(2)), cwd = this.mainSession.cwd;
-    const session = new ChatSession(this, { threadId, cwd });
+    const session = new ChatSession(this, { threadId: Number(key.slice(2)), cwd: this.mainSession.cwd });
     this.sessions.set(key, session);
-    this.state.topics[threadId] = { cwd };
-    void this.saveState({ topics: this.state.topics });
-    void session.send(`Topic session started with workspace:\n${cwd}\n\nUse /topic <path> for another project.`);
+    void this.persistPaneSession(session).then(() => session.send(`Topic session started with workspace:\n${session.cwd}\n\nUse /topic <path> for another project.`))
+      .catch((error) => log("topic", `Failed to initialize ${key}: ${error.message}`));
     return session;
-  }
-  getOwnedPaneIds(excludingSession = null) {
-    return [...new Set([...this.sessions.values()]
-      .filter((s) => s !== excludingSession && (!excludingSession?.binding.paneId || s.binding.paneId !== excludingSession.binding.paneId))
-      .map((s) => s.pi?.herdrEnv?.HERDR_PANE_ID || s.binding.paneId).filter(Boolean))];
   }
   async start() {
     // launchd 以 O_APPEND 持有日志 fd，newsyslog 处理不了这种 fd；启动时截断 + 每小时巡检（服务极少重启，只靠启动截断等于没截）
@@ -1367,22 +1114,17 @@ class Gateway {
     this.startBlockedPoller();
     for (const connection of this.bridge.connections.values()) await this.onPaneHello(connection);
     this.cleanupDownloads();
-    this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000);
-    this.downloadCleanupTimer.unref?.();
+    this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000).unref();
     const sessionInfo = state?.sessionId ? `session ${state.sessionId}` : (attached ? "attached" : "not attached (starts on first message)");
-    console.log(`${new Date().toISOString()} @${this.me.username} ready; Pi ${sessionInfo}`);
+    log("gateway", `@${this.me.username} ready; Pi ${sessionInfo}`);
     await this.completeRestart();
     await this.telegram.poll((update) => this.dispatchUpdate(update));
   }
   async completeRestart() {
-    const messageId = this.state.pendingRestartMessageId;
-    if (!messageId) return;
-    try {
-      await this.telegram.edit(this.chatId, messageId, "✅ Gateway restarted");
-      await this.saveState({ pendingRestartMessageId: null });
-    } catch (error) {
-      console.warn(`[restart] failed to update restart notice: ${error.message}`);
-    }
+    if (!this.state.pendingRestartMessageId) return;
+    await this.telegram.edit(this.chatId, this.state.pendingRestartMessageId, "✅ Gateway restarted")
+      .then(() => this.saveState({ pendingRestartMessageId: null }))
+      .catch((error) => log("restart", `failed to update restart notice: ${error.message}`));
   }
   async saveDownload(fileId, name, needsBase64 = false) {
     const file = await this.telegram.call("getFile", { file_id: fileId });
@@ -1392,19 +1134,8 @@ class Gateway {
     const safe = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "file";
     const path = join(this.config.downloadsDir, `${Date.now()}-${safe}`);
     await writeFile(path, buffer);
-    console.log(`${new Date().toISOString()} [download] ${name} (${buffer.length} bytes)`);
+    log("download", `${name} (${buffer.length} bytes)`);
     return { path, data: needsBase64 ? buffer.toString("base64") : null };
-  }
-  queueTelegram(work) {
-    if (this.als.getStore()) return work();
-    const next = this.telegramChain.then(() => this.als.run(true, work));
-    this.telegramChain = next.catch((error) => console.error("Telegram output:", error));
-    return next;
-  }
-  queueUpload(work) {
-    const next = this.uploadChain.then(work);
-    this.uploadChain = next.catch((error) => console.error("Upload output:", error));
-    return next;
   }
   // Downloads expire after a fixed 30 days.
   async cleanupDownloads() {
@@ -1415,20 +1146,18 @@ class Gateway {
         const info = await stat(path).catch(() => null);
         if (info && info.mtimeMs < Date.now() - 30 * 24 * 60 * 60_000) await unlink(path).catch(() => {});
       }
-    } catch (error) { console.warn("Download cleanup:", error.message); }
+    } catch (error) { log("download", "cleanup:", error.message); }
   }
-  isAllowed(from, chat) {
-    return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private");
-  }
-  dispatchUpdate(update) {
+  isAllowed(from, chat) { return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private"); }
+  async dispatchUpdate(update) {
     const m = update.message, callback = update.callback_query;
     if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return Promise.resolve();
-    const action = callback?.data?.startsWith("a:") ? this.actions.get(callback.data.slice(2)) : null;
+    const action = callback?.data?.startsWith("a:") ? this.actions.get(callback.data.slice(2)) : null, command = parseCommand(m?.text?.trim() || "");
     const session = m ? this.getOrCreateSession(m) : this.sessions.get(action?.sessionKey) || this.mainSession;
     this.chatReady = true;
-    if (parseCommand(m?.text?.trim() || "")?.name === "abort") {
+    if (command?.name === "abort" || command?.name === "restart") {
       this.telegram.react(this.chatId, m.message_id, "👀");
-      return session.handleCommand({ name: "abort", argument: "" }, m.text, update.update_id);
+      return session.handleCommand(command, m.text, update.update_id);
     }
     // ref: https://docs.python-telegram-bot.org/en/stable/telegram.message.html#telegram.Message.media_group_id — serialize albums at the first message.
     if (m?.media_group_id) {
@@ -1443,7 +1172,7 @@ class Gateway {
           await group.ready;
           if (!group.cancelled && group.messages.length) await session.handleMediaGroup(group.messages);
         }).catch((err) => {
-          console.error("Media group error:", err);
+          log("update", "Media group error:", err);
           session.send(`❌ Failed to process media group: ${err.message}`);
         });
         session.updateChain = next;
@@ -1458,29 +1187,26 @@ class Gateway {
       return group.done;
     }
     const next = session.updateChain.then(() => this.handleUpdate(update, session));
-    session.updateChain = next.catch((error) => console.error("Telegram update error:", error));
+    session.updateChain = next.catch((error) => log("update", error));
     return next;
   }
   async handleUpdate(update, session = this.mainSession) {
+    const m = update.message, callback = update.callback_query;
+    if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return;
+    this.chatReady = true;
     try {
-      if (update.message) {
-        if (!this.isAllowed(update.message.from, update.message.chat)) return;
-        this.chatReady = true;
-        const m = update.message;
+      if (m) {
         const kind = m.text ? "text" : m.photo ? "photo" : m.voice ? "voice" : m.document ? "document" : m.video ? "video" : m.video_note ? "video_note" : m.audio ? "audio" : "other";
         // ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — never log user message content.
         const textLen = (m.text || m.caption || "").length;
-        console.log(`${new Date().toISOString()} [update] msg #${m.message_id}: ${textLen ? `${kind}, ${textLen} chars` : kind}`);
-        await this.handleMessage(update.message, session, update.update_id);
-      } else if (update.callback_query) {
-        const callback = update.callback_query;
-        if (!this.isAllowed(callback.from, callback.message?.chat)) return;
-        this.chatReady = true;
-        console.log(`${new Date().toISOString()} [update] callback #${callback.id}`);
+        log("update", `msg #${m.message_id}: ${textLen ? `${kind}, ${textLen} chars` : kind}`);
+        await this.handleMessage(m, session, update.update_id);
+      } else {
+        log("update", `callback #${callback.id}`);
         await this.handleCallback(callback, session);
       }
     } catch (error) {
-      console.error("Telegram input:", error);
+      log("update", error);
       await session.send(`❌ ${error.message}`);
     }
   }
@@ -1495,7 +1221,8 @@ class Gateway {
     const image = isImage ? { type: "image", data: saved.data, mimeType: mime } : null;
     return { saved, image, label: m.voice ? "voice message" : file.file_name ? `file ${file.file_name}` : kind };
   }
-  async handleMessage(message, session = this.getOrCreateSession(message), updateId = null) {
+  async handleMessage(message, session = null, updateId = null) {
+    session ??= this.getOrCreateSession(message);
     const media = await this.extractMedia(message), text = message.text?.trim();
     if (!media && !text) return;
     this.telegram.react(this.chatId, message.message_id, "👀");
@@ -1514,11 +1241,8 @@ class Gateway {
       media.image ? [media.image] : undefined, undefined, message.message_id);
   }
   async registerBotCommands() {
-    let rpcCommands = [];
-    if (this.mainSession.pi.proc) {
-      const data = await this.mainSession.pi.request("get_commands").catch(() => null);
-      rpcCommands = data?.commands || [];
-    }
+    const data = this.mainSession.pi.proc ? await this.mainSession.pi.request("get_commands").catch(() => null) : null;
+    const rpcCommands = data?.commands || [];
     const commands = [...BOT_COMMANDS];
     const routes = commandRoutes(rpcCommands);
     for (const command of rpcCommands) {
@@ -1532,24 +1256,22 @@ class Gateway {
       this.telegram.call("setMyCommands", { commands: finalCommands }),
       this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
     ]);
-    console.log(`${new Date().toISOString()} [gateway] bot commands registered (${finalCommands.length})`);
+    log("gateway", `bot commands registered (${finalCommands.length})`);
   }
   async saveState(patch) {
     this.state = { ...this.state, ...patch };
     const statePath = join(this.config.stateDir, "state.json");
     // 串行化写入：并发 saveState 共享 tmp 路径会 ENOENT，且可能乱序完成
-    const write = async () => {
+    this.stateWriteChain = this.stateWriteChain.then(async () => {
       const tempPath = `${statePath}.${process.pid}.${++stateWriteCounter}.tmp`;
       try {
         await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
         await rename(tempPath, statePath);
       } catch (err) {
-        console.warn(`[state] failed to persist state to ${statePath}: ${err.message}`);
+        log("state", `failed to persist state to ${statePath}: ${err.message}`);
       }
-    };
-    const next = this.stateWriteChain.then(write, write);
-    this.stateWriteChain = next;
-    return next;
+    });
+    return this.stateWriteChain;
   }
   action(payload, ttl = 10 * 60_000) {
     const now = Date.now();
@@ -1566,7 +1288,7 @@ class Gateway {
   startBlockedPoller() {
     if (HERDR_DISABLED_FOR_TEST || this.blockedTimer) return;
     this.blockedTimer = setInterval(() => {
-      this.pollBlocked().catch((error) => console.error("Blocked poll:", error.message));
+      this.pollBlocked().catch((error) => log("blocked", error.message));
     }, 3000);
     this.blockedTimer.unref();
   }
@@ -1594,95 +1316,126 @@ class Gateway {
       this.blockedStatuses = new Map(sessions.map((s) => [s.binding.paneId, current.get(s.binding.paneId)]));
     } finally { this.blockedPolling = false; }
   }
-  async handleCallback(callback, session = this.mainSession) {
-    const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
-    const action = this.actions.get(token);
-    this.actions.delete(token);
-    // ref: Telegram Bot API answerCallbackQuery — 收到即应答，客户端转圈等待且过晚会 "query is too old"；每个 callback 只 answer 一次
-    if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
-    this.telegram.answer(callback.id).catch(() => {});
-    try {
-      console.log(`${new Date().toISOString()} [callback] handling ${action.type}`);
-      if (action.type === "herdr_keys") {
-        for (const [key, value] of this.actions) if (value.group === action.group) this.actions.delete(key);
-        const target = this.sessions.get(action.sessionKey);
-        const agent = JSON.parse(await this.herdr(["get", action.paneId])).result?.agent;
-        if (target?.binding.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
-          await this.herdr(["send-keys", action.paneId, action.key]);
-        } else {
-          await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
-        }
-        if (callback.message) await this.telegram.call("editMessageReplyMarkup", {
-          chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
-        });
-      } else if (action.type === "close_topic") {
-        const key = `t:${action.threadId}`;
-        if (action.confirmed) {
-          const target = this.sessions.get(key);
-          if (target) await this.closePaneSession(target);
-          this.sessions.delete(key);
-          delete this.state.topics[action.threadId];
-          delete this.state.herdrPanes?.[key];
-          await this.saveState({ topics: this.state.topics, herdrPanes: this.state.herdrPanes });
-          await this.telegram.call("deleteForumTopic", { chat_id: this.chatId, message_thread_id: action.threadId }).catch(() => {});
-        }
-        if (callback.message) await this.telegram.edit(
-          callback.message.chat.id, callback.message.message_id, action.confirmed ? "Topic closed." : "Close cancelled.",
-        ).catch(() => {});
-      } else {
-        const targetSession = this.sessions.get(action.sessionKey || sessionKeyOf(callback)) || session || this.mainSession;
-        await targetSession.handleCallbackAction(action, callback);
-      }
-    } catch (error) {
-      const targetSession = this.sessions.get(action?.sessionKey) || session || this.mainSession;
-      await targetSession.send(`❌ ${error.message}`);
+  async handleCallback(callback, session = this.mainSession, action = null) {
+    if (callback) {
+      const token = callback.data?.startsWith("a:") ? callback.data.slice(2) : "";
+      action = this.actions.get(token);
+      this.actions.delete(token);
+      // ref: Telegram Bot API answerCallbackQuery — 收到即应答，客户端转圈等待且过晚会 "query is too old"；每个 callback 只 answer 一次
+      if (!action || action.expires < Date.now()) return this.telegram.answer(callback.id, "Expired");
+      this.telegram.answer(callback.id).catch(() => {});
+      session = this.sessions.get(action.sessionKey || sessionKeyOf(callback)) || session;
     }
+    try {
+      log("callback", `handling ${action.type}`);
+      switch (action.type) {
+        case "jump_pane": {
+          const connection = this.bridge.connections.get(action.paneId);
+          if (!connection) return session.send("That Pi is not connected. Enable /remote-control in its pane first.");
+          const old = session.binding;
+          session.pi.stop();
+          session.resetSessionState();
+          session.cwd = connection.hello.cwd;
+          session.binding = { paneId: action.paneId, sessionFile: connection.hello.sessionFile, cwd: session.cwd, owned: false };
+          session.pi.bind(connection);
+          await this.persistPaneSession(session);
+          return session.send(`✅ This topic now views Pi in ${action.paneId}. Previous session ${old.paneId || ""} was not stopped.`);
+        }
+        case "model":
+          await session.pi.request("set_model", { provider: action.provider, modelId: action.modelId });
+          session.lastModel = { provider: action.provider, modelId: action.modelId };
+          return session.send(`✅ ${action.provider}/${action.modelId}`);
+        case "thinking":
+          await session.pi.request("set_thinking_level", { level: action.level });
+          return session.send(`✅ thinking: ${action.level}`);
+        case "retry": {
+          if (!session.lastPrompt) return session.send("No prompt to retry");
+          if (session.isStreaming) return session.send("⚠️ Still streaming; /abort first");
+          const { message, images, triggerMessageId } = session.lastPrompt;
+          await session.send(`🔁 Retrying last prompt (${message.length} chars)…`);
+          return session.prompt(message, images, undefined, triggerMessageId);
+        }
+        case "resume": {
+          const paneId = await this.liveSessionPane(action.path);
+          if (paneId && paneId !== session.binding.paneId) {
+            return session.send(`This session is already open in ${paneId}; no second Pi was started.`, session.keyboard([
+              { label: "View that Pi here", action: { type: "jump_pane", paneId } },
+            ]));
+          }
+          await session.abortRun(session.isStreaming);
+          const result = await session.pi.request("switch_session", { sessionPath: action.path });
+          return session.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
+        }
+        case "ui": {
+          for (const [key, value] of this.actions) {
+            if (value.type === "ui" && value.requestId === action.requestId) this.actions.delete(key);
+          }
+          session.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
+          if (callback?.message) {
+            const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
+            await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
+          }
+          return;
+        }
+        case "herdr_keys": {
+          for (const [key, value] of this.actions) if (value.group === action.group) this.actions.delete(key);
+          const target = this.sessions.get(action.sessionKey);
+          const agent = JSON.parse(await this.herdr(["get", action.paneId])).result?.agent;
+          if (target?.binding.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
+            await this.herdr(["send-keys", action.paneId, action.key]);
+          } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
+          if (callback?.message) await this.telegram.call("editMessageReplyMarkup", {
+            chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
+          });
+          return;
+        }
+        case "close_topic": {
+          const key = `t:${action.threadId}`;
+          if (action.confirmed) {
+            const target = this.sessions.get(key);
+            if (target) await this.closePaneSession(target);
+            this.sessions.delete(key);
+            delete this.state.topics[action.threadId];
+            delete this.state.herdrPanes?.[key];
+            await this.saveState({ topics: this.state.topics, herdrPanes: this.state.herdrPanes });
+            await this.telegram.call("deleteForumTopic", { chat_id: this.chatId, message_thread_id: action.threadId }).catch(() => {});
+          }
+          if (callback?.message) await this.telegram.edit(
+            callback.message.chat.id, callback.message.message_id, action.confirmed ? "Topic closed." : "Close cancelled.",
+          ).catch(() => {});
+        }
+      }
+    } catch (error) { await session.send(`❌ ${error.message}`); }
   }
   // ref: Telegram Bot API 9.3 & 9.4 (2026-02-09): createForumTopic in private chats
   async handleTopicCommand(session, argument) {
     const me = await this.telegram.call("getMe");
-    if (!me?.has_topics_enabled) {
-      return session.send("Topics are not enabled for this bot. Enable Threaded Mode in the @BotFather Mini App:\nopen @BotFather → tap Open → select your bot → Bot Settings → Threads Settings → Threaded Mode.");
-    }
+    if (!me?.has_topics_enabled) return session.send("Topics are not enabled for this bot. Enable Threaded Mode in the @BotFather Mini App:\nopen @BotFather → tap Open → select your bot → Bot Settings → Threads Settings → Threaded Mode.");
     const target = argument ? resolvePath(argument.trim(), session.cwd) : session.cwd;
     let realTarget, targetStat;
-    try {
-      realTarget = await realpath(target);
-      targetStat = await stat(realTarget);
-    } catch {
+    try { targetStat = await stat(realTarget = await realpath(target)); } catch {
       return session.send(`Directory missing or inaccessible: ${target}`);
     }
-    if (!targetStat.isDirectory()) {
-      return session.send(`Not a valid directory: ${target}`);
-    }
+    if (!targetStat.isDirectory()) return session.send(`Not a valid directory: ${target}`);
     const name = (basename(realTarget) || "topic").slice(0, 128);
-    const { message_thread_id: threadId } = await this.telegram.call("createForumTopic", { chat_id: this.chatId, name });
-    const newSession = new ChatSession(this, { threadId, cwd: realTarget });
-    newSession.lastTopicName = name;
-    this.sessions.set(`t:${threadId}`, newSession);
-    this.state.topics[threadId] = { cwd: realTarget };
-    await this.saveState({ topics: this.state.topics });
+    const newSession = await this.createTopic({ cwd: realTarget, name });
+    const threadId = newSession.threadId;
     await newSession.pi.start();
     const state = await newSession.pi.request("get_state");
-    const text = formatSessionReset({ model: state.model, cwd: realTarget });
-    await newSession.send(text);
-    if (session.threadId !== threadId) {
-      await session.send(`✅ Created topic "${name}" (thread #${threadId})`);
-    }
+    await newSession.send(`✅ Topic ready · ${state.model?.provider || "unknown"}/${state.model?.id || "unknown"} · ${realTarget}`);
+    if (session.threadId !== threadId) await session.send(`✅ Created topic "${name}" (thread #${threadId})`);
   }
   // ref: Telegram Bot API 9.3 deleteForumTopic in private chats
   async handleCloseCommand(session) {
-    if (session.threadId === null) {
-      return session.send("/close only works inside a topic.");
-    }
+    if (session.threadId === null) return session.send("/close only works inside a topic.");
     const keyboard = session.keyboard(["Confirm", "Cancel"].map((label) => ({
       label, action: { type: "close_topic", threadId: session.threadId, confirmed: label === "Confirm" },
     })));
     return session.send(`Close topic "${basename(session.cwd)}"? ${session.binding.owned ? "This will quit its Pi and close its pane." : "This only detaches Telegram; your desktop Pi keeps running."} The topic will be removed.`, keyboard);
   }
   async acquireLock() {
-    const sockPath = join(this.config.stateDir, "gateway.sock");
-    const pidFile = join(this.config.stateDir, "gateway.pid");
+    const sockPath = this.sockPath = join(this.config.stateDir, "gateway.sock");
+    const pidFile = this.pidFile = join(this.config.stateDir, "gateway.pid");
     this.lockServer = await new Promise((done, reject) => {
       const client = net.connect(sockPath, () => {
         client.end();
@@ -1698,8 +1451,6 @@ class Gateway {
       });
     });
     this.lockServer.unref();
-    this.sockPath = sockPath;
-    this.pidFile = pidFile;
     writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
   }
   stop() {
@@ -1708,14 +1459,12 @@ class Gateway {
     this.telegram?.stopPolling?.();
     clearInterval(this.blockedTimer);
     this.blockedTimer = null;
-    this.bridge?.stop().catch((error) => console.error(`[bridge] stop: ${error.message}`));
+    this.bridge?.stop().catch((error) => log("bridge", `stop: ${error.message}`));
     try { this.lockServer?.close(); } catch {}
     this.lockServer = null;
     try { if (this.sockPath) unlinkSync(this.sockPath); } catch {}
     try {
-      if (this.pidFile && existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) {
-        unlinkSync(this.pidFile);
-      }
+      if (this.pidFile && existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").trim() === String(process.pid)) unlinkSync(this.pidFile);
     } catch {}
     for (const session of this.sessions.values()) session.stop();
   }
@@ -1723,8 +1472,7 @@ class Gateway {
 
 async function main() {
   if (process.argv.includes("--self-test")) {
-    const { selfTest } = await import("./self-test.mjs");
-    await selfTest();
+    return (await import("./self-test.mjs")).selfTest();
   } else {
     const gateway = new Gateway(loadConfig());
     for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
@@ -1732,30 +1480,21 @@ async function main() {
       process.exit(0);
     });
     gateway.start().catch((error) => {
-      console.error(error);
+      log("gateway", error);
       gateway.stop();
       process.exit(1);
     });
   }
 }
 
-if (import.meta.main) {
-  main().catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
-}
+if (import.meta.main) main().catch((error) => {
+  log("gateway", error);
+  process.exit(1);
+});
 
 export {
-  BOT_COMMANDS, RESERVED_COMMANDS, HELP, MAX_MESSAGE,
-  ChatSession, Gateway, PaneRpc, Telegram,
-  attachmentPrompt, buildDevPath, chunks,
-  expandableBlockquote, extensionFromMime, extractText,
-  formatAssistantError, formatContextTokens, formatSessionReset,
-  herdrTail, isConnectPhaseError, loadConfig, loadState,
-  paneHasForegroundShell, parseCommand, pollBackoffMs,
-  resolveAgentSessionFile, resolveHerdrEnvironment,
-  resolvePath, retryableTelegramStatus, runCommand, runStt,
-  sessionKeyOf, setTestMode, shellQuote,
-  shouldRetryTelegram, telegramCommandName, telegramHtml, toolSummary,
+  BOT_COMMANDS, ChatSession, Gateway, HELP, MAX_MESSAGE, PaneRpc, Telegram,
+  chunks, expandableBlockquote, formatAssistantError, loadConfig, loadState,
+  paneHasForegroundShell, parseCommand, pollBackoffMs, sessionKeyOf, setTestMode,
+  shouldRetryTelegram, telegramCommandName, telegramHtml,
 };

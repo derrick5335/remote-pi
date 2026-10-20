@@ -32,7 +32,7 @@
 - ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
 - 🔒 **配置与状态严格解耦（12-Factor 原则）**：`config.json` 保持只读；运行期工作区与 pane/session 绑定持久化于 `state.json`；会话使用 Pi 原生目录。
 - 🎯 **100% 基于 Pi 原生状态与能力**：仅使用 Pi 1.3.0 公开 Extension API、Pi CLI 与 Herdr socket API。每个会话由一个交互式 Pi 进程持有，Telegram 和终端只是该进程的不同视图；无私有补丁或旁路通信文件。
-- 🌊 **实时草稿**：`sendMessageDraft` 显示临时文本和当前工具进度，各 Topic 独立更新；更新间隔至少 1.5 秒，每 20 秒保活，最终回复作为持久文本消息发送。草稿失败时仅停用本轮预览，不回退到编辑消息。
+- 🌊 **实时草稿**：`sendMessageDraft` 显示临时文本和当前工具进度，各 Topic 独立更新；更新间隔至少 1.5 秒，每 20 秒保活，最终回复作为持久文本消息发送。本轮已回复后，不再发送空的“Thinking…”占位草稿。草稿失败时仅停用本轮预览，不回退到编辑消息。
 - 🔁 **错误重试**：助手错误回复仅附一个 `🔁 Retry` 按钮，重发上一次 Prompt。超长回复直接分段发送文本。
 - 🎮 **统一远程控制扩展**：
   - `remote-pi.ts` 提供 `remote_attach`（发送本地文件）与 `remote_ask`（同时在 Telegram 和终端提问，先回答者生效）；工具仅在连接期间启用。
@@ -43,7 +43,7 @@
   - **视觉与附件**：直接向 Bot 发送图片（模型原生视觉上下文）或代码/文档/音视频文件（自动下载至本地供 Pi 处理分析）。
 - 💬 **实时干预（Steer）与表情反馈（Reaction ACK）**：
   - Agent 执行过程中，直接在聊天窗口发送文字即可作为 steer 动态修正任务方向。
-  - 在触发任务的用户消息上显示：`👀` 已接收 → `👨‍💻` 工作中 → `👌` 已回复、`💔` 出错或 `🤷` 无文本回复；中止会清除表情。终端发起的任务不设置表情。
+  - 在触发任务的用户消息上显示：`👀` 已接收 → `👨‍💻` 工作中 → `👌` 已回复、`💔` 出错或 `🤷` 无文本回复；最终错误状态以最新一条助手消息为准，内部自动重试成功后以 `👌` 结束。中止会清除表情。终端发起的任务不设置表情。
 - 🔒 **单实例互斥与严格白名单**：
   - 本地 Unix Domain Socket 互斥锁，杜绝后台多实例竞争导致会话混乱；
   - 严格限制仅响应配置的单一 `allowedUserId` 私聊请求，忽略非授权用户与所有群聊消息。
@@ -61,7 +61,7 @@
 | `/close` | 确认后关闭当前 Topic：网关创建的 Pi 窗格会退出并关闭；桌面附加窗格仅断开远程控制。随后删除 Topic |
 | `/model [关键词]` | 弹出内联键盘选择模型，或直接按关键词/完整 ID 快速切换 |
 | `/thinking [level]` | 查看或设置思考强度级别（如 `off`, `low`, `high`） |
-| `/new` | 开启新会话，重置上下文并显示当前模型 |
+| `/new` | 即使连接已断开也开启新会话，重置上下文并显示当前模型 |
 | `/resume` | 列出 Pi 原生目录中当前工作区的会话；若已在其他窗格打开，则提供切换视图到已有窗格的按钮 |
 | `/sh <命令>` | 直接在项目工作目录下执行系统 Shell 命令，0 Token 毫秒级响应。注意：此处对服务重启/停止命令的拦截仅为误操作防护，并非安全边界 —— 持有 Bot 者本就拥有完整 Shell 权限 |
 | `/followup <指令>` | 排队追加后续任务，不打断当前轮次执行 |
@@ -77,7 +77,7 @@
 | 命令 | 说明 |
 | :--- | :--- |
 | `/name <name>` | 设置会话名称 |
-| `/restart` | 重启网关；启动就绪后，将原提示更新为“✅ Gateway restarted” |
+| `/restart` | 绕过卡住的会话更新立即重启网关；启动就绪后，将原提示更新为“✅ Gateway restarted” |
 
 > **提示**：已安装的 Pi 技能及自定义命令统一走原生命令路由。内部 `/remote-pi-new` 与 `/remote-pi-switch` 桥接命令不出现在 Telegram 命令发现中；不修改终端自动补全。
 
@@ -119,7 +119,7 @@ npm install --omit=dev
 
 ### 2. 离线自检
 
-在不连接 Telegram 的情况下运行离线单元测试：
+通过假的 Telegram/Herdr 适配器及临时本地桥接 socket 验证核心不变式，不连接真实 Telegram 或 Herdr：
 
 ```bash
 npm test
@@ -131,6 +131,8 @@ Lint（ESLint 安全与可读性规则）：
 ```bash
 npm run lint
 ```
+
+自检强制行数预算（含注释及空行）：`gateway.mjs` ≤1500、`remote-pi.ts` ≤360、`install.sh` ≤140，核心合计 ≤2000；`self-test.mjs` ≤900。ESLint 可读性规则保持启用，不得为缩减行数而将多条语句挤到一行。
 
 ### 3. 创建配置文件
 
@@ -233,7 +235,7 @@ pi-remote-gateway stop     # 停止后台服务
    - 点击 **Open** 打开 BotFather Mini App → 选择你的 Bot → **Bot Settings** → **Threads Settings** → 开启 **Threaded Mode**（经典 `/mybots` 文字菜单里没有这个选项）。
 2. **创建 Topic 会话**：
    - 发送 `/topic [路径]` 为指定项目目录创建独立 Topic；不带参数则复用当前会话的工作目录。
-   - 每个新建 Topic 都会在独立的 Herdr 窗格/工作区内启动交互式 Pi；会话保存在 Pi 原生目录，不另设 Telegram 历史目录。
+   - 每个新建 Topic 都会在独立的 Herdr 窗格/工作区内启动交互式 Pi；就绪后用一行显示 provider/model 与工作目录。会话保存在 Pi 原生目录，不另设 Telegram 历史目录。
 3. **会话管理**：
    - 使用 `/topic <路径>` 为其他项目创建独立 Topic。手动打开的 Topic 继承主会话的工作目录。
    - `/close` 确认后删除 Topic。关闭网关创建的 Pi 的最后一个视图时，Pi 退出并关闭窗格；桌面附加的 Pi 仅断开远程控制并继续运行。
@@ -285,9 +287,10 @@ pi-remote-gateway stop     # 停止后台服务
 ```
 
 - **一个持有者，多个视图**：每个会话属于一个交互式 Pi 进程。`state.json` 保存 pane/session 绑定；原生 Pi 会话文件仍位于 `~/.pi/agent/sessions`（可由 Pi 原生目录环境变量覆盖）。
+- **会话内保序**：每个视图分别串行处理事件与输入更新，不使用全局 Telegram 输出队列或方法猴子补丁。附件上传使用独立的会话级 Promise 链，保留文件顺序，但不阻塞事件处理或其他会话。仅 `/abort` 与 `/restart` 绕过输入更新链立即执行，避免卡住的命令阻塞恢复。新 Topic 的注册与更新入队同步完成；状态持久化与欢迎消息在后台执行，失败会记录日志。
 - **原生生命周期**：Herdr 负责创建窗格、启动 agent；Pi 负责指令、模型、压缩与会话替换。网关用 `PaneRpc` 保留 RPC 形状的客户端接口，不再通过子进程 RPC 模式另起 Pi。
 - **常驻与电源管理**：macOS 下 launchd 使用 `/usr/bin/caffeinate -s -i -- node gateway.mjs`，防止接通电源时的空闲睡眠，同时保留手动睡眠与合盖行为。
-- **参考**：[Pi Extension API](https://pi.dev/docs/latest/extensions)（实现以本机 Pi 1.3.0 为准）、[Herdr CLI](https://herdr.dev/docs/cli-reference/) 与 [Herdr 集成](https://herdr.dev/docs/integrations/)。
+- **参考**：[Pi Extension API](https://pi.dev/docs/latest/extensions)（实现以本机 Pi 1.3.0 为准）、[Herdr CLI](https://herdr.dev/docs/cli-reference/) 、[Herdr 集成](https://herdr.dev/docs/integrations/)、[Telegram 草稿生命周期](https://core.telegram.org/bots/api#sendmessagedraft)、[Telegram 重试参数](https://core.telegram.org/bots/api#responseparameters) 与 [Node socket 生命周期](https://nodejs.org/api/net.html#event-close)。
 
 ---
 
