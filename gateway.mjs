@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
@@ -11,6 +12,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import MarkdownIt from "markdown-it";
 import { herdrRequest, readJsonLines, writeJsonLine } from "./remote-pi.ts";
+// ref: https://nodejs.org/api/child_process.html#child_processexecfilefile-args-options-callback — bounded, promisified subprocesses.
+const execFileAsync = promisify(execFile);
 const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 let HERDR_DISABLED_FOR_TEST = false;
@@ -200,13 +203,6 @@ function formatAssistantError(errorMessage) {
     : /rate limit|too many requests|429/i.test(message) ? "provider rate limit hit. Retry shortly, or use /model to switch models." : "";
   return tip ? `⚠️ ${message}\n\n💡 Tip: ${tip}` : `❌ ${message}`;
 }
-async function runStt(sttCommand, audioPath) {
-  try {
-    const text = await runCommand("bash", ["-c", sttCommand, "stt", audioPath], { timeout: 120_000 });
-    if (!text) throw new Error("no output");
-    return text;
-  } catch (error) { throw new Error(`Speech-to-text failed: ${error.message.slice(-300)}`); }
-}
 function resolvePath(pathStr, baseDir = process.cwd()) {
   if (!pathStr || typeof pathStr !== "string") return "";
   const expanded = pathStr.startsWith("~/") ? join(homedir(), pathStr.slice(2)) : pathStr === "~" ? homedir() : pathStr;
@@ -233,8 +229,6 @@ function loadState(stateDir) {
     return { cwd: typeof raw.cwd === "string" ? raw.cwd : null, topics, herdrPanes, pendingRestartMessageId: Number.isSafeInteger(raw.pendingRestartMessageId) && raw.pendingRestartMessageId > 0 ? raw.pendingRestartMessageId : null };
   } catch { return { cwd: null, topics: {}, herdrPanes: {} }; }
 }
-
-const shellQuote = (str) => `'${String(str).replaceAll("'", "'\\''")}'`;
 
 function loadConfig() {
   const path = process.env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
@@ -335,9 +329,9 @@ class Telegram {
     if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
     log("tg:call", `sendDocument ok`);
   }
-  // ref: https://core.telegram.org/bots/api#sendmessagedraft — drafts are temporary; persist finals with sendMessage.
+  // ref: https://core.telegram.org/bots/api#sendmessagedraft — can_stop shows Stop; sendMessage persists the final reply.
   draft(chatId, draftId, text, extra = {}) {
-    return this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: text ? telegramHtml(text) : "", parse_mode: "HTML", ...extra }, 10_000, 1);
+    return this.call("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: text ? telegramHtml(text) : "", parse_mode: "HTML", can_stop: true, ...extra }, 10_000, 1);
   }
   // ref: https://core.telegram.org/bots/api#setmessagereaction — one emoji per bot, [] clears it.
   async react(chatId, messageId, emoji) {
@@ -368,7 +362,7 @@ class Telegram {
     while (this.polling) {
       try {
         this.currentPollAc = new AbortController();
-        const updates = await this.call("getUpdates", { offset, timeout: 25, allowed_updates: ["message", "callback_query"] }, 35_000, 1, this.currentPollAc.signal, true);
+        const updates = await this.call("getUpdates", { offset, timeout: 25, allowed_updates: ["message", "callback_query", "stopped_message_generation"] }, 35_000, 1, this.currentPollAc.signal, true);
         this.currentPollAc = null;
         if (!this.polling) break;
         this.inConflict = false;
@@ -399,44 +393,7 @@ class Telegram {
   }
 }
 
-function runCommand(cmd, args = [], options = {}) {
-  if (HERDR_DISABLED_FOR_TEST && (cmd.includes("herdr") || args.some((a) => String(a).includes("herdr")))) throw new Error(`Self-test must never call herdr: ${cmd} ${args.join(" ")}`);
-  const { okCodes = [0], ...spawnOptions } = options;
-  return new Promise((resolve, reject) => {
-    const cp = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], killSignal: "SIGKILL", ...spawnOptions });
-    let stdout = "", stderr = "";
-    cp.stdout?.setEncoding("utf8").on("data", (d) => { stdout += d; });
-    cp.stderr?.setEncoding("utf8").on("data", (d) => { stderr += d; });
-    cp.on("error", reject); // ref: https://nodejs.org/api/child_process.html#event-exit — inherited stdio may outlive the timed-out child.
-    cp.on("exit", () => {
-      if (cp.killed) reject(new Error(`Command timed out: ${cmd} ${args.join(" ")}`));
-    });
-    cp.on("close", (code) => {
-      if (okCodes.includes(code)) resolve(stdout.trim());
-      else reject(new Error(`Command failed (${code}): ${stderr.trim() || stdout.trim()}`));
-    });
-  });
-}
-
-// ref: Herdr pane.report_agent_session (`herdr api schema --json`); Pi session_start / sessionManager.getSessionFile() (Pi docs/extensions.md)
-function resolveAgentSessionFile(agent) {
-  const session = agent?.agent_session;
-  return session?.kind === "path" && session.value ? session.value : typeof session?.path === "string" ? session.path
-    : typeof session === "string" ? session : agent?.tokens?.remote_pi_session || null;
-}
-
-const herdrTail = (screen, maxLines = 30, maxChars = 2500) =>
-  String(screen || "").trim().split("\n").slice(-maxLines).join("\n").slice(-maxChars);
-
 const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
-
-async function waitForShell(bin, paneId, options, attempts, runCmd = runCommand) {
-  for (let i = 0; i < attempts; i++) {
-    if (paneHasForegroundShell(JSON.parse(await runCmd(bin, ["pane", "process-info", "--pane", paneId], options)).result?.process_info)) return true;
-    if (i + 1 < attempts) await sleep(100);
-  }
-  return false;
-}
 
 // ref: Pi docs/rpc.md#framing; Node net IPC sockets. The directory is private and the socket is mode 0600.
 const matchesBinding = (binding, hello) => Boolean(binding.sessionFile) && binding.sessionFile === hello.sessionFile ||
@@ -537,7 +494,7 @@ class PaneServer {
 class PaneRpc {
   constructor(session, onEvent, onClose) {
     Object.assign(this, { session, gateway: session.gateway, onEvent, onClose, proc: null,
-      connection: null, pending: new Map(), starting: null, herdrEnv: {}, stopping: false });
+      connection: null, pending: new Map(), starting: null, stopping: false });
   }
   async ensureStarted() {
     if (this.proc && !this.proc.destroyed) return;
@@ -558,10 +515,10 @@ class PaneRpc {
     this.connection = connection;
     connection.clients.add(this);
     this.proc = connection.socket;
-    this.herdrEnv = { ...this.gateway.herdrEnvironment, HERDR_PANE_ID: connection.hello.paneId };
     this.session.binding = { ...this.session.binding, paneId: connection.hello.paneId, terminalId: connection.hello.terminalId,
       sessionFile: connection.hello.sessionFile, cwd: connection.hello.cwd };
     this.session.cwd = connection.hello.cwd;
+    this.gateway.syncBlockedSubscription();
     for (const [id, pending] of this.pending) {
       if (pending.replacing && pending.from === connection.hello.previousSessionFile && ["new", "resume"].includes(connection.hello.reason)) this.finish(id, null, { cancelled: false });
     }
@@ -578,6 +535,7 @@ class PaneRpc {
     if (this.connection !== connection) return;
     this.proc = this.connection = null;
     connection.clients.delete(this);
+    this.gateway.syncBlockedSubscription();
     const replacing = [...this.pending.values()].some((p) => p.replacing);
     for (const [id, pending] of this.pending) {
       if (!pending.replacing) this.finish(id, new Error("Pi bridge disconnected; command delivery may be incomplete"));
@@ -604,6 +562,7 @@ class PaneRpc {
     this.connection?.clients.delete(this);
     this.proc = this.connection = null;
     for (const id of this.pending.keys()) this.finish(id, new Error("Pi view detached"));
+    this.gateway.syncBlockedSubscription();
   }
 }
 
@@ -917,17 +876,16 @@ class Gateway {
       config, chatId: config.allowedUserId, chatReady: false, state: loadState(config.stateDir),
       telegram: new Telegram(config.botToken, join(config.stateDir, "telegram-offset")), actions: new Map(),
       stateWriteChain: Promise.resolve(), paneStartChain: Promise.resolve(), downloadCleanupTimer: null,
-      blockedTimer: null, blockedStatuses: new Map(), blockedPolling: false, herdrEnvironment: null,
+      blockedStatuses: new Map(), subscribedPanesKey: "", herdrSocketPath: null, herdrSubSocket: null, herdrSubTimer: null, herdrSubRetries: 0,
+      stopping: false,
       bridge: new PaneServer(join(config.stateDir, "bridge.sock"), (connection) => this.onPaneHello(connection)),
     });
     this.mainSession = new ChatSession(this, { threadId: null, cwd: config.cwd });
     this.sessions = new Map([["main", this.mainSession]]);
     // 延迟初始化 state.json 中持久化的有效 topic 会话
-    for (const [threadId, info] of Object.entries(this.state.topics || {})) {
-      if (info?.cwd && existsSync(info.cwd)) {
-        const tid = Number(threadId);
-        this.sessions.set(`t:${tid}`, new ChatSession(this, { threadId: tid, cwd: info.cwd }));
-      }
+    for (const [threadId, info] of Object.entries(this.state.topics)) {
+      const tid = Number(threadId);
+      this.sessions.set(`t:${tid}`, new ChatSession(this, { threadId: tid, cwd: info.cwd }));
     }
   }
   // ref: Claude Code Remote Control CLAUDE_CLIENT_PRESENCE_FILE skips phone pushes while present (https://code.claude.com/docs/en/remote-control)
@@ -972,12 +930,14 @@ class Gateway {
       if (wasUnbound && session.threadId === null) this.registerBotCommands().catch(() => {});
     }
   }
+  // ref: Herdr AgentSessionInfo / pane.report_agent_session schema — native path identity, with the metadata fallback.
   async liveSessionPane(sessionFile) {
     const connected = this.bridge.find({ sessionFile });
     if (connected) return connected.hello.paneId;
-    if (!this.herdrEnvironment?.HERDR_SOCKET_PATH) return null;
+    if (!this.herdrSocketPath) return null;
     const data = await this.herdr("agent.list", {});
-    return (data?.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
+    return (data?.agents || []).find((a) => a.agent === "pi" &&
+      (a.agent_session?.kind === "path" && a.agent_session.value || a.tokens?.remote_pi_session) === sessionFile)?.pane_id || null;
   }
   ensurePaneSession(rpc, options = {}) {
     // Serialize starts, including sessions arriving concurrently from different topics.
@@ -987,77 +947,66 @@ class Gateway {
   }
   // Returns true when rpc ends up bound to a live Pi pane. spawn:false attaches only —
   // a gateway (re)start must never create workspaces or launch Pi processes by itself.
-  // ref: Herdr Official Docs - CLI Reference & Integrations (https://herdr.dev/docs/cli-reference/ & https://herdr.dev/docs/integrations/)
-  async startPaneSession(rpc, { spawn = true, runCmd = runCommand } = {}) {
+  // ref: https://herdr.dev/docs/socket-api/; installed schema: pane_info / pane_process_info / workspace_created / agent_started / ok.
+  async startPaneSession(rpc, { spawn = true } = {}) {
     const session = rpc.session, file = session.binding.sessionFile;
     if (HERDR_DISABLED_FOR_TEST && !this.bridge.server) throw new Error("Self-test must provide a fake connected pane");
     await this.bridge.start();
     let connection = this.bridge.find(session.binding);
-    const env = { ...this.herdrEnvironment }, bin = env.HERDR_BIN_PATH;
-    const options = { env: { ...process.env, ...env }, timeout: 5000 };
     const livePane = !connection && file ? await this.liveSessionPane(file) : null;
-    if (livePane && !await waitForShell(bin, livePane, options, 1, runCmd)) {
+    if (livePane && !await this.waitForShell(livePane, 1)) {
       // A live Pi without hello is not permission to create another writer.
       connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
     }
     if (!connection) {
       if (!spawn) return false;
-      if (HERDR_DISABLED_FOR_TEST && runCmd === runCommand) throw new Error("Self-test must provide a fake connected pane");
-      if (!bin || !env.HERDR_SOCKET_PATH) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
+      if (!this.herdrSocketPath) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
       let pane, created = false;
       if (session.binding.owned && session.binding.paneId && session.binding.terminalId) {
-        try { pane = JSON.parse(await runCmd(bin, ["pane", "get", session.binding.paneId], options)).result?.pane; } catch {}
+        try { pane = (await this.herdr("pane.get", { pane_id: session.binding.paneId }))?.pane; } catch {}
         if (pane?.terminal_id !== session.binding.terminalId) pane = null;
       }
       if (!pane?.pane_id) {
         const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
         try {
-          const result = JSON.parse(await runCmd(bin, ["workspace", "create", "--cwd", session.cwd, "--label", label, "--no-focus",
-            "--env", "REMOTE_PI_ATTACH=1", "--env", `REMOTE_PI_BRIDGE_SOCKET=${this.bridge.path}`], options)).result;
-          pane = { ...result?.root_pane, workspace_id: result?.workspace?.workspace_id, tab_id: result?.tab?.tab_id };
-          created = Boolean(pane.pane_id);
+          pane = (await this.herdr("workspace.create", { cwd: session.cwd, label, focus: false }))?.root_pane;
+          created = Boolean(pane?.pane_id);
         } catch (error) { log("herdr", `failed to create workspace for ${session.cwd}: ${error.message}`); }
       }
       if (!pane?.pane_id) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
       const paneId = pane.pane_id;
-      Object.assign(env, { HERDR_ENV: "1", HERDR_PANE_ID: paneId, HERDR_WORKSPACE_ID: pane.workspace_id,
-        HERDR_TAB_ID: pane.tab_id, REMOTE_PI_CREATED_PANE: created ? "1" : "0" });
-      this.herdrEnvironment = rpc.herdrEnv = env;
-      options.env = { ...process.env, ...env };
       session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, workspaceId: pane.workspace_id, cwd: session.cwd, owned: true };
       await this.persistPaneSession(session);
-      const shell = await waitForShell(bin, paneId, options, created ? 10 : 1, runCmd);
+      const shell = await this.waitForShell(paneId, created ? 10 : 1);
       if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
-      // ref: Herdr CLI agent start requires a foreground shell; never send an export into another application.
-      if (shell && !created) await runCmd(bin, ["pane", "run", paneId, `export REMOTE_PI_ATTACH=1 REMOTE_PI_BRIDGE_SOCKET=${shellQuote(this.bridge.path)}`], options);
       const waiting = this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello));
       waiting.catch(() => {}); // agent start may outlive the hello deadline.
-      if (shell) await runCmd(bin, ["agent", "start", `remote-${randomBytes(6).toString("hex")}`, "--kind", "pi", "--pane", paneId, "--",
-        ...(file ? ["--session", file] : [])], { ...options, timeout: 45_000 });
+      if (shell) {
+        // ref: Herdr `herdr api schema --json`: PaneReportMetadataParams — enable attachment without shell input.
+        await this.herdr("pane.report_metadata", { pane_id: paneId, source: "remote-pi", tokens: { remote_pi: "on" } });
+        await this.herdr("agent.start", { name: `remote-${randomBytes(6).toString("hex")}`, kind: "pi", pane_id: paneId,
+          args: file ? ["--session", file] : [], timeout_ms: 45_000 });
+      }
       connection = await waiting;
     }
     rpc.bind(connection);
     await this.persistPaneSession(session);
     return true;
   }
-  async closePaneSession(session, runCmd = runCommand) {
+  async closePaneSession(session) {
     const otherViews = [...this.sessions.values()].filter((s) => s !== session && matchesBinding(s.binding, session.binding));
     for (const other of otherViews) {
       other.binding.owned ||= session.binding.owned;
       await this.persistPaneSession(other);
     }
     if (!otherViews.length && session.pi.proc) await session.pi.request(session.binding.owned ? "quit" : "remote_off", {}, 10_000);
-    if (session.binding.owned && !otherViews.length && session.binding.paneId) {
-      const env = session.pi.herdrEnv;
-      const bin = env.HERDR_BIN_PATH;
-      if (bin) {
-        const options = { env: { ...process.env, ...env }, timeout: 3000 };
-        let pane = null;
-        try { pane = JSON.parse(await runCmd(bin, ["pane", "get", session.binding.paneId], options)).result?.pane; } catch {}
-        if (session.binding.terminalId && pane?.terminal_id === session.binding.terminalId) {
-          if (!await waitForShell(bin, session.binding.paneId, options, 30, runCmd)) throw new Error("Pi has not exited; pane and topic were kept");
-          await runCmd(bin, ["pane", "close", session.binding.paneId], options);
-        }
+    if (session.binding.owned && !otherViews.length && session.binding.paneId && this.herdrSocketPath) {
+      const paneId = session.binding.paneId;
+      let pane = null;
+      try { pane = (await this.herdr("pane.get", { pane_id: paneId }))?.pane; } catch {}
+      if (session.binding.terminalId && pane?.terminal_id === session.binding.terminalId) {
+        if (!await this.waitForShell(paneId, 30)) throw new Error("Pi has not exited; pane and topic were kept");
+        await this.herdr("pane.close", { pane_id: paneId });
       }
     }
     session.stop();
@@ -1114,9 +1063,8 @@ class Gateway {
     await this.acquireLock();
     if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test cannot start the gateway");
     try {
-      const bin = await runCommand("which", ["herdr"], { timeout: 2000 });
-      const status = JSON.parse(await runCommand(bin, ["status", "server", "--json"], { timeout: 5000 }));
-      if (status.socket) this.herdrEnvironment = { HERDR_BIN_PATH: bin, HERDR_SOCKET_PATH: status.socket };
+      const { stdout } = await execFileAsync("herdr", ["status", "server", "--json"], { timeout: 5000, killSignal: "SIGKILL" });
+      this.herdrSocketPath = JSON.parse(stdout).socket;
     } catch { throw new Error("Herdr is required: install herdr and ensure its server is reachable"); }
     await this.bridge.start();
     await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
@@ -1130,7 +1078,7 @@ class Gateway {
     // Startup attaches only; the first message owns lazy Pi startup.
     const attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
     await this.registerBotCommands();
-    this.startBlockedPoller();
+    this.syncBlockedSubscription();
     for (const connection of this.bridge.connections.values()) await this.onPaneHello(connection);
     this.cleanupDownloads();
     this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000).unref();
@@ -1167,6 +1115,12 @@ class Gateway {
   }
   isAllowed(from, chat) { return String(from?.id) === this.config.allowedUserId && (!chat || chat.type === "private"); }
   async dispatchUpdate(update) {
+    // ref: https://core.telegram.org/bots/api#messagegenerationstopped — no from field; authenticate the private chat id.
+    if (update.stopped_message_generation) {
+      const smg = update.stopped_message_generation;
+      if (!this.isAllowed(smg.chat, smg.chat)) return;
+      return this.sessions.get(sessionKeyOf(smg))?.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
+    }
     const m = update.message, callback = update.callback_query;
     if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return Promise.resolve();
     const action = callback?.data?.startsWith("a:") ? this.actions.get(callback.data.slice(2)) : null, command = parseCommand(m?.text?.trim() || "");
@@ -1209,8 +1163,6 @@ class Gateway {
   }
   async handleUpdate(update, session = this.mainSession) {
     const m = update.message, callback = update.callback_query;
-    if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return;
-    this.chatReady = true;
     try {
       if (m) {
         const kind = m.text ? "text" : m.photo ? "photo" : m.voice ? "voice" : m.document ? "document" : m.video ? "video" : m.video_note ? "video_note" : m.audio ? "audio" : "other";
@@ -1250,7 +1202,10 @@ class Gateway {
     }
     if (message.voice && this.config.sttCommand) {
       try {
-        const transcript = await runStt(this.config.sttCommand, media.saved.path);
+        const { stdout } = await execFileAsync("bash", ["-c", this.config.sttCommand, "stt", media.saved.path], { timeout: 120_000, killSignal: "SIGKILL" })
+          .catch((error) => { throw new Error(`Speech-to-text failed: ${error.message.slice(-300)}`); });
+        const transcript = stdout.trim();
+        if (!transcript) throw new Error("Speech-to-text failed: no output");
         return await session.prompt(`${transcript}${message.caption ? `\n\n${message.caption}` : ""}`, undefined, undefined, message.message_id);
       } catch (error) { return session.send(`❌ ${error.message}`); }
     }
@@ -1269,11 +1224,8 @@ class Gateway {
       commands.push({ command: telegramName, description: (command.description || command.name).replace(/\s+/g, " ").slice(0, 200) });
     }
     const finalCommands = commands.slice(0, 100);
-    await Promise.all([
-      this.telegram.call("setMyCommands", { commands: finalCommands }),
-      this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } }),
-    ]);
-    log("gateway", `bot commands registered (${finalCommands.length})`);
+    // ref: https://core.telegram.org/bots/api#determining-list-of-commands — the narrowest scope wins; this bot is private-chat only.
+    await this.telegram.call("setMyCommands", { commands: finalCommands, scope: { type: "all_private_chats" } });
   }
   async saveState(patch) {
     this.state = { ...this.state, ...patch };
@@ -1299,39 +1251,73 @@ class Gateway {
   // ref: Herdr socket API (`herdr api schema --json`).
   herdr(method, params = {}) {
     if (HERDR_DISABLED_FOR_TEST) throw new Error(`Self-test must never call herdr: ${method}`);
-    if (!this.herdrEnvironment?.HERDR_SOCKET_PATH) throw new Error("Herdr is unavailable");
-    return herdrRequest(this.herdrEnvironment, method, params);
+    if (!this.herdrSocketPath) throw new Error("Herdr is unavailable");
+    return herdrRequest({ HERDR_SOCKET_PATH: this.herdrSocketPath }, method, params);
   }
-  startBlockedPoller() {
-    if (HERDR_DISABLED_FOR_TEST || this.blockedTimer) return;
-    this.blockedTimer = setInterval(() => {
-      this.pollBlocked().catch((error) => log("blocked", error.message));
-    }, 3000);
-    this.blockedTimer.unref();
+  async waitForShell(paneId, attempts) {
+    for (let i = 0; i < attempts; i++) {
+      if (paneHasForegroundShell((await this.herdr("pane.process_info", { pane_id: paneId }))?.process_info)) return true;
+      if (i + 1 < attempts) await sleep(100);
+    }
+    return false;
   }
-  // ref: Herdr socket API (`herdr api schema --json`) — agent_status is authoritative; never parse numbered screen choices.
-  async pollBlocked() {
-    const sessions = [...this.sessions.values()].filter((s) => s.pi.proc && s.binding.paneId);
-    if (this.blockedPolling || !sessions.some((s) => s.isStreaming)) return;
-    this.blockedPolling = true;
-    try {
-      const res = await this.herdr("agent.list", {});
-      const current = new Map((res?.agents || []).map((a) => [a.pane_id, a.agent_status]));
-      for (const session of sessions) {
-        const paneId = session.binding.paneId;
-        if (current.get(paneId) !== "blocked" || this.blockedStatuses.get(paneId) === "blocked" || session.uiMessages?.size) continue;
-        const screen = (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text;
-        if (!session.pi.proc || session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
-        const group = randomBytes(6).toString("hex");
-        await session.send(`✋ Pi needs your confirmation\n\n${expandableBlockquote(herdrTail(screen, 40))}`, {
-          ...session.keyboard([["⏎ Enter", "enter"], ["⎋ Esc", "esc"]].map(([label, key]) => ({
-            label, action: { type: "herdr_keys", paneId, key, group },
-          }))),
-          disable_notification: this.isUserPresent(),
+  // ref: Herdr `herdr api schema --json`: EventsSubscribeParams / Subscription / SubscriptionEventEnvelope.
+  async onAgentStatus(paneId, status) {
+    const sessions = [...this.sessions.values()].filter((s) => s.binding.paneId === paneId && s.pi.proc);
+    if (!sessions.length) return;
+    const prev = this.blockedStatuses.get(paneId);
+    this.blockedStatuses.set(paneId, status);
+    if (status !== "blocked" || prev === "blocked") return;
+    for (const session of sessions) {
+      if (!session.isStreaming || session.uiMessages?.size) continue;
+      const connection = session.pi.connection;
+      const screen = (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text;
+      if (this.blockedStatuses.get(paneId) !== "blocked" || session.pi.connection !== connection || !session.pi.proc ||
+        session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
+      const group = randomBytes(6).toString("hex");
+      await session.send(`✋ Pi needs your confirmation\n\n${expandableBlockquote(String(screen || "").trim().split("\n").slice(-40).join("\n").slice(-2500))}`, {
+        ...session.keyboard([["⏎ Enter", "enter"], ["⎋ Esc", "esc"]].map(([label, key]) => ({
+          label, action: { type: "herdr_keys", paneId, key, group },
+        }))),
+        disable_notification: this.isUserPresent(),
+      });
+    }
+  }
+  syncBlockedSubscription(connect = net.createConnection) {
+    if (this.stopping || HERDR_DISABLED_FOR_TEST && connect === net.createConnection || !this.herdrSocketPath) return;
+    const panes = [...new Set([...this.sessions.values()].filter((s) => s.pi.proc && s.binding.paneId).map((s) => s.binding.paneId))].sort();
+    const key = JSON.stringify(panes);
+    if (key === this.subscribedPanesKey && this.herdrSubSocket && !this.herdrSubSocket.destroyed) return;
+    this.subscribedPanesKey = key;
+    clearTimeout(this.herdrSubTimer);
+    this.herdrSubSocket?.destroy();
+    this.herdrSubSocket = null;
+    for (const p of this.blockedStatuses.keys()) if (!panes.includes(p)) this.blockedStatuses.delete(p);
+    if (!panes.length) return;
+    const socket = this.herdrSubSocket = connect(this.herdrSocketPath), id = randomUUID();
+    let chain = Promise.resolve();
+    const enqueue = (work) => { chain = chain.then(() => this.herdrSubSocket === socket && work()).catch((e) => log("blocked", e.message)); };
+    socket.on("connect", () => writeJsonLine(socket, { id, method: "events.subscribe", params: {
+      subscriptions: panes.map((pane_id) => ({ type: "pane.agent_status_changed", pane_id })),
+    } }));
+    readJsonLines(socket, (msg) => {
+      if (msg.id === id && msg.error) return socket.destroy(new Error(msg.error.message || "Herdr subscription rejected"));
+      if (msg.id === id && msg.result?.type === "subscription_started") {
+        this.herdrSubRetries = 0;
+        enqueue(async () => {
+          const res = await this.herdr("agent.list", {});
+          for (const a of res?.agents || []) if (this.herdrSubSocket === socket && panes.includes(a.pane_id)) await this.onAgentStatus(a.pane_id, a.agent_status);
         });
+      } else if (msg.event === "pane.agent_status_changed" && panes.includes(msg.data?.pane_id)) {
+        enqueue(() => this.onAgentStatus(msg.data.pane_id, msg.data.agent_status));
       }
-      this.blockedStatuses = new Map(sessions.map((s) => [s.binding.paneId, current.get(s.binding.paneId)]));
-    } finally { this.blockedPolling = false; }
+    }, false);
+    socket.on("error", (error) => log("blocked", error.message));
+    socket.on("close", () => {
+      if (this.herdrSubSocket !== socket || this.stopping) return;
+      this.herdrSubSocket = null;
+      this.herdrSubTimer = setTimeout(() => this.syncBlockedSubscription(connect), Math.min(10_000, 250 * 2 ** Math.min(this.herdrSubRetries++, 6))).unref();
+    });
   }
   async handleCallback(callback, session = this.mainSession, action = null) {
     if (callback) {
@@ -1458,11 +1444,13 @@ class Gateway {
     writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
   }
   stop() {
+    this.stopping = true;
     clearInterval(this.downloadCleanupTimer);
     this.downloadCleanupTimer = null;
     this.telegram?.stopPolling?.();
-    clearInterval(this.blockedTimer);
-    this.blockedTimer = null;
+    clearTimeout(this.herdrSubTimer);
+    this.herdrSubSocket?.destroy();
+    this.herdrSubSocket = null;
     this.bridge?.stop().catch((error) => log("bridge", `stop: ${error.message}`));
     try { this.lockServer?.close(); } catch {}
     this.lockServer = null;
@@ -1475,20 +1463,17 @@ class Gateway {
 }
 
 async function main() {
-  if (process.argv.includes("--self-test")) {
-    return (await import("./self-test.mjs")).selfTest();
-  } else {
-    const gateway = new Gateway(loadConfig());
-    for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
-      gateway.stop();
-      process.exit(0);
-    });
-    gateway.start().catch((error) => {
-      log("gateway", error);
-      gateway.stop();
-      process.exit(1);
-    });
-  }
+  if (process.argv.includes("--self-test")) return (await import("./self-test.mjs")).selfTest();
+  const gateway = new Gateway(loadConfig());
+  for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
+    gateway.stop();
+    process.exit(0);
+  });
+  gateway.start().catch((error) => {
+    log("gateway", error);
+    gateway.stop();
+    process.exit(1);
+  });
 }
 
 if (import.meta.main) main().catch((error) => {

@@ -11,6 +11,7 @@
   "scripts": {
     "test": "node gateway.mjs --self-test",
     "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
     "start": "node gateway.mjs"
   },
   "dependencies": {
@@ -24,7 +25,9 @@
     "rpc"
   ],
   "devDependencies": {
+    "@typescript-eslint/parser": "^8.72.0",
     "eslint": "^10.13.0",
-    "globals": "^17.13.0"
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3"
   }
 }

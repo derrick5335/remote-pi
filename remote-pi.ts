@@ -1,18 +1,20 @@
 // Interactive Pi bridge; only Pi 1.3.0 public extension APIs are used.
-// @ts-nocheck
+// ref: Pi docs/extensions.md — extension types from @earendil-works/pi-coding-agent.
 import net from "node:net";
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { ExtensionAPI, ExtensionContext, ExtensionEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { TObject, TArray, TString } from "typebox";
 
 const TOOLS = ["remote_attach", "remote_ask"];
-const INTERNAL_COMMANDS = { new_session: "remote-pi-new", switch_session: "remote-pi-switch" };
+const INTERNAL_COMMANDS: Record<string, string> = { new_session: "remote-pi-new", switch_session: "remote-pi-switch" };
 // ref: Pi docs/rpc.md#framing — LF only; setEncoding preserves split UTF-8 code points.
-export function readJsonLines(socket, onMessage, requireType = true) {
+export function readJsonLines(socket: net.Socket, onMessage: (message: any) => void, requireType = true) {
   let buffer = "";
   socket.setEncoding("utf8");
-  socket.on("data", (chunk) => {
+  socket.on("data", (chunk: string | Buffer) => {
     buffer += chunk;
     if (buffer.length > 64 * 1024 * 1024) return socket.destroy(new Error("Bridge record too large"));
     let index;
@@ -24,13 +26,13 @@ export function readJsonLines(socket, onMessage, requireType = true) {
       try {
         message = JSON.parse(line);
         if (!message || typeof message !== "object" || Array.isArray(message) || requireType && typeof message.type !== "string") throw new Error("Invalid bridge record");
-      } catch (error) { return socket.destroy(error); }
+      } catch (error: any) { return socket.destroy(error); }
       onMessage(message);
     }
   });
 }
 
-export function writeJsonLine(socket, message) {
+export function writeJsonLine(socket: net.Socket | null | undefined, message: unknown) {
   if (!socket || socket.destroyed || !socket.writable) return false;
   // ref: Node stream writableLength — bound queued output rather than blocking Pi's event loop on a slow view.
   if (socket.writableLength > 64 * 1024 * 1024) {
@@ -40,23 +42,23 @@ export function writeJsonLine(socket, message) {
   socket.write(`${JSON.stringify(message)}\n`);
   return true;
 }
-async function bridgePath(env) {
-  if (env.REMOTE_PI_BRIDGE_SOCKET) return env.REMOTE_PI_BRIDGE_SOCKET;
+async function bridgePath(env: Record<string, string | undefined>) {
   const configPath = env.REMOTE_PI_CONFIG || join(homedir(), ".config", "remote-pi", "config.json");
-  let config = {};
-  try { config = JSON.parse(await readFile(configPath, "utf8")); } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  let config: { stateDir?: string } = {};
+  try { config = JSON.parse(await readFile(configPath, "utf8")); } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
   }
   const path = config.stateDir || join(homedir(), ".local", "var", "remote-pi");
   const stateDir = path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(dirname(configPath), path);
   return join(stateDir, "bridge.sock");
 }
-export function herdrRequest(env, method, params = {}) {
+export function herdrRequest(env: Record<string, string | undefined>, method: string, params: Record<string, unknown> = {}): Promise<any> {
   return new Promise((resolveRequest, reject) => {
-    const socket = net.createConnection(env.HERDR_SOCKET_PATH);
+    const socket = net.createConnection(env.HERDR_SOCKET_PATH!);
     const id = randomUUID();
-    const timer = setTimeout(() => finish(new Error("Herdr did not respond")), 2000);
-    const finish = (error, value) => {
+    // ref: Herdr AgentStartParams.timeout_ms — allow the native startup deadline plus transport grace.
+    const timer = setTimeout(() => finish(new Error("Herdr did not respond")), typeof params.timeout_ms === "number" ? params.timeout_ms + 2000 : 2000);
+    const finish = (error: Error | null, value?: any) => {
       clearTimeout(timer);
       socket.destroy();
       if (error) reject(error); else resolveRequest(value);
@@ -68,33 +70,44 @@ export function herdrRequest(env, method, params = {}) {
     }, false);
   });
 }
-const textOf = (content) => typeof content === "string" ? content : (content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+const textOf = (content: string | { type: string; text?: string }[]) =>
+  typeof content === "string" ? content : (content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
 
 // ref: Pi docs/extensions.md#context-and-session-changes; dist/core/extensions/types.d.ts.
 // Lazy public import keeps the framing helpers usable by plain Node without a local Pi installation.
-const listPiSessions = async (cwd, dir) => (await import("@earendil-works/pi-coding-agent")).SessionManager.list(cwd, dir);
-export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions } = {}) {
-  let ctx, socket, retryTimer, path, terminalId, retries = 0, enabled = false, disposed = false, startEvent = {};
-  const dialogs = new Map(), replacements = new Map(), paneId = env.HERDR_PANE_ID;
-  const send = (message) => writeJsonLine(socket, message);
-  const on = (type, handler) => pi.on(type, (event, currentCtx) => {
-    ctx = currentCtx;
-    return handler(event);
-  });
-  const response = (request, data, error) => send({ id: request.id, type: "response", command: request.type, success: !error, ...(error ? { error: error.message || String(error) } : { data }) });
-  const setTools = (on) => pi.setActiveTools([...pi.getActiveTools().filter((name) => !TOOLS.includes(name)), ...(on ? TOOLS : [])]);
-  const setOn = (on) => metadata(env, "pane.report_metadata", {
-    pane_id: paneId, source: "remote-pi",
-    tokens: { remote_pi: on ? "on" : null, remote_pi_session: on ? ctx.sessionManager.getSessionFile() : null },
+const listPiSessions = async (cwd: string, dir?: string) => (await import("@earendil-works/pi-coding-agent")).SessionManager.list(cwd, dir);
+type BridgeOptions = {
+  env?: Record<string, string | undefined>; metadata?: typeof herdrRequest;
+  connect?: typeof net.createConnection; listSessions?: typeof listPiSessions;
+};
+export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}) {
+  const { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions } = options;
+  let ctx: ExtensionContext, socket: net.Socket | null = null, retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let path: string, terminalId: string | undefined, retries = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
+  const dialogs = new Map<string, { finish: (value?: string, error?: unknown) => void; request: { options: string[] } & Record<string, unknown> }>();
+  const replacements = new Map<string, Record<string, any>>(), paneId = env.HERDR_PANE_ID;
+  const send = (message: unknown) => writeJsonLine(socket, message);
+  const on = <K extends ExtensionEvent["type"]>(type: K, handler: (event: Extract<ExtensionEvent, { type: K }>) => unknown) => {
+    const register = pi.on as (type: K, handler: (event: Extract<ExtensionEvent, { type: K }>, ctx: ExtensionContext) => unknown) => unknown;
+    return register(type, (event, currentCtx) => {
+      ctx = currentCtx;
+      return handler(event);
+    });
+  };
+  const response = (request: any, data?: any, error?: any) => send({ id: request.id, type: "response", command: request.type, success: !error, ...(error ? { error: error.message || String(error) } : { data }) });
+  const setTools = (on: boolean) => pi.setActiveTools([...pi.getActiveTools().filter((name) => !TOOLS.includes(name)), ...(on ? TOOLS : [])]);
+  const setOn = (on: boolean) => metadata(env, "pane.report_metadata", {
+    pane_id: paneId!, source: "remote-pi",
+    tokens: { remote_pi: on ? "on" : null, remote_pi_session: on ? ctx?.sessionManager.getSessionFile() : null },
   });
   // ref: Claude Code Remote Control shows persistent active indicator (https://code.claude.com/docs/en/remote-control)
-  const setStatus = (text) => {
+  const setStatus = (text?: string) => {
     try { if (ctx?.hasUI || ctx?.mode === "tui") ctx.ui?.setStatus?.("remote-pi", text); } catch {}
   };
   const getRecent = () => {
     try {
       const branch = ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || [];
-      const texts = (role) => branch.filter((e) => e?.type === "message" && e.message?.role === role).map((e) => textOf(e.message.content).trim()).filter(Boolean);
+      const texts = (role: "user" | "assistant") => branch.flatMap((e) => e.type === "message" && e.message.role === role ? [textOf(e.message.content).trim()] : []).filter(Boolean);
       const userTexts = texts("user"), assistantTexts = texts("assistant");
       return {
         firstUserText: userTexts[0]?.slice(0, 60) || undefined,
@@ -103,16 +116,16 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       };
     } catch { return {}; }
   };
-  const identity = () => ({ sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId() });
+  const identity = () => ({ sessionFile: ctx?.sessionManager.getSessionFile(), sessionId: ctx?.sessionManager.getSessionId() });
   const hello = () => send({
-    type: "hello", paneId, terminalId, cwd: ctx.cwd, ...identity(), pid: process.pid, version: 1,
+    type: "hello", paneId, terminalId, cwd: ctx?.cwd, ...identity(), pid: process.pid, version: 1,
     reason: startEvent.reason, previousSessionFile: startEvent.previousSessionFile, state: state(),
     sessionName: pi.getSessionName?.() || ctx?.sessionManager?.getSessionName?.() || undefined,
     recent: getRecent(),
   });
   // ref: https://nodejs.org/api/net.html#event-close — reconnect only after close, and cancel timers on explicit detach.
   const disconnect = (retry = false) => {
-    clearTimeout(retryTimer);
+    if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
     if (!retry) for (const dialog of dialogs.values()) dialog.finish(undefined);
     const current = socket;
@@ -126,7 +139,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     }, Math.min(10_000, 250 * 2 ** Math.min(retries++, 6))).unref();
   };
   const open = () => {
-    if (!enabled || disposed || socket) return;
+    if (!enabled || disposed || socket || !path) return;
     const current = connect({ path });
     socket = current;
     current.on("connect", () => {
@@ -153,8 +166,8 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       }).catch((error) => response(message, null, error));
     });
   };
-  const setEnabled = async (on, pane) => {
-    if (on) terminalId = (pane || await metadata(env, "pane.get", { pane_id: paneId }))?.pane?.terminal_id;
+  const setEnabled = async (on: boolean, pane?: any) => {
+    if (on) terminalId = (pane || await metadata(env, "pane.get", { pane_id: paneId! }))?.pane?.terminal_id;
     enabled = on;
     await setOn(on);
     setStatus(on ? "📱 reconnecting…" : undefined);
@@ -163,34 +176,35 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     open();
   };
   const state = () => ({
-    model: ctx.model || null, thinkingLevel: pi.getThinkingLevel(), isStreaming: !ctx.isIdle(),
-    ...identity(), sessionName: pi.getSessionName(), cwd: ctx.cwd,
+    model: ctx?.model || null, thinkingLevel: pi.getThinkingLevel(), isStreaming: !ctx?.isIdle(),
+    ...identity(), sessionName: pi.getSessionName(), cwd: ctx?.cwd,
   });
   const stats = () => {
-    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+    const tokens: Record<string, number> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
     let cost = 0;
     for (const entry of ctx.sessionManager.getEntries()) {
-      const usage = entry.type === "message" ? entry.message.usage : entry.usage;
+      const usage = entry.type === "message" ? ("usage" in entry.message ? entry.message.usage : undefined) : "usage" in entry ? entry.usage : undefined;
       if (!usage) continue;
-      for (const key of ["input", "output", "cacheRead", "cacheWrite"]) tokens[key] += usage[key] || 0;
+      for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) tokens[key] += usage[key] || 0;
       cost += usage.cost?.total || 0;
     }
     // ref: Pi AgentSession.getSessionStats — sum all four token buckets, including compaction/branch usage.
     tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-    return { ...identity(), tokens, cost, contextUsage: ctx.getContextUsage() };
+    return { ...identity(), tokens, cost, contextUsage: ctx?.getContextUsage() };
   };
   const levels = () => {
-    if (!ctx.model?.reasoning) return ["off"];
+    if (!ctx?.model?.reasoning) return ["off"];
     const map = ctx.model.thinkingLevelMap;
     // ref: Pi docs/rpc-commands.md#set_thinking_level; a model's native map marks unsupported levels null.
-    return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].filter((level) => map ? map[level] !== null && (level !== "max" && level !== "xhigh" || map[level] !== undefined) : !["xhigh", "max"].includes(level));
+    const supported = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+    return supported.filter((level) => map ? map[level] !== null && (level !== "max" && level !== "xhigh" || map[level] !== undefined) : !["xhigh", "max"].includes(level));
   };
-  async function dispatch(request) {
+  async function dispatch(request: any): Promise<any> {
     if (!ctx || disposed) throw new Error("Pi session is not ready");
     switch (request.type) {
       case "prompt": case "steer": case "follow_up": {
         if (typeof request.message !== "string" || request.images !== undefined && !Array.isArray(request.images)) throw new Error("Invalid prompt");
-        if (request.images?.some((i) => i.type !== "image" || typeof i.data !== "string" || typeof i.mimeType !== "string")) throw new Error("Invalid image");
+        if (request.images?.some((i: any) => i.type !== "image" || typeof i.data !== "string" || typeof i.mimeType !== "string")) throw new Error("Invalid image");
         const deliverAs = request.type === "steer" ? "steer" : request.type === "follow_up" ? "followUp" : request.streamingBehavior;
         if (deliverAs !== undefined && !["steer", "followUp"].includes(deliverAs)) throw new Error("Invalid streaming behavior");
         if (!ctx.isIdle() && !deliverAs) throw new Error("Agent is streaming; specify streamingBehavior");
@@ -212,7 +226,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       case "set_thinking_level":
         if (!levels().includes(request.level)) throw new Error("Unsupported thinking level");
         pi.setThinkingLevel(request.level); return {};
-      case "compact": return new Promise((done, reject) => ctx.compact({ customInstructions: request.customInstructions, onComplete: done, onError: reject }));
+      case "compact": return new Promise((done, reject) => ctx!.compact({ customInstructions: request.customInstructions, onComplete: done, onError: reject }));
       case "bash": {
         if (typeof request.command !== "string") throw new Error("Shell command required");
         const result = await pi.exec("bash", ["-lc", request.command], { cwd: ctx.cwd });
@@ -221,7 +235,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       // ref: Pi 1.3.0 dist/core/session-manager.d.ts — list respects the active native session directory.
       case "list_sessions": {
         const sessions = await listSessions(ctx.cwd, ctx.sessionManager.getSessionDir());
-        return { sessions: sessions.sort((a, b) => b.modified - a.modified).slice(0, 12)
+        return { sessions: sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime()).slice(0, 12)
           .map((s) => ({ path: s.path, title: s.name || s.firstMessage?.split("\n")[0].slice(0, 60) || basename(s.path) })) };
       }
       case "get_commands": return { commands: pi.getCommands().filter((c) => !Object.values(INTERNAL_COMMANDS).includes(c.name)) };
@@ -280,16 +294,17 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       try {
         await setEnabled(arg === "on" || arg !== "off" && !enabled);
         ctx.ui.notify(`Remote control ${enabled ? "on" : "off"}.`, "info");
-      } catch (error) { ctx.ui.notify(`/remote-control failed: ${error.message}`, "error"); }
+      } catch (error: any) { ctx.ui.notify(`/remote-control failed: ${error?.message || error}`, "error"); }
     },
   });
+  // ref: Pi ToolDefinition<TParams> — type-only TypeBox annotations keep the existing JSON schemas unchanged at runtime.
   pi.registerTool({
     name: "remote_attach", label: "Remote Attach", description: "Send local files to the user's chat as attachments with the current reply.",
     promptSnippet: "Deliver local files to the chat", promptGuidelines: ["Use remote_attach when the user asks for a file or generated artifact."],
-    parameters: { type: "object", properties: { paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 10 } }, required: ["paths"] },
+    parameters: { type: "object", properties: { paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 10 } }, required: ["paths"] } as unknown as TObject<{ paths: TArray<TString> }>,
     async execute(_id, params, _signal, _update, toolCtx) {
       if (!socket || socket.readyState !== "open") throw new Error("Remote control is not connected");
-      const paths = params.paths.map((p) => resolve(toolCtx.cwd, p));
+      const paths = params.paths.map((p: string) => resolve(toolCtx.cwd, p));
       for (const path of paths) { if (!(await stat(path)).isFile()) throw new Error(`Not a file: ${path}`); }
       return { content: [{ type: "text", text: `Queued ${paths.length} attachment(s) for delivery.` }], details: { paths } };
     },
@@ -297,13 +312,13 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   pi.registerTool({
     name: "remote_ask", label: "Remote Ask", description: "Ask a multiple-choice question in Telegram and the terminal; the first answer wins.",
     promptSnippet: "Ask the user a multiple-choice question with buttons", promptGuidelines: ["Use remote_ask only when user input is needed to unblock the next step."],
-    parameters: { type: "object", properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8 } }, required: ["question", "options"] },
+    parameters: { type: "object", properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8 } }, required: ["question", "options"] } as unknown as TObject<{ question: TString; options: TArray<TString> }>,
     async execute(_id, params, signal, _update, toolCtx) {
       if (!socket || socket.readyState !== "open") throw new Error("Remote control is not connected");
-      const answer = await new Promise((done, reject) => {
+      const answer = await new Promise<string | undefined>((done, reject) => {
         const id = randomUUID();
         const controller = new AbortController();
-        const finish = (value, error) => {
+        const finish = (value?: string, error?: any) => {
           if (!dialogs.delete(id)) return;
           clearTimeout(timer);
           signal?.removeEventListener("abort", cancel);
@@ -330,7 +345,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     setTools(false);
     if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !paneId) return;
     const pane = await metadata(env, "pane.get", { pane_id: paneId }).catch(() => null);
-    enabled = pane?.pane?.tokens?.remote_pi === "on" || env.REMOTE_PI_ATTACH === "1" && event.reason === "startup";
+    enabled = pane?.pane?.tokens?.remote_pi === "on";
     if (enabled) await setEnabled(true, pane); else setStatus(undefined);
   });
   pi.on("session_shutdown", async (event) => {
@@ -340,23 +355,23 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     disconnect();
   });
   // Pi 1.3.0 exposes no public auto_retry_start/end hooks; retry notifications are unavailable here.
-  for (const type of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end", "session_info_changed"]) on(type, send);
+  for (const type of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end", "session_info_changed"] as const) on(type, send);
   on("input", (event) => { if (event.source === "interactive") send({ type: "remote_user_input", text: event.text }); });
   on("session_before_switch", async (event) => {
     if (!enabled || event.reason !== "resume" || !event.targetSessionFile || !env.HERDR_SOCKET_PATH) return;
     // ref: Herdr agent.list exposes the native agent_session path; refuse another writer even from the desktop picker.
-    let result;
+    let result: any;
     try { result = await metadata(env, "agent.list", {}); } catch {
-      ctx.ui.notify("Cannot verify whether that session is already open; try again when Herdr is reachable.", "error");
+      ctx?.ui.notify("Cannot verify whether that session is already open; try again when Herdr is reachable.", "error");
       return { cancel: true };
     }
-    const other = result?.agents?.find((agent) => agent.pane_id !== paneId && agent.agent === "pi" && agent.agent_session?.value === event.targetSessionFile);
+    const other = result?.agents?.find((agent: any) => agent.pane_id !== paneId && agent.agent === "pi" && agent.agent_session?.value === event.targetSessionFile);
     if (other) {
-      ctx.ui.notify(`Session is already open in ${other.pane_id}. Switch to that pane instead.`, "error");
+      ctx?.ui.notify(`Session is already open in ${other.pane_id}. Switch to that pane instead.`, "error");
       return { cancel: true };
     }
   });
   on("session_compact", (event) => send({ type: "compaction_end", reason: event.reason, result: event.compactionEntry, aborted: false, willRetry: event.willRetry }));
   on("session_compact_failed", (event) => send({ ...event, type: "compaction_end", result: null }));
 }
-export default (pi) => createRemoteBridge(pi);
+export default (pi: ExtensionAPI) => createRemoteBridge(pi);

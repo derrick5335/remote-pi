@@ -32,7 +32,7 @@
 - ⚡ **Lightweight & Minimalist**: Built around a clean, single-file core (`gateway.mjs`) using only the Node.js standard library plus `markdown-it` for Telegram HTML rendering. No heavy frameworks.
 - 🔒 **Clean State & Config Separation**: Follows 12-Factor principles — `config.json` remains strictly immutable. Runtime workspaces and pane/session bindings are tracked in `state.json`; sessions stay in Pi’s native session directory.
 - 🎯 **100% Pi-Native**: Uses Pi 1.3.0’s public Extension API, Pi CLI, and Herdr socket API. One interactive Pi process owns each session; Telegram and the terminal are views of that process. No private patches or side-channel files.
-- 🌊 **Live Drafts**: `sendMessageDraft` shows temporary text and current tool progress, independently for each topic. Updates are throttled to 1.5 seconds with 20-second keepalives; final replies are sent as persistent text messages. After a reply, an empty “Thinking…” placeholder is never sent again in that run. If drafts fail, previews stop for that run without falling back to edits.
+- 🌊 **Live Drafts**: `sendMessageDraft` shows temporary text and current tool progress, independently for each topic. Updates are throttled to 1.5 seconds with 20-second keepalives; final replies are sent as persistent text messages. After a reply, an empty “Thinking…” placeholder is never sent again in that run. If drafts fail, previews stop for that run without falling back to edits. Drafts show Telegram's native Stop button (`can_stop: true`, Bot API 10.3); stopping generation acts as `/abort` in the owning chat/topic, for the allowed private-chat user only.
 - 🔁 **Retry Errors**: Assistant error replies include a single `🔁 Retry` button to resend the last prompt. Long replies are delivered as text chunks.
 - 🎮 **One Remote-Control Extension**:
   - `remote-pi.ts` provides `remote_attach` (send local files) and `remote_ask` (multiple-choice questions in Telegram and the terminal; first answer wins). Tools are active only while connected.
@@ -119,20 +119,23 @@ npm install --omit=dev
 
 ### 2. Run Offline Self-Test
 
-Verify core invariants using fake Telegram/Herdr adapters and temporary local bridge sockets, without connecting to real Telegram or Herdr:
+Verify core invariants using fake Telegram/Herdr adapters and temporary local bridge sockets, without connecting to real Telegram or Herdr. A 60-second watchdog reports the active test and exits non-zero on hangs; assertions in polling fakes stop polling and reject the test instead of entering network backoff:
 
 ```bash
-npm test
+timeout 120 node gateway.mjs --self-test
 # Outputs "self-test: ok" upon success
 ```
 
-Lint (ESLint safety and readability rules):
+Developer checks (install dev dependencies with `npm install` first):
 
 ```bash
 npm run lint
+npm run typecheck
 ```
 
-The self-test enforces the line budgets (including comments and blank lines): `gateway.mjs` ≤1500, `remote-pi.ts` ≤360, `install.sh` ≤140, core total ≤2000, and `self-test.mjs` ≤900. ESLint readability rules remain enabled; budget reductions must not cram statements onto a line.
+`typecheck` runs `tsc --noEmit` on `remote-pi.ts` using the installed Pi 1.3.0 public types, not vendored declarations. `tsconfig.json` maps the installed package and its TypeBox types under `/Users/panyunpeng/.pi/agent/install/releases/1.3.0/node_modules`; adjust those paths on other machines. Type-only imports are erased by Node's native type stripping, so `npm test` needs no TypeScript loader.
+
+The project's line-budget targets are (including comments and blank lines): `gateway.mjs` ≤1500, `remote-pi.ts` ≤360, `install.sh` ≤140, core total ≤2000, and `self-test.mjs` ≤900. ESLint readability rules remain enabled; budget reductions must not cram statements onto a line.
 
 ### 3. Configure
 
@@ -268,7 +271,7 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 - **Resume without another writer**: `/resume` asks the connected Pi for the 12 most recently modified sessions for the current cwd using public `SessionManager.list`, respecting Pi’s active native session directory. If another pane already serves a session, the gateway offers to point the topic at that pane instead of opening another Pi on the same file.
 - **Dialogs**: `remote_ask` appears in both views; the first answer dismisses the other. Other extensions’ TUI dialogs stay in the terminal; Herdr blocked notifications include a screen tail and only `⏎ Enter` / `⎋ Esc` controls.
 - **Lifecycle & terminal identity**: Sessions bind to Herdr terminal identities (`terminal_id`), preventing stale pane IDs from reusing or closing unrelated panes after Herdr restarts. A gateway (re)start only re-attaches to Pi panes that are still running — it never launches a new Pi by itself; if none is running, the first message starts one. Reconnecting keeps pending `remote_ask` terminal questions active and re-sends them to Telegram. When Pi quits to the shell, the next phone prompt resumes it in the same pane. Closing a desktop-attached topic never kills that Pi.
-- **Blocked prompts**: While a bound session is working, poll Herdr's native agent status every 3 seconds over the Herdr socket API. Only bound panes that become blocked receive a screen-tail preview and Enter/Esc buttons, and open `remote_ask` dialogs suppress duplicate alerts. Buttons re-check blocked status before sending keys.
+- **Blocked prompts**: Herdr `events.subscribe` pushes `pane.agent_status_changed` events for bound, connected panes; there is no periodic status poll. Changes to bindings resubscribe, socket closure reconnects with exponential backoff, and each subscription reconciles once using `agent.list`. While a session is working, entering blocked sends a screen-tail preview and Enter/Esc buttons; open `remote_ask` dialogs suppress duplicate alerts. Buttons re-check blocked status before sending keys.
 
 **Pi 1.3.0 public API limits**: Native queue inspection/clearing and automatic retry start/end notifications are unavailable. Compaction and agent lifecycle events are forwarded.
 
@@ -287,10 +290,12 @@ Configure `"sttCommand"` in `config.json`. When a voice message is received, the
 ```
 
 - **One owner, many views**: Each session belongs to one interactive Pi process. `state.json` stores pane/session bindings; native Pi session files remain in `~/.pi/agent/sessions` (subject to Pi’s native environment overrides).
-- **Per-session ordering**: Each view serializes its events and incoming updates; there is no global Telegram output queue or method monkey-patching. Attachment uploads use a separate per-session promise chain, preserving file order without blocking events or other sessions. Only `/abort` and `/restart` bypass the update chain, so a stuck command cannot block recovery. New topics are registered and their updates enqueued synchronously; persistence and the welcome message run in the background with error logging.
-- **Native lifecycle**: Herdr creates/starts panes; Pi handles prompts, models, compaction, and session replacement. The gateway preserves its RPC-shaped client interface with `PaneRpc`, without spawning another Pi through a subprocess RPC mode.
+- **Per-session ordering**: Each view serializes its events and incoming updates; there is no global Telegram output queue or method monkey-patching. Attachment uploads use a separate per-session promise chain, preserving file order without blocking events or other sessions. Only `/abort`, the native draft Stop button, and `/restart` bypass the update chain, so a stuck command cannot block recovery. New topics are registered and their updates enqueued synchronously; persistence and the welcome message run in the background with error logging.
+- **Native lifecycle**: Before `agent.start`, the gateway sets `remote_pi=on` using Herdr `pane.report_metadata`, retaining the foreground-shell safety check. No shell `export` or simulated input is injected; the extension resolves `bridge.sock` from configuration, without `REMOTE_PI_ATTACH` or `REMOTE_PI_BRIDGE_SOCKET`. Herdr creates/starts panes; Pi handles prompts, models, compaction, and session replacement. The gateway preserves its RPC-shaped client interface with `PaneRpc`, without spawning another Pi through a subprocess RPC mode.
+- **Herdr transport**: Pane lookup, foreground-process checks, workspace creation, agent startup, and pane closure use the socket API. The only Herdr CLI call is `herdr status server --json` at startup to discover the socket (5-second timeout). Discovery and speech-to-text use the same promisified `execFile` helper; transcription runs `bash -c <sttCommand> stt <path>` with a 120-second timeout. Native `agent.start` receives `timeout_ms: 45000`; its socket request allows an additional 2 seconds for transport.
+- **Command menu**: Commands are registered once using `setMyCommands` with the default scope. Older `all_private_chats` or other narrower command scopes take precedence if still configured; clearing those is a separate, authorized migration step.
 - **Power Management**: On macOS, launchd invokes `/usr/bin/caffeinate -s -i -- node gateway.mjs`. This prevents idle sleep on AC power while preserving manual sleep and lid-close behavior.
-- **References**: [Pi Extension API](https://pi.dev/docs/latest/extensions) (implementation targets installed Pi 1.3.0), [Herdr CLI](https://herdr.dev/docs/cli-reference/), [Herdr integrations](https://herdr.dev/docs/integrations/), [Telegram draft lifecycle](https://core.telegram.org/bots/api#sendmessagedraft), [Telegram retry parameters](https://core.telegram.org/bots/api#responseparameters), and [Node socket lifecycle](https://nodejs.org/api/net.html#event-close).
+- **References**: [Pi Extension API](https://pi.dev/docs/latest/extensions) (implementation targets installed Pi 1.3.0), [Herdr socket API](https://herdr.dev/docs/socket-api/), [Herdr CLI](https://herdr.dev/docs/cli-reference/), [Herdr integrations](https://herdr.dev/docs/integrations/), [Telegram draft lifecycle](https://core.telegram.org/bots/api#sendmessagedraft), [Telegram generation-stop updates](https://core.telegram.org/bots/api#messagegenerationstopped), [Telegram retry parameters](https://core.telegram.org/bots/api#responseparameters), [Telegram command-scope precedence](https://core.telegram.org/bots/api#determining-list-of-commands), [Node subprocesses](https://nodejs.org/api/child_process.html#child_processexecfilefile-args-options-callback), and [Node socket lifecycle](https://nodejs.org/api/net.html#event-close).
 
 ---
 

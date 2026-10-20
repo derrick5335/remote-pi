@@ -32,7 +32,7 @@
 - ⚡ **轻量极简核心**：单文件核心实现（`gateway.mjs`），除 `markdown-it` 用于 Telegram HTML 格式渲染外，全部使用 Node.js 标准库，无重型框架包袱。
 - 🔒 **配置与状态严格解耦（12-Factor 原则）**：`config.json` 保持只读；运行期工作区与 pane/session 绑定持久化于 `state.json`；会话使用 Pi 原生目录。
 - 🎯 **100% 基于 Pi 原生状态与能力**：仅使用 Pi 1.3.0 公开 Extension API、Pi CLI 与 Herdr socket API。每个会话由一个交互式 Pi 进程持有，Telegram 和终端只是该进程的不同视图；无私有补丁或旁路通信文件。
-- 🌊 **实时草稿**：`sendMessageDraft` 显示临时文本和当前工具进度，各 Topic 独立更新；更新间隔至少 1.5 秒，每 20 秒保活，最终回复作为持久文本消息发送。本轮已回复后，不再发送空的“Thinking…”占位草稿。草稿失败时仅停用本轮预览，不回退到编辑消息。
+- 🌊 **实时草稿**：`sendMessageDraft` 显示临时文本和当前工具进度，各 Topic 独立更新；更新间隔至少 1.5 秒，每 20 秒保活，最终回复作为持久文本消息发送。本轮已回复后，不再发送空的“Thinking…”占位草稿。草稿失败时仅停用本轮预览，不回退到编辑消息。草稿显示 Telegram 原生 Stop 按钮（`can_stop: true`，Bot API 10.3）；停止生成等同于在所属私聊/Topic 执行 `/abort`，仅接受白名单私聊用户。
 - 🔁 **错误重试**：助手错误回复仅附一个 `🔁 Retry` 按钮，重发上一次 Prompt。超长回复直接分段发送文本。
 - 🎮 **统一远程控制扩展**：
   - `remote-pi.ts` 提供 `remote_attach`（发送本地文件）与 `remote_ask`（同时在 Telegram 和终端提问，先回答者生效）；工具仅在连接期间启用。
@@ -119,20 +119,23 @@ npm install --omit=dev
 
 ### 2. 离线自检
 
-通过假的 Telegram/Herdr 适配器及临时本地桥接 socket 验证核心不变式，不连接真实 Telegram 或 Herdr：
+通过假的 Telegram/Herdr 适配器及临时本地桥接 socket 验证核心不变式，不连接真实 Telegram 或 Herdr。60 秒 watchdog 会在卡住时输出当前测试名称并以非零状态退出；轮询 fake 中的断言失败会停止轮询并使测试失败，不进入网络退避重试：
 
 ```bash
-npm test
+timeout 120 node gateway.mjs --self-test
 # 输出 "self-test: ok" 即表示全部核心逻辑正常
 ```
 
-Lint（ESLint 安全与可读性规则）：
+开发检查（先用 `npm install` 安装开发依赖）：
 
 ```bash
 npm run lint
+npm run typecheck
 ```
 
-自检强制行数预算（含注释及空行）：`gateway.mjs` ≤1500、`remote-pi.ts` ≤360、`install.sh` ≤140，核心合计 ≤2000；`self-test.mjs` ≤900。ESLint 可读性规则保持启用，不得为缩减行数而将多条语句挤到一行。
+`typecheck` 对 `remote-pi.ts` 执行 `tsc --noEmit`，使用已安装的 Pi 1.3.0 公开类型，不复制类型声明。`tsconfig.json` 将 Pi 包及其 TypeBox 类型映射至 `/Users/panyunpeng/.pi/agent/install/releases/1.3.0/node_modules` 下；其他机器需调整这些路径。Node 原生类型剥离会移除 type-only import，因此 `npm test` 无需 TypeScript loader。
+
+项目行数预算目标（含注释及空行）：`gateway.mjs` ≤1500、`remote-pi.ts` ≤360、`install.sh` ≤140，核心合计 ≤2000；`self-test.mjs` ≤900。ESLint 可读性规则保持启用，不得为缩减行数而将多条语句挤到一行。
 
 ### 3. 创建配置文件
 
@@ -268,7 +271,7 @@ pi-remote-gateway stop     # 停止后台服务
 - **恢复会话而不创建第二个写入者**：`/resume` 经连接的 Pi 调用公开 `SessionManager.list`，使用 Pi 当前原生会话目录，列出当前 cwd 最近修改的 12 个会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
 - **提问与审批**：`remote_ask` 同时出现在两个视图，先回答的一端使另一端关闭。其他扩展的 TUI 对话仍留在终端；Herdr 待确认通知仅附屏幕末尾内容及 `⏎ Enter` / `⎋ Esc` 控件。
 - **生命周期与终端标识**：会话按 Herdr 终端物理标识（`terminal_id`）绑定，避免 Herdr 重启后复用窗格 ID 误操作新窗格。网关（重）启动只重新附加仍在运行的 Pi 窗格，绝不自行启动新 Pi；若没有正在运行的 Pi，第一条消息才会启动它。断线重连保持待答的 `remote_ask` 提问有效并重新同步至 Telegram。Pi 退出至 Shell 后，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。
-- **待确认提示**：绑定会话工作期间每 3 秒通过 Herdr socket API 轮询 Herdr 原生 agent 状态；仅为进入 blocked 状态的绑定窗格发送屏幕末尾预览及 Enter/Esc 按钮，已有 `remote_ask` 对话时不重复提醒。发送按键前会重新检查 blocked 状态。
+- **待确认提示**：通过 Herdr `events.subscribe` 为已绑定且已连接的窗格推送 `pane.agent_status_changed` 事件，不再定期轮询状态。绑定变化时重新订阅，socket 关闭后采用指数退避重连，每次订阅通过一次 `agent.list` 对齐状态。会话工作期间进入 blocked 时发送屏幕末尾预览及 Enter/Esc 按钮；已有 `remote_ask` 对话时不重复提醒。发送按键前会重新检查 blocked 状态。
 
 **Pi 1.3.0 公开 API 限制**：不支持检查或清空原生队列，也不支持自动重试开始/结束通知。压缩及 agent 生命周期事件正常转发。
 
@@ -287,10 +290,12 @@ pi-remote-gateway stop     # 停止后台服务
 ```
 
 - **一个持有者，多个视图**：每个会话属于一个交互式 Pi 进程。`state.json` 保存 pane/session 绑定；原生 Pi 会话文件仍位于 `~/.pi/agent/sessions`（可由 Pi 原生目录环境变量覆盖）。
-- **会话内保序**：每个视图分别串行处理事件与输入更新，不使用全局 Telegram 输出队列或方法猴子补丁。附件上传使用独立的会话级 Promise 链，保留文件顺序，但不阻塞事件处理或其他会话。仅 `/abort` 与 `/restart` 绕过输入更新链立即执行，避免卡住的命令阻塞恢复。新 Topic 的注册与更新入队同步完成；状态持久化与欢迎消息在后台执行，失败会记录日志。
-- **原生生命周期**：Herdr 负责创建窗格、启动 agent；Pi 负责指令、模型、压缩与会话替换。网关用 `PaneRpc` 保留 RPC 形状的客户端接口，不再通过子进程 RPC 模式另起 Pi。
+- **会话内保序**：每个视图分别串行处理事件与输入更新，不使用全局 Telegram 输出队列或方法猴子补丁。附件上传使用独立的会话级 Promise 链，保留文件顺序，但不阻塞事件处理或其他会话。仅 `/abort`、草稿原生 Stop 按钮与 `/restart` 绕过输入更新链立即执行，避免卡住的命令阻塞恢复。新 Topic 的注册与更新入队同步完成；状态持久化与欢迎消息在后台执行，失败会记录日志。
+- **原生生命周期**：网关在 `agent.start` 前通过 Herdr `pane.report_metadata` 设置 `remote_pi=on`，并保留前台 Shell 安全检查。不向 Shell 注入 `export` 或模拟输入；扩展从配置解析 `bridge.sock`，不再使用 `REMOTE_PI_ATTACH` 或 `REMOTE_PI_BRIDGE_SOCKET`。Herdr 负责创建窗格、启动 agent；Pi 负责指令、模型、压缩与会话替换。网关用 `PaneRpc` 保留 RPC 形状的客户端接口，不再通过子进程 RPC 模式另起 Pi。
+- **Herdr 通信**：窗格查询、前台进程检查、工作区创建、agent 启动与窗格关闭全部走 socket API。唯一的 Herdr CLI 调用是启动时用 `herdr status server --json` 发现 socket（5 秒超时）。发现与语音转写共用 promisified `execFile` helper；转写执行 `bash -c <sttCommand> stt <path>`，超时 120 秒。原生 `agent.start` 接收 `timeout_ms: 45000`，socket 请求额外预留 2 秒通信时间。
+- **命令菜单**：仅调用一次默认 scope 的 `setMyCommands`。旧版本若仍配置了 `all_private_chats` 或其他更具体的命令 scope，它们会优先于默认菜单；清除这些 scope 属于需要单独授权的迁移操作。
 - **常驻与电源管理**：macOS 下 launchd 使用 `/usr/bin/caffeinate -s -i -- node gateway.mjs`，防止接通电源时的空闲睡眠，同时保留手动睡眠与合盖行为。
-- **参考**：[Pi Extension API](https://pi.dev/docs/latest/extensions)（实现以本机 Pi 1.3.0 为准）、[Herdr CLI](https://herdr.dev/docs/cli-reference/) 、[Herdr 集成](https://herdr.dev/docs/integrations/)、[Telegram 草稿生命周期](https://core.telegram.org/bots/api#sendmessagedraft)、[Telegram 重试参数](https://core.telegram.org/bots/api#responseparameters) 与 [Node socket 生命周期](https://nodejs.org/api/net.html#event-close)。
+- **参考**：[Pi Extension API](https://pi.dev/docs/latest/extensions)（实现以本机 Pi 1.3.0 为准）、[Herdr socket API](https://herdr.dev/docs/socket-api/)、[Herdr CLI](https://herdr.dev/docs/cli-reference/)、[Herdr 集成](https://herdr.dev/docs/integrations/)、[Telegram 草稿生命周期](https://core.telegram.org/bots/api#sendmessagedraft)、[Telegram 停止生成更新](https://core.telegram.org/bots/api#messagegenerationstopped)、[Telegram 重试参数](https://core.telegram.org/bots/api#responseparameters)、[Telegram 命令 scope 优先级](https://core.telegram.org/bots/api#determining-list-of-commands)、[Node 子进程](https://nodejs.org/api/child_process.html#child_processexecfilefile-args-options-callback) 与 [Node socket 生命周期](https://nodejs.org/api/net.html#event-close)。
 
 ---
 

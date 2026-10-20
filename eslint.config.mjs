@@ -1,4 +1,5 @@
 import globals from "globals";
+import tsParser from "@typescript-eslint/parser";
 
 export default [
   {
@@ -27,4 +28,6 @@ export default [
       "brace-style": ["error", "1tbs", { allowSingleLine: true }],
     },
   },
+  // ref: https://typescript-eslint.io/packages/parser/ — parse TS syntax without changing the existing rules.
+  { files: ["**/*.ts"], languageOptions: { parser: tsParser } },
 ];
