@@ -19,7 +19,7 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - 服务：`pi-remote-gateway start|stop|restart|status|logs`（仅经用户授权执行变更）
 - 配置：`~/.config/remote-pi/config.json`（bot token，mode 600；可选 `sttCommand` 语音转写）
 - 会话：Pi 原生目录 `~/.pi/agent/sessions`（支持 Pi 原生目录环境变量覆盖）
-- 网关状态：`~/.local/var/remote-pi/state.json`，保存主会话/Topic 的 pane/session 绑定；桥接 socket 为同目录的 `bridge.sock`（mode 600）
+- 网关状态：`~/.local/var/remote-pi/state.json`，保存主会话/Topic 的 pane/terminal/session 绑定；桥接 socket 为同目录的 `bridge.sock`（mode 600）
 - 下载：`~/.local/var/remote-pi/downloads`
 - 网关代码通过服务重启生效；Pi 扩展通过 Pi 原生 `/reload` 或会话替换重载。不要为了验证而自行重启。
 
@@ -29,7 +29,8 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - 输出保序：各 `ChatSession` 的 `eventChain` / `updateChain` 负责会话内串行；无全局 Telegram 输出队列或方法猴子补丁。附件用独立的会话级 `uploadChain` 保序，不阻塞事件或其他会话；仅 `/abort` 与 `/restart` 绕过输入更新链。新 Topic 同步注册并按到达顺序入队，持久化与欢迎消息在后台执行并记录错误。
 - 轮次收尾：已回复后禁止空的 “Thinking…” 草稿；每条助手 `message_end` 更新 `run.error`，内部重试成功后最终 reaction 为 `👌`。
 - `remote-pi.ts`：统一 Pi extension，通过公开 Extension API 实现 RPC 形状的桥接命令与事件转发，提供 `/remote-control on|off|status`。Herdr 原生 pane metadata token `remote_pi=on` 保存开关，扩展自动重连；会话替换后由新 runtime 的 hello 恢复绑定。
-- `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
+- `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。断线重连保持待答提问有效并在重连后重发，显式断开才取消。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
+- 绑定与生命周期：会话按 Herdr `terminal_id` 匹配实际终端，避免窗格 ID 复用导致误绑或误关。Telegram 客户端删除的 Topic 在下次投递失败时自动对齐清理。`/new` 与 `/resume` 替换请求采用 60s 超时并向用户反馈清晰错误。
 - blocked 轮询：绑定会话工作期间每 3 秒读取 Herdr 原生 agent 状态，仅推送绑定窗格的 blocked 变化；已有 `remote_ask` 按钮时不重复提醒。Enter/Esc 回调重新验证 blocked；普通指令仍走 socket，不用模拟按键驱动 Pi。
 - `install.sh`：安装 launchd 服务，并将 `remote-pi.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`；安装/升级时替换已有软链目标，不覆盖用户普通文件。`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - `/new` 无论是否已有连接都必须请求 `new_session`，不能把旧 `binding.sessionFile` 的懒启动误报为新会话。

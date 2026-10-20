@@ -62,7 +62,7 @@ async function selfTestPaneBridge() {
   let otherAgents = [];
   const metadataCalls = [];
   const metadata = async (_env, method, params) => {
-    if (method === "pane.get") return { pane: { tokens } };
+    if (method === "pane.get") return { pane: { tokens, terminal_id: "term-test" } };
     if (method === "pane.report_metadata") {
       metadataCalls.push(params);
       Object.assign(tokens, params.tokens);
@@ -183,7 +183,7 @@ async function selfTestPaneBridge() {
       { ...conn.hello, version: 2 }, { ...conn.hello, cwd: "relative" },
       { ...conn.hello, sessionFile: "relative" }, { ...conn.hello, pid: 0 },
       { ...conn.hello, sessionId: null }, { ...conn.hello, paneId: "" },
-      { ...conn.hello, paneId: "other-pane" },
+      { ...conn.hello, paneId: "other-pane" }, { ...conn.hello, terminalId: 1 },
     ]) {
       const socket = net.connect(path);
       socket.on("error", () => {});
@@ -191,6 +191,7 @@ async function selfTestPaneBridge() {
       await until(() => socket.destroyed);
       assert.equal(gateway.bridge.connections.size, 1);
     }
+    assert.equal(conn.hello.terminalId, "term-test");
     assert.equal(conn.hello.sessionName, "test");
     assert.deepEqual(conn.hello.recent, { firstUserText: "hello", lastUserText: "hello", lastAssistantText: "answer" });
     const session = gateway.mainSession;
@@ -282,10 +283,24 @@ async function selfTestPaneBridge() {
     await current.commands.get("remote-control").handler("on", current.ctx);
     await until(() => gateway.mainSession.pi.proc);
     await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
+    const askPending = current.tools.get("remote_ask").execute("ask", { question: "Drop?", options: ["A", "B"] }, undefined, undefined, current.ctx);
+    await until(() => selections.length === 3);
+    const dropRequest = events.filter((e) => e.type === "extension_ui_request").at(-1);
+    assert.ok(dropRequest);
+    const reqCount = events.filter((e) => e.type === "extension_ui_request" && e.id === dropRequest.id).length;
+
     // Assert connected -> reconnecting -> connected transition on socket drop
     const connBeforeDrop = [...gateway.bridge.connections.values()][0];
     connBeforeDrop?.socket?.destroy();
     await until(() => current.statusCalls.some((c) => c.text === "📱 reconnecting…"));
+    await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
+    assert.equal(selections.at(-1).cancelled, false, "close keeps dialog pending");
+    await until(() => events.filter((e) => e.type === "extension_ui_request" && e.id === dropRequest.id).length > reqCount);
+    await current.commands.get("remote-control").handler("off", current.ctx);
+    assert.equal(selections.at(-1).cancelled, true, "explicit off cancels pending dialog");
+    assert.equal((await askPending).details.answer, null);
+    await current.commands.get("remote-control").handler("on", current.ctx);
+    await until(() => gateway.mainSession.pi.proc);
     await until(() => current.statusCalls.at(-1)?.text === "📱 remote");
     // /remote-control status consistent with footer
     await current.commands.get("remote-control").handler("status", current.ctx);
@@ -327,7 +342,7 @@ async function selfTest() {
   };
   try {
     const root = dirname(fileURLToPath(import.meta.url));
-    const limits = { "gateway.mjs": 1500, "remote-pi.ts": 360, "install.sh": 140, "self-test.mjs": 900 };
+    const limits = { "gateway.mjs": 1540, "remote-pi.ts": 380, "install.sh": 140, "self-test.mjs": 1000 };
     let total = 0;
     for (const [file, limit] of Object.entries(limits)) {
       const count = (await readFile(join(root, file), "utf8")).split("\n").length - 1;
@@ -388,6 +403,32 @@ async function selfTest() {
       assert.deepEqual(handled, ["first", "second"]);
     }
 
+    for (const owned of [true, false]) {
+      const { gw, calls } = await fresh();
+      const s = await gw.createTopic({ threadId: 99, cwd: dir, name: "deleted", binding: { owned, paneId: "gone" } });
+      const requests = [];
+      s.pi.proc = {};
+      s.pi.request = owned
+        ? async (type) => { requests.push(type); throw new Error("refused to quit"); }
+        : async (type) => requests.push(type);
+      gw.telegram.send = async () => Promise.reject(new Error("Bad Request: message thread not found"));
+      await s.send("final output");
+      assert.deepEqual(requests, [owned ? "quit" : "remote_off"]);
+      const state = loadState(gw.config.stateDir);
+      assert.deepEqual([gw.sessions.has(s.key), state.topics[99], state.herdrPanes[s.key]], [false, undefined, undefined]);
+      assert.ok(!calls.some((c) => c.method === "deleteForumTopic"));
+    }
+    {
+      const { gw, calls } = await fresh();
+      const s = await gw.createTopic({ threadId: 77, cwd: dir, name: "gone", binding: { owned: true, paneId: "gone", terminalId: "t1" } });
+      s.pi.proc = {};
+      s.pi.request = async () => {};
+      s.pi.herdrEnv = { HERDR_BIN_PATH: "/fake/herdr" };
+      await gw.closeTopic(77, { deleteTopic: true });
+      const state = loadState(gw.config.stateDir);
+      assert.deepEqual([gw.sessions.has("t:77"), state.topics[77], state.herdrPanes["t:77"]], [false, undefined, undefined]);
+      assert.ok(calls.some((c) => c.method === "deleteForumTopic"), "pane already gone still closes the topic");
+    }
     // Attach-only startup never spawns; even a live Pi without hello must only be attached.
     {
       const { gw, s } = await fresh();
@@ -410,11 +451,28 @@ async function selfTest() {
         s.stop();
       } finally { await gw.bridge.stop(); }
     }
+    {
+      const { gw, s } = await fresh();
+      gw.me = { has_topics_enabled: true };
+      s.binding = { paneId: "reused", terminalId: "old", sessionFile: "/old.jsonl", owned: true };
+      const connection = { socket: { writable: true }, clients: new Set(), hello: { paneId: "reused", terminalId: "new", sessionFile: "/new.jsonl", cwd: dir } };
+      gw.bridge.connections.set("reused", connection);
+      assert.equal(gw.bridge.find(s.binding), undefined);
+      await gw.onPaneHello(connection);
+      const attached = [...gw.sessions.values()].find((view) => view !== s);
+      assert.deepEqual([s.pi.proc, attached.binding.owned, attached.binding.terminalId], [null, false, "new"], "reused pane id binds a new topic");
+      s.pi.herdrEnv.HERDR_BIN_PATH = "/fake/herdr";
+      await gw.closePaneSession(s, async (_bin, args) => {
+        if (args[1] !== "get") throw new Error(`unexpected command: ${args.join(" ")}`);
+        return `{"result":{"pane":{"terminal_id":"new"}}}`;
+      });
+      attached.stop();
+    }
     // Foreground-shell safety and persisted-pane reuse, without any real Herdr command.
-    for (const mode of ["new", "saved", "gone", "pi", "busy"]) {
+    for (const mode of ["new", "saved", "gone", "pi", "busy", "reused", "attached"]) {
       const { gw, s } = await fresh(), commands = [];
       gw.herdrEnvironment = { HERDR_BIN_PATH: "/fake/herdr", HERDR_SOCKET_PATH: "/fake/socket" };
-      s.binding = { cwd: s.cwd, ...(mode !== "new" ? { paneId: "saved" } : {}) };
+      s.binding = { cwd: s.cwd, owned: mode !== "attached", terminalId: "term-saved", ...(mode !== "new" ? { paneId: "saved" } : {}) };
       gw.bridge.server = {};
       gw.bridge.start = async () => {};
       gw.bridge.waitFor = async () => ({});
@@ -423,14 +481,14 @@ async function selfTest() {
         commands.push(args);
         if (args[1] === "get") {
           if (mode === "gone") throw new Error("missing");
-          return JSON.stringify({ result: { pane: { pane_id: "saved", agent: mode === "pi" ? "pi" : "shell" } } });
+          return JSON.stringify({ result: { pane: { pane_id: "saved", terminal_id: mode === "reused" ? "other" : "term-saved", agent: mode === "pi" ? "pi" : "shell" } } });
         }
-        if (args[0] === "workspace") return JSON.stringify({ result: { root_pane: { pane_id: "new" } } });
+        if (args[0] === "workspace") return JSON.stringify({ result: { root_pane: { pane_id: "new", terminal_id: "term-new" } } });
         return JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_process_group_id: ["busy", "pi"].includes(mode) ? 20 : 10 } } });
       };
       if (mode === "busy") await assert.rejects(() => gw.startPaneSession(s.pi, { runCmd }), /busy; no terminal input/);
       else assert.equal(await gw.startPaneSession(s.pi, { runCmd }), true);
-      assert.equal(commands.some((a) => a[0] === "workspace"), ["new", "gone"].includes(mode));
+      assert.equal(commands.some((a) => a[0] === "workspace"), ["new", "gone", "reused", "attached"].includes(mode));
       assert.equal(commands.some((a) => a[0] === "agent"), !["busy", "pi"].includes(mode));
       assert.equal(commands.some((a) => a[1] === "run"), mode === "saved");
       assert.ok(!commands.some((a) => a[1] === "list"));
@@ -473,6 +531,27 @@ async function selfTest() {
     assert.ok(fencedChunks[0].endsWith("```"));
     assert.ok(fencedChunks[1].startsWith("```js\n"));
 
+    for (const type of ["message_start", "message_update", "tool_execution_start", "message_end"]) {
+      const { s, calls } = await fresh();
+      const message = { role: "assistant", content: [{ type: "text", text: "reconnected reply" }], stopReason: "stop" };
+      await s.handleEvent({ type, message, toolName: "bash", assistantMessageEvent: { type: "text_delta", delta: "live" } });
+      assert.deepEqual([s.isStreaming, s.run.trigger], [true, null]);
+      if (type !== "message_end") await s.handleEvent({ type: "message_end", message });
+      assert.equal(calls.find((c) => c.method === "sendMessage").body.disable_notification, false);
+      await s.handleEvent({ type: "agent_settled" });
+      assert.deepEqual([s.run, s.isStreaming], [null, false]);
+    }
+    {
+      const { gw, s, calls } = await fresh();
+      for (const type of ["message_start", "message_end"]) await s.handleEvent({ type, message: { role: "custom", content: "x" } });
+      assert.deepEqual([s.run, s.isStreaming], [null, false], "non-assistant messages never start a run");
+      s.binding.sessionFile = "/s.jsonl";
+      await s.handleEvent({ type: "agent_start" });
+      const timer = s.run.timer;
+      await gw.onPaneHello({ socket: { destroyed: false, writable: true }, clients: new Set(),
+        hello: { paneId: "p1", cwd: s.cwd, sessionFile: "/s.jsonl", state: { isStreaming: false } } });
+      assert.deepEqual([timer._destroyed, s.run, s.isStreaming], [true, null, false], "idle reconnect clears a stale run");
+    }
     // Run lifecycle, temporary drafts, notifications, Retry, and internal provider recovery.
     {
       const { gw, s, calls } = await fresh();
@@ -566,7 +645,7 @@ async function selfTest() {
         assert.equal(of("sendMessage").at(-1).body.disable_notification, true);
         for (const present of [true, false]) {
           gw.isUserPresent = () => present;
-          await s.handleUiRequest({ method: "select", id: "q", title: "Choose", options: ["A", "B"] });
+          await s.handleUiRequest({ method: "select", id: `q-${present}`, title: "Choose", options: ["A", "B"] });
           assert.equal(of("sendMessage").at(-1).body.disable_notification, present);
         }
       } finally { s.stop(); }
@@ -620,6 +699,10 @@ async function selfTest() {
       await gw.pollBlocked();
       assert.equal(requests.length, 0);
       s.isStreaming = true;
+      await gw.pollBlocked();
+      assert.equal(requests.length, 0, "stale bindings never poll");
+      s.pi.proc = {};
+      s.pi.connection = { clients: new Set(), hello: { paneId: "bound" } };
       s.uiMessages = new Map([["q", 1]]);
       await gw.pollBlocked();
       assert.equal(calls.length, 0);
@@ -709,6 +792,7 @@ async function selfTest() {
       await until(() => existsSync(tg.offsetPath));
       assert.equal(await readFile(tg.offsetPath, "utf8"), "8");
       const { gw: restart } = await fresh(), exitBefore = process.exit;
+      const earlier = Promise.withResolvers(), late = earlier.promise.then(() => restart.telegram.saveOffset(8));
       let stopped = false;
       restart.stop = () => { stopped = true; };
       restart.mainSession.updateChain = new Promise(() => {});
@@ -717,7 +801,12 @@ async function selfTest() {
         const result = restart.dispatchUpdate({ update_id: 888, message: message("/restart") });
         await until(() => stopped);
         await result;
+        assert.equal(restart.telegram.savedOffset, 889);
+        earlier.resolve();
+        await late;
         assert.equal(await readFile(restart.telegram.offsetPath, "utf8"), "889");
+        await Promise.all([restart.telegram.saveOffset(890), restart.telegram.saveOffset(891), restart.telegram.saveOffset(889)]);
+        assert.equal(await readFile(restart.telegram.offsetPath, "utf8"), "891");
         await sleep(150);
       } finally { process.exit = exitBefore; }
       const ready = new Gateway(restart.config), edits = [];
@@ -801,8 +890,25 @@ async function selfTest() {
     // RPC startup coalesces, failed writes clean pending requests, and resume refuses a second writer.
     {
       const { gw, s, calls } = await fresh();
+      s.pi.proc = { destroyed: false, writable: true };
+      s.pi.write = (rec) => { setTimeout(() => s.pi.receive({ id: rec.id, type: "response", command: rec.type, success: true, data: {} }), 50); };
+      await s.handleCommand(parseCommand("/new"));
+      assert.match(calls.at(-1).body.text, /✅ New session started/, "a slow bridge still completes /new");
+      s.pi.request = async (type) => { throw new Error(`Pi bridge ${type} timed out; not retried`); };
+      await s.handleCommand(parseCommand("/new"));
+      assert.match(calls.at(-1).body.text, /❌ Pi bridge new_session timed out/);
+      await gw.handleCallback(null, s, { type: "resume", path: "/timeout.jsonl" });
+      assert.match(calls.at(-1).body.text, /❌ Pi bridge switch_session timed out/);
+      const uiReq = { method: "select", id: "dedup-q", title: "Q", options: ["A", "B"] };
+      await s.handleUiRequest(uiReq);
+      const count = calls.filter((c) => c.method === "sendMessage").length;
+      await s.handleUiRequest(uiReq);
+      assert.equal(calls.filter((c) => c.method === "sendMessage").length, count, "duplicate ui request not posted");
+    }
+    {
+      const { gw, s, calls } = await fresh();
       let starts = 0;
-      s.pi.start = async () => {
+      gw.ensurePaneSession = async () => {
         starts++;
         await sleep(10);
         s.pi.proc = { destroyed: false };
@@ -850,7 +956,7 @@ async function selfTest() {
         assert.deepEqual(loadState(config.stateDir).herdrPanes, {});
         assert.deepEqual(loadState(config.stateDir).topics, { 1: { cwd: dir } });
         await writeFile(statePath, JSON.stringify({ herdrPanes: { main: "legacy-pane", "t:1": { cwd: dir, paneId: "pane", owned: true } } }));
-        assert.deepEqual(loadState(config.stateDir).herdrPanes, { main: "legacy-pane", "t:1": { cwd: dir, paneId: "pane", owned: true } });
+        assert.deepEqual(loadState(config.stateDir).herdrPanes, { "t:1": { cwd: dir, paneId: "pane", owned: true } });
       } finally {
         if (previous === undefined) delete process.env.REMOTE_PI_CONFIG;
         else process.env.REMOTE_PI_CONFIG = previous;

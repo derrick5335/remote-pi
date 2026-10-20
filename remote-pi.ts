@@ -74,7 +74,7 @@ const textOf = (content) => typeof content === "string" ? content : (content || 
 // Lazy public import keeps the framing helpers usable by plain Node without a local Pi installation.
 const listPiSessions = async (cwd, dir) => (await import("@earendil-works/pi-coding-agent")).SessionManager.list(cwd, dir);
 export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions } = {}) {
-  let ctx, socket, retryTimer, path, retries = 0, enabled = false, disposed = false, startEvent = {};
+  let ctx, socket, retryTimer, path, terminalId, retries = 0, enabled = false, disposed = false, startEvent = {};
   const dialogs = new Map(), replacements = new Map(), paneId = env.HERDR_PANE_ID;
   const send = (message) => writeJsonLine(socket, message);
   const on = (type, handler) => pi.on(type, (event, currentCtx) => {
@@ -105,7 +105,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   };
   const identity = () => ({ sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId() });
   const hello = () => send({
-    type: "hello", paneId, cwd: ctx.cwd, ...identity(), pid: process.pid, version: 1,
+    type: "hello", paneId, terminalId, cwd: ctx.cwd, ...identity(), pid: process.pid, version: 1,
     reason: startEvent.reason, previousSessionFile: startEvent.previousSessionFile, state: state(),
     sessionName: pi.getSessionName?.() || ctx?.sessionManager?.getSessionName?.() || undefined,
     recent: getRecent(),
@@ -114,7 +114,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   const disconnect = (retry = false) => {
     clearTimeout(retryTimer);
     retryTimer = null;
-    for (const dialog of dialogs.values()) dialog.finish(undefined);
+    if (!retry) for (const dialog of dialogs.values()) dialog.finish(undefined);
     const current = socket;
     socket = null;
     current?.end().setTimeout(2000, () => current.destroy());
@@ -134,6 +134,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       retries = 0;
       setTools(true);
       hello();
+      for (const dialog of dialogs.values()) send(dialog.request);
       setStatus("📱 remote");
     });
     current.on("error", () => {});
@@ -143,7 +144,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     readJsonLines(current, (message) => {
       if (message.type === "extension_ui_response") {
         const dialog = dialogs.get(message.id);
-        if (dialog && (message.cancelled || dialog.options.includes(message.value))) dialog.finish(message.cancelled ? undefined : message.value);
+        if (dialog && (message.cancelled || dialog.request.options.includes(message.value))) dialog.finish(message.cancelled ? undefined : message.value);
         return;
       }
       if (typeof message.id !== "string" || !message.id) return current.destroy(new Error("Bridge request id required"));
@@ -152,7 +153,8 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
       }).catch((error) => response(message, null, error));
     });
   };
-  const setEnabled = async (on) => {
+  const setEnabled = async (on, pane) => {
+    if (on) terminalId = (pane || await metadata(env, "pane.get", { pane_id: paneId }))?.pane?.terminal_id;
     enabled = on;
     await setOn(on);
     setStatus(on ? "📱 reconnecting…" : undefined);
@@ -311,10 +313,11 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
         };
         const cancel = () => finish(undefined);
         const timer = setTimeout(cancel, 5 * 60_000);
-        dialogs.set(id, { finish, options: params.options });
+        const request = { type: "extension_ui_request", id, method: "select", title: params.question, options: params.options, timeout: 5 * 60_000 };
+        dialogs.set(id, { finish, request });
         signal?.addEventListener("abort", cancel, { once: true });
         if (signal?.aborted) return cancel();
-        send({ type: "extension_ui_request", id, method: "select", title: params.question, options: params.options, timeout: 5 * 60_000 });
+        send(request);
         // ref: Pi examples/extensions/timed-confirm.ts — AbortSignal dismisses the losing TUI dialog.
         Promise.resolve().then(() => toolCtx.ui.select(params.question, params.options, { signal: controller.signal }))
           .then((value) => finish(value), (error) => finish(undefined, error));
@@ -328,7 +331,7 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
     if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !paneId) return;
     const pane = await metadata(env, "pane.get", { pane_id: paneId }).catch(() => null);
     enabled = pane?.pane?.tokens?.remote_pi === "on" || env.REMOTE_PI_ATTACH === "1" && event.reason === "startup";
-    if (enabled) await setEnabled(true); else setStatus(undefined);
+    if (enabled) await setEnabled(true, pane); else setStatus(undefined);
   });
   pi.on("session_shutdown", async (event) => {
     disposed = true;
@@ -355,6 +358,5 @@ export function createRemoteBridge(pi, { env = process.env, metadata = herdrRequ
   });
   on("session_compact", (event) => send({ type: "compaction_end", reason: event.reason, result: event.compactionEntry, aborted: false, willRetry: event.willRetry }));
   on("session_compact_failed", (event) => send({ ...event, type: "compaction_end", result: null }));
-  return { dispatch };
 }
 export default (pi) => createRemoteBridge(pi);

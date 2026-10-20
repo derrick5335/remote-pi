@@ -38,9 +38,8 @@ secure_log() {
 }
 setup_plist() {
     secure_log
-    local esc_node esc_gateway esc_root esc_log
-    esc_node="$(xml_escape "$NODE")"; esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
-    esc_root="$(xml_escape "$ROOT")"; esc_log="$(xml_escape "$LOG_FILE")"
+    local esc_node="$(xml_escape "$NODE")" esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
+    local esc_root="$(xml_escape "$ROOT")" esc_log="$(xml_escape "$LOG_FILE")"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -81,8 +80,7 @@ install() {
     fi
 
     local token user_id
-    printf 'Telegram Bot Token: ' && read -rs token
-    printf '\nTelegram numeric user ID: ' && read -r user_id
+    printf 'Telegram Bot Token: ' && read -rs token && printf '\nTelegram numeric user ID: ' && read -r user_id
     [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { echo 'Invalid Bot Token' >&2; exit 1; }
     [[ "$user_id" =~ ^[0-9]+$ ]] || { echo 'User ID must be numeric' >&2; exit 1; }
 
@@ -114,14 +112,9 @@ stop() {
     echo "🛑 remote-pi is stopped"
 }
 
-restart() { start restart; }
-
 status() {
-    local state
-    state="$( (launchctl print "$DOMAIN/$LABEL" 2>/dev/null || true) | awk '/state =/{print $3; exit}')"
-    if [[ "$state" == "running" ]]; then
-        echo "✅ remote-pi is running (logs: $LOG_FILE)"
-    else
+    local state="$( (launchctl print "$DOMAIN/$LABEL" 2>/dev/null || true) | awk '/state =/{print $3; exit}')"
+    if [[ "$state" == "running" ]]; then echo "✅ remote-pi is running (logs: $LOG_FILE)"; else
         echo "⚠️ remote-pi is ${state:-stopped} (logs: $LOG_FILE)"
         [[ -f "$LOG_FILE" ]] && tail -n 10 "$LOG_FILE"
         return 1
@@ -132,7 +125,7 @@ case "${1:-install}" in
     install)   install ;;
     start)     start ;;
     stop)      stop ;;
-    restart)   restart ;;
+    restart)   start restart ;;
     status)    status ;;
     logs)      tail -f "$LOG_FILE" ;;
     uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; [[ -L "$PI_EXTENSION" ]] && rm -f "$PI_EXTENSION"; echo "Removed service; kept $CONFIG" ;;
