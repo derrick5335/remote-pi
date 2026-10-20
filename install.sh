@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 解析 symlink（pi-remote-gateway 是指向本脚件的符号链接），否则 ROOT 会指向 ~/.local/bin
 SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
@@ -21,67 +20,41 @@ NODE="$(command -v node || true)"
 PI="$(command -v pi || true)"
 [[ -n "$PI" ]] || { echo "❌ pi not found; install and log in to the pi CLI first" >&2; exit 1; }
 
-xml_escape() {
-    local s="$1"
-    s="${s//&/&amp;}"
-    s="${s//</&lt;}"
-    s="${s//>/&gt;}"
-    s="${s//\"/&quot;}"
-    s="${s//\'/&apos;}"
-    echo "$s"
-}
+xml_escape() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"; s="${s//\'/&apos;}"; echo "$s"; }
 
 install_command() {
-    mkdir -p "$(dirname "$COMMAND")"
+    mkdir -p "$(dirname "$COMMAND")" "$PI_EXTENSION_DIR"
     ln -sf "$ROOT/install.sh" "$COMMAND"
-    # Pi 自动发现此扩展；保留安装路径并替换旧目标（包括悬空软链），不覆盖用户普通文件。
-    mkdir -p "$PI_EXTENSION_DIR"
-    if [[ -e "$PI_EXTENSION" && ! -L "$PI_EXTENSION" ]]; then
-        echo "❌ Refusing to overwrite non-symlink extension: $PI_EXTENSION" >&2
-        return 1
-    fi
-    # ref: ln -sfn replaces the link itself, not a linked directory: https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html
+    if [[ -e "$PI_EXTENSION" && ! -L "$PI_EXTENSION" ]]; then echo "❌ Refusing to overwrite non-symlink extension: $PI_EXTENSION" >&2; return 1; fi
     ln -sfn "$ROOT/remote-pi.ts" "$PI_EXTENSION"
 }
 
 secure_log() {
-    # ref: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html — protect log directory and file permissions
-    mkdir -p "$LOG_DIR"
-    chmod 700 "$LOG_DIR"
+    mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
     [[ -f "$LOG_FILE" ]] || (umask 077 && touch "$LOG_FILE")
     chmod 600 "$LOG_FILE"
 }
 
 setup_plist() {
     secure_log
-
     local esc_node esc_gateway esc_root esc_log
-    esc_node="$(xml_escape "$NODE")"
-    esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
-    esc_root="$(xml_escape "$ROOT")"
-    esc_log="$(xml_escape "$LOG_FILE")"
-
+    esc_node="$(xml_escape "$NODE")"; esc_gateway="$(xml_escape "$ROOT/gateway.mjs")"
+    esc_root="$(xml_escape "$ROOT")"; esc_log="$(xml_escape "$LOG_FILE")"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
+<plist version="1.0"><dict>
     <key>Label</key><string>$LABEL</string>
-    <key>ProgramArguments</key>
-    <array><string>/usr/bin/caffeinate</string><string>-s</string><string>-i</string><string>--</string><string>$esc_node</string><string>$esc_gateway</string></array>
+    <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-s</string><string>-i</string><string>--</string><string>$esc_node</string><string>$esc_gateway</string></array>
     <key>WorkingDirectory</key><string>$esc_root</string>
     <key>KeepAlive</key><true/>
     <key>ProcessType</key><string>Background</string>
     <key>StandardOutPath</key><string>$esc_log</string>
     <key>StandardErrorPath</key><string>$esc_log</string>
-</dict>
-</plist>
+</dict></plist>
 EOF
     plutil -lint "$PLIST"
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-    # launchctl bootout 是异步的；同一 label 立刻 bootstrap 会撞上拆除中的旧服务 →
-    # "Bootstrap failed: 5: Input/output error"，所以先等一下，失败再重试。
-    local attempt
     sleep 1
     for attempt in 1 2 3; do
         if launchctl bootstrap "$DOMAIN" "$PLIST"; then break; fi
@@ -107,24 +80,15 @@ install() {
     fi
 
     local token user_id
-    printf 'Telegram Bot Token: '
-    read -rs token
-    printf '\nTelegram numeric user ID: '
-    read -r user_id
-
+    printf 'Telegram Bot Token: ' && read -rs token
+    printf '\nTelegram numeric user ID: ' && read -r user_id
     [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { echo 'Invalid Bot Token' >&2; exit 1; }
     [[ "$user_id" =~ ^[0-9]+$ ]] || { echo 'User ID must be numeric' >&2; exit 1; }
 
     mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
     chmod 700 "$CONFIG_DIR"
     (umask 077 && CFG_TOKEN="$token" CFG_USER_ID="$user_id" CFG_CWD="$ROOT" "$NODE" -e '
-      process.stdout.write(JSON.stringify({
-        telegram: {
-          botToken: process.env.CFG_TOKEN,
-          allowedUserId: process.env.CFG_USER_ID,
-        },
-        cwd: process.env.CFG_CWD,
-      }, null, 2) + "\n");
+      process.stdout.write(JSON.stringify({ telegram: { botToken: process.env.CFG_TOKEN, allowedUserId: process.env.CFG_USER_ID }, cwd: process.env.CFG_CWD }, null, 2) + "\n");
     ' > "$CONFIG")
     chmod 600 "$CONFIG"
     install_command
@@ -134,12 +98,12 @@ install() {
 
 start() {
     if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-        status
-        return
+        if [[ "${1:-}" == "restart" ]]; then launchctl kickstart -k "$DOMAIN/$LABEL"; else status; return; fi
+    else
+        [[ -f "$PLIST" ]] || { echo "Missing $PLIST; run $ROOT/install.sh install" >&2; exit 1; }
+        secure_log
+        launchctl bootstrap "$DOMAIN" "$PLIST"
     fi
-    [[ -f "$PLIST" ]] || { echo "Missing $PLIST; run $ROOT/install.sh install" >&2; exit 1; }
-    secure_log
-    launchctl bootstrap "$DOMAIN" "$PLIST"
     sleep 2
     status
 }
@@ -149,17 +113,7 @@ stop() {
     echo "🛑 remote-pi is stopped"
 }
 
-restart() {
-    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-        launchctl kickstart -k "$DOMAIN/$LABEL"
-    else
-        [[ -f "$PLIST" ]] || { echo "Missing $PLIST; run $ROOT/install.sh install" >&2; exit 1; }
-        secure_log
-        launchctl bootstrap "$DOMAIN" "$PLIST"
-    fi
-    sleep 2
-    status
-}
+restart() { start restart; }
 
 status() {
     local state
@@ -173,50 +127,13 @@ status() {
     fi
 }
 
-# ponytail: rollback only covers npm/self-test failures; a new version that boots but crashes loops under KeepAlive — recover manually with `git reset --hard <old>`
-upgrade() {
-    local flag="${1:-}"
-    cd "$ROOT"
-    command -v git >/dev/null 2>&1 || { echo "❌ git not found" >&2; exit 1; }
-    local old branch remote_name
-    old="$(git rev-parse HEAD 2>/dev/null)" || { echo "❌ $ROOT is not a git repository" >&2; exit 1; }
-    [[ -z "$(git status --porcelain)" ]] || { echo "❌ Working tree has uncommitted changes; refusing to upgrade (commit or clean first)" >&2; exit 1; }
-    branch="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || { echo "❌ Current branch has no upstream (git push -u origin <branch>)" >&2; exit 1; }
-    remote_name="${branch%%/*}"
-    git fetch --quiet "$remote_name" || { echo "❌ git fetch failed" >&2; exit 1; }
-    if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$branch")" ]]; then
-        echo "✅ Already up to date: $(git log -1 --format='(%h) %s')"
-        return 0
-    fi
-    git merge --ff-only --quiet "$branch" || { echo "❌ Cannot fast-forward (local and remote have diverged)" >&2; exit 1; }
-    echo "⬆️ Updated to: $(git log -1 --format='(%h) %s')"
-    if ! npm install --omit=dev --no-audit --no-fund --silent; then
-        git reset --hard --quiet "$old"
-        echo "❌ npm install failed; rolled back to $old" >&2; exit 1
-    fi
-    if ! "$NODE" "$ROOT/gateway.mjs" --self-test >/dev/null 2>&1; then
-        git reset --hard --quiet "$old"
-        npm install --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1
-        echo "❌ Self-test failed; rolled back to $old" >&2; exit 1
-    fi
-    install_command
-    echo "✅ Upgrade complete"
-    [[ "$flag" == "--no-restart" ]] && return 0
-    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-        restart
-    else
-        echo "(Service not running; skipping restart. Run pi-remote-gateway start to start it.)"
-    fi
-}
-
 case "${1:-install}" in
     install)   install ;;
-    upgrade)   upgrade "${2:-}" ;;
     start)     start ;;
     stop)      stop ;;
     restart)   restart ;;
     status)    status ;;
     logs)      tail -f "$LOG_FILE" ;;
     uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; [[ -L "$PI_EXTENSION" ]] && rm -f "$PI_EXTENSION"; echo "Removed service; kept $CONFIG" ;;
-    *) echo "Usage: $0 [install|upgrade|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [install|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
 esac

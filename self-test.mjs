@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, readlink, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readlink, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -23,29 +23,21 @@ import {
   buildDevPath,
   chunks,
   encodeCwdSessionDir,
-  errorActions,
   expandableBlockquote,
   extensionFromMime,
   extractText,
   formatAssistantError,
   formatContextTokens,
-  formatRunCard,
   formatSessionReset,
-  getUpdatePriority,
   herdrOptedIn,
   herdrTail,
   isConnectPhaseError,
   loadConfig,
   loadState,
-  nextFallbackModel,
   paneHasForegroundShell,
   parseCommand,
-  parseNumberConfig,
-  parseNumstat,
   pollBackoffMs,
   previewText,
-  redactLog,
-  renderReplyHtml,
   renderToolPanel,
   resolveAgentSessionFile,
   resolveHerdrEnvironment,
@@ -63,13 +55,13 @@ import {
   toolSummary,
 } from "./gateway.mjs";
 
-const LINE_BUDGET = 4600;
+const LINE_BUDGET = 3100;
 
 async function selfTestPaneBridge() {
   const dir = join(tmpdir(), `rp-${randomBytes(4).toString("hex")}`);
   await mkdir(dir, { mode: 0o700 });
   const path = join(dir, "bridge.sock");
-  const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir, doneCard: false };
+  const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir };
   let gateway = new Gateway(config);
   const outputs = [];
   const events = [];
@@ -78,7 +70,6 @@ async function selfTestPaneBridge() {
     gw.telegram.send = async (_chat, text) => { outputs.push(text); return { message_id: ++messageId }; };
     gw.telegram.call = async () => true;
     gw.mainSession.startTyping = () => {};
-    gw.mainSession.takeRunSnapshot = async () => null;
     const handle = gw.mainSession.handleEvent.bind(gw.mainSession);
     gw.mainSession.handleEvent = async (event) => { events.push(event); await handle(event); };
   };
@@ -400,7 +391,7 @@ async function selfTest() {
   {
     const dir = join(tmpdir(), `rp-attach-${randomBytes(4).toString("hex")}`);
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir, doneCard: false };
+    const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir };
     const gwDead = new Gateway(config);
     await gwDead.bridge.start();
     // Persisted binding points at a closed pane; no bridge peer ever reconnects. Reaching the spawn
@@ -554,74 +545,31 @@ async function selfTest() {
     assert.equal(sendOneCalls.length, 2);
     assert.equal(sendOneCalls[1].text, "direct send");
 
-    // 回归：最终交付失败时文本落盘为可恢复副本
-    {
-      const tmpUi = join(tmpdir(), `test-remote-pi-ui-${Date.now()}`);
-      await mkdir(tmpUi, { recursive: true, mode: 0o700 });
-      const gwFail = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpUi });
-      gwFail.telegram.sendOne = async () => { throw new Error("network down"); };
-      gwFail.mainSession.send = async () => {};
-      await gwFail.mainSession.finishDraft({ text: "recover me", messageId: null, draftId: null });
-      const copies = (await readdir(tmpUi)).filter((f) => f.startsWith("failed-reply-"));
-      assert.equal(copies.length, 1);
-      assert.equal(await readFile(join(tmpUi, copies[0]), "utf8"), "recover me");
-    }
+    // Long replies remain plain text chunks.
+    const longText = "word ".repeat(2000);
+    const before = sendOneCalls.length;
+    await gw.mainSession.finishDraft({ text: longText, messageId: null });
+    assert.equal(sendOneCalls.slice(before).map((c) => c.text).join(""), longText);
+    assert.ok(sendOneCalls.slice(before).every((c) => c.text.length <= MAX_MESSAGE));
 
-    // Phase 3：超长回复改为 HTML 文档附件；发送失败回退分段
+    // Retry callback re-sends the last prompt.
     {
-      const tmpLong = join(tmpdir(), `test-remote-pi-long-${Date.now()}`);
-      await mkdir(tmpLong, { recursive: true, mode: 0o700 });
-      const gwLong = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpLong, downloadsDir: tmpLong, longReplyChars: 100 });
-      const longEdits = [];
-      const longSends = [];
-      let docCalls = 0;
-      gwLong.telegram.edit = async (_c, id, text) => { longEdits.push({ id, text }); return true; };
-      gwLong.telegram.sendOne = async (_c, text) => { longSends.push(text); return { message_id: 1 }; };
-      gwLong.telegram.sendDocument = async () => { docCalls++; return { message_id: 2 }; };
-      const longText = `# Big\n\n${"word ".repeat(80)}`;
-      await gwLong.mainSession.finishDraft({ text: longText, messageId: 7 });
-      assert.equal(docCalls, 1, "long reply sent as document");
-      assert.ok(longEdits[0].text.includes("(full reply attached"), "first chunk kept with note");
-      assert.equal(longSends.length, 0, "no extra plain chunks");
-      const savedHtml = (await readdir(tmpLong)).find((f) => f.startsWith("reply-") && f.endsWith(".html"));
-      assert.ok(savedHtml, "reply html file written");
-      assert.ok((await readFile(join(tmpLong, savedHtml), "utf8")).includes("<h1>Big</h1>"), "html rendered from markdown");
-      // 发送文档失败 → 回退全量分段（原地 edit 回完整首段）
-      let failDoc = true;
-      gwLong.telegram.sendDocument = async () => { if (failDoc) throw new Error("upload failed"); };
-      await gwLong.mainSession.finishDraft({ text: longText, messageId: 8 });
-      assert.ok(!longEdits.at(-1).text.includes("(full reply attached"), "fallback drops the note");
-      assert.ok(longEdits.at(-1).text.startsWith("# Big"), "fallback edits full first chunk");
-      // longReplyChars: 0 → 关闭，直接分段
-      gwLong.config.longReplyChars = 0;
-      failDoc = false; docCalls = 0;
-      longSends.length = 0;
-      await gwLong.mainSession.finishDraft({ text: longText, messageId: null });
-      assert.equal(docCalls, 0, "disabled via 0");
-      assert.ok(longSends.length >= 1);
-    }
-
-    // Phase 3：错误恢复按钮 errorActions + retry 回调
-    {
-      const gwErr = new Gateway({
-        allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(),
-        fallbackModels: ["anthropic/claude", "google/gemini"],
-      });
+      const gwErr = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
       const s = gwErr.mainSession;
-      assert.ok(errorActions(s, "boom").reply_markup.inline_keyboard.length >= 3, "static buttons always present");
-      assert.ok(!JSON.stringify(errorActions(s, "boom")).includes("Retry"), "no lastPrompt → no retry");
-      s.lastPrompt = { message: "do it", images: undefined };
-      s.lastModel = { provider: "anthropic", modelId: "claude" };
-      const kb = errorActions(s, "boom").reply_markup.inline_keyboard;
-      assert.equal(kb[0][0].text, "🔁 Retry");
-      assert.ok(kb[1][0].text.includes("google/gemini"), "next fallback after current");
-      const kb429 = errorActions(s, "429 rate limit exceeded").reply_markup.inline_keyboard;
-      assert.ok(kb429[0][0].text.includes("Retry with"), "rate limit puts fallback first");
-      const kbWrap = errorActions(s, "boom", { endedRun: false }).reply_markup.inline_keyboard;
-      s.isStreaming = true;
-      assert.ok(!JSON.stringify(errorActions(s, "boom")).includes("Retry"), "streaming → retry omitted");
-      assert.ok(kbWrap.length >= 3);
-      // retry 回调：重发上一次 prompt
+      s.lastPrompt = { message: "do it", images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] };
+      const deliveries = [];
+      gwErr.telegram.sendOne = async (_chat, text, extra) => { deliveries.push({ text, extra }); return { message_id: 1 }; };
+      gwErr.chatReady = true;
+      await s.handleEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(5000) }], stopReason: "error", errorMessage: "Network failure" } });
+      await gwErr.telegramChain;
+      assert.equal(deliveries.length, 2);
+      assert.equal(deliveries[0].extra.reply_markup, undefined);
+      assert.ok(deliveries[1].text.includes("❌ Network failure"));
+      const buttons = deliveries[1].extra.reply_markup.inline_keyboard.flat();
+      assert.equal(buttons.length, 1);
+      assert.equal(buttons[0].text, "🔁 Retry");
+      assert.equal(gwErr.actions.get(buttons[0].callback_data.slice(2)).type, "retry");
+      // Retry also retains image context.
       s.isStreaming = false;
       const sent = [];
       s.send = async (text) => { sent.push(text); };
@@ -632,12 +580,8 @@ async function selfTest() {
       await s.handleCallbackAction({ type: "retry" }, { id: "c1" });
       assert.equal(rpcCalls.at(-1).type, "prompt");
       assert.equal(rpcCalls.at(-1).fields.message, "do it");
+      assert.deepEqual(rpcCalls.at(-1).fields.images, s.lastPrompt.images);
       assert.ok(sent.some((t) => t.includes("Retrying")), "retry notifies");
-      // retry_fallback：先 set_model 再 prompt
-      await s.handleCallbackAction({ type: "retry_fallback", model: "google/gemini" }, { id: "c2" });
-      assert.equal(rpcCalls.at(-2).type, "set_model");
-      assert.deepEqual(rpcCalls.at(-2).fields, { provider: "google", modelId: "gemini" });
-      assert.equal(rpcCalls.at(-1).type, "prompt");
     }
 
     // Test remote_attach auto delivery via tool_execution_end
@@ -654,42 +598,26 @@ async function selfTest() {
     await Promise.all([gw.telegramChain, gw.uploadChain]);
     assert.deepEqual(docs, ["/tmp/file1.png", "/tmp/file2.pdf"]);
 
-    // Test priority command classification and preemptive dispatch
-    assert.equal(getUpdatePriority({ message: { text: "/abort" } }), "p0");
-    assert.equal(getUpdatePriority({ message: { text: "/new" } }), "p0");
-    assert.equal(getUpdatePriority({ message: { text: "/restart" } }), "p0");
-    assert.equal(getUpdatePriority({ message: { text: "/status" } }), "p1");
-    assert.equal(getUpdatePriority({ message: { text: "/queue" } }), "p1");
-    assert.equal(getUpdatePriority({ message: { text: "/help" } }), "p1");
-    assert.equal(getUpdatePriority({ message: { text: "/commands" } }), "p1");
-    assert.equal(getUpdatePriority({ message: { text: "/sh cargo build" } }), "p2");
-    assert.equal(getUpdatePriority({ message: { text: "hello" } }), "p2");
-
-    let p2Started = false;
-    let p2Finished = false;
-    let p0Executed = false;
-    gw.handleUpdate = async () => {
-      p2Started = true;
-      await sleep(100);
-      p2Finished = true;
+    // Only /abort bypasses an in-flight session update.
+    let releaseUpdate;
+    const blocked = new Promise((resolve) => { releaseUpdate = resolve; });
+    const updates = [];
+    gw.telegram.setReaction = async () => {};
+    const handleCommand = gw.mainSession.handleCommand;
+    gw.mainSession.handleCommand = async ({ name }) => { updates.push(`/${name}`); };
+    gw.handleUpdate = async (update) => {
+      updates.push(update.message.text);
+      if (update.message.text !== "/abort") await blocked;
     };
-    gw.handlePriorityUpdate = async () => {
-      p0Executed = true;
-    };
-
-    // Dispatch slow P2 update, followed immediately by P0
-    gw.dispatchUpdate({ message: { from: { id: 1 }, text: "/sh sleep 10" } });
+    const slow = gw.dispatchUpdate({ message: { from: { id: 1 }, chat: { type: "private" }, text: "/sh sleep 10" } });
     await sleep(5);
-    assert.equal(p2Started, true);
-    assert.equal(p2Finished, false);
-
-    // P0 should execute immediately without waiting for P2 to finish
-    gw.dispatchUpdate({ message: { from: { id: 1 }, text: "/abort" } });
-    assert.equal(p0Executed, true);
-    assert.equal(p2Finished, false);
-
-    await gw.mainSession.updateChain;
-    assert.equal(p2Finished, true);
+    const queued = gw.dispatchUpdate({ message: { from: { id: 1 }, chat: { type: "private" }, text: "/status" } });
+    await gw.dispatchUpdate({ message: { from: { id: 1 }, chat: { type: "private" }, text: "/abort" } });
+    assert.deepEqual(updates, ["/sh sleep 10", "/abort"]);
+    releaseUpdate();
+    await Promise.all([slow, queued]);
+    assert.deepEqual(updates, ["/sh sleep 10", "/abort", "/status"]);
+    gw.mainSession.handleCommand = handleCommand;
 
     // Test outbound queue re-entrancy and serialization
     const sendOrder = [];
@@ -746,7 +674,7 @@ async function selfTest() {
       command: "set_model",
       params: { provider: "openai", modelId: "gpt-4o" },
     });
-    assert.ok(newSessionSent.includes("◆ Model: gpt-4o"));
+    assert.ok(newSessionSent.includes("openai/gpt-4o"));
     assert.deepEqual(gw.mainSession.lastModel, { provider: "openai", modelId: "gpt-4o" });
   }
 
@@ -822,21 +750,6 @@ async function selfTest() {
       else delete process.env.REMOTE_PI_CONFIG;
     }
 
-    // verify showCwds guides usage when history is empty
-    const gwNoHistory = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
-    let sentMsg = "";
-    gwNoHistory.telegram.send = async (_chat, text) => { sentMsg = text; };
-    await gwNoHistory.mainSession.showCwds();
-    assert.ok(sentMsg.includes("No recent projects yet"), "showCwds should guide usage when history is empty");
-
-    // verify switchCwd reports error for nonexistent dir and keeps cwd
-    const gwSwitch = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpCfgDir, cwd: tmpCfgDir });
-    let switchMsg = "";
-    gwSwitch.telegram.send = async (_chat, text) => { switchMsg = text; };
-    await gwSwitch.mainSession.switchCwd(join(tmpCfgDir, "no-such-dir"), null);
-    assert.ok(switchMsg.includes("Directory missing"), "switchCwd should report error for missing dir");
-    assert.equal(gwSwitch.config.cwd, tmpCfgDir);
-
     // verify state persistence without modifying config.json
     const originalCfgContent = readFileSync(validCfgPath, "utf8");
     const gwState = new Gateway({
@@ -846,11 +759,10 @@ async function selfTest() {
       stateDir: tmpCfgDir,
       cwd: tmpCfgDir,
     });
-    await gwState.saveState({ cwd: "/target/path", recentProjects: ["/target/path", tmpCfgDir] });
+    await gwState.saveState({ cwd: "/target/path" });
     assert.equal(readFileSync(validCfgPath, "utf8"), originalCfgContent, "config.json must remain immutable");
     const loaded = loadState(tmpCfgDir);
     assert.equal(loaded.cwd, "/target/path");
-    assert.deepEqual(loaded.recentProjects, [tmpCfgDir]); // only existing dirs filtered
   }
 
   {
@@ -866,9 +778,9 @@ async function selfTest() {
     assert.equal(calls.length, 1);
   }
 
-  // Receipt reactions stay unchanged; completion is delivered by the run card.
+  // Receipt reactions stay unchanged after a run settles.
   {
-    const gwAck = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), ackEmoji: "👀", doneCard: true });
+    const gwAck = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
     gwAck.chatReady = true;
     const session = gwAck.mainSession;
     const reactions = [];
@@ -883,18 +795,12 @@ async function selfTest() {
 
     await gwAck.handleMessage(message(1, "hello"));
     session.repliedInRun = true;
-    let cardPromise;
-    const sendRunCard = session.sendRunCard.bind(session);
-    session.sendRunCard = (...args) => (cardPromise = sendRunCard(...args));
     await session.handleEvent({ type: "agent_settled" });
-    await cardPromise;
     await gwAck.telegramChain;
-    assert.ok(sent.some((text) => text.startsWith("✅ Done")), "Completion must still send a run card");
-
+    assert.deepEqual(sent, [], "settling without text sends no extra warning");
     await gwAck.handleMessage(message(2, "/status"));
     await gwAck.handleMessage(message(3, "/followup next"));
-    await gwAck.handlePriorityUpdate({ message: message(4, "/abort") }, "p0");
-    session.pendingUi = { id: "ack-ui" };
+    await gwAck.dispatchUpdate({ message: message(4, "/abort") });
     await gwAck.handleMessage(message(5, "answer"));
     gwAck.extractMedia = async () => ({ saved: { path: "/tmp/ack.jpg" }, label: "photo" });
     await gwAck.handleMessage(message(6, "photo"));
@@ -970,17 +876,12 @@ async function selfTest() {
       let origExit = process.exit;
       process.exit = () => {};
 
-      // 首次 /restart：应落盘收据并发送提示
-      await gwRestart.handlePriorityUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 }, "p0");
-      assert.ok(sentMsg.includes("Restarting gateway"));
-      assert.equal(await readFile(join(tmpState, "last-restart-update"), "utf8"), "888");
-
-      // 重复投递相同的 update_id：应静默忽略，不再重复执行
-      sentMsg = "";
-      await gwRestart.handlePriorityUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 }, "p0");
-      assert.equal(sentMsg, "");
-      await sleep(150); // 等待 restart 的 100ms exit 定时器被空函数消耗
-      process.exit = origExit;
+      try {
+        await gwRestart.dispatchUpdate({ message: { message_id: 10, text: "/restart", from: { id: 1 }, chat: { type: "private" } }, update_id: 888 });
+        assert.ok(sentMsg.includes("Restarting gateway"));
+        assert.equal(await readFile(gwRestart.telegram.offsetPath, "utf8"), "889");
+        await sleep(150);
+      } finally { process.exit = origExit; }
 
       const gwReady = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpState });
       assert.equal(gwReady.state.pendingRestartMessageId, 42, "restart message must survive process replacement");
@@ -1140,35 +1041,6 @@ async function selfTest() {
     assert.deepEqual(handled, [7]);
     assert.equal(readFileSync(join(tmpOffset, "offset"), "utf8"), "8", "处理完后 offset 应为 update_id+1");
     tg.stopPolling();
-    tg.stopWakeMonitor();
-
-    // 回归：macOS 休眠唤醒自愈（秒级中止死轮询 + 快速网络探测重连）
-    {
-      const tgWake = new Telegram("123456:fake-token", "/tmp/fake-offset");
-      let pollAborted = false;
-      const ac = new AbortController();
-      ac.signal.addEventListener("abort", () => { pollAborted = true; });
-      tgWake.currentPollAc = ac;
-
-      const origFetch = globalThis.fetch;
-      let probeCalls = 0;
-      globalThis.fetch = async (url) => {
-        if (String(url).includes("/getMe")) {
-          probeCalls++;
-          return { ok: true, json: async () => ({ ok: true }) };
-        }
-        return { ok: false };
-      };
-
-      const wakeTask = tgWake.handleWake(15);
-      assert.equal(pollAborted, true, "唤醒时应立即 abort 悬挂的长轮询");
-      await wakeTask;
-      assert.equal(probeCalls, 1, "唤醒后应执行快速网络探测");
-      assert.equal(tgWake.wakePromise, null, "探测结束后 wakePromise 应复位");
-
-      globalThis.fetch = origFetch;
-      tgWake.stopWakeMonitor();
-    }
   }
 
   {
@@ -1227,16 +1099,9 @@ async function selfTest() {
     const r = spawnSync("node", ["--check", "--experimental-strip-types", join(dirname(fileURLToPath(import.meta.url)), "remote-pi.ts")]);
     assert.equal(r.status, 0, `remote-pi.ts syntax check: ${r.stderr}`);
   }
-  assert.ok(HELP.includes("/upgrade"), "HELP mentions /upgrade");
-  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "status"), { command: "status", description: "Session status, tokens & cost" });
-  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "restart"), { command: "restart", description: "Restart the gateway" });
-  assert.deepEqual(BOT_COMMANDS.find((c) => c.command === "git_commit_push"), { command: "git_commit_push", description: "Stage, commit and push" });
-  assert.ok(HELP.includes("/git_commit_push"), "HELP mentions /git_commit_push");
-  for (const name of ["name", "restart", "upgrade"]) {
-    if (name !== "restart") assert.ok(!BOT_COMMANDS.some((c) => c.command === name), `${name} hidden from menu`);
-    assert.ok(HELP.split("\nAdmin\n")[1].includes(`/${name}`), `${name} listed under Admin`);
-  }
-  assert.ok(!BOT_COMMANDS.some((c) => c.command === "commands"), "command discovery folded into help");
+  for (const c of BOT_COMMANDS) assert.ok(HELP.includes(`/${c.command.padEnd(19)} ${c.description}`));
+  assert.ok(BOT_COMMANDS.some((c) => c.command === "name"), "rename is in the menu");
+  assert.ok(!BOT_COMMANDS.some((c) => c.command === "commands"), "discovery uses help");
 
   // 1. pollBackoffMs 指数退避与全抖动
   assert.equal(pollBackoffMs(1, () => 1), 1000);
@@ -1268,24 +1133,6 @@ async function selfTest() {
     globalThis.fetch = origFetch;
   }
 
-  // 1. poll() 退避睡眠可被 handleWake 中断并重置失败计数
-  {
-    const tg = new Telegram("123456:fake-token", join(tmpdir(), `test-offset-${Date.now()}`));
-    tg.pollFailures = 4;
-    tg.outageStart = Date.now() - 5000;
-    let sleepAborted = false;
-    tg.pollSleepAc = new AbortController();
-    tg.pollSleepAc.signal.addEventListener("abort", () => { sleepAborted = true; });
-
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true }) });
-    const wakePromise = tg.handleWake(10);
-    assert.equal(sleepAborted, true, "handleWake 应立即 abort 退避等待");
-    assert.equal(tg.pollFailures, 0, "handleWake 应重置连续失败计数");
-    await wakePromise;
-    globalThis.fetch = origFetch;
-  }
-
   // 1. poll() 断网与恢复日志：断网仅首见打 1 行 offline，期间静默，恢复打 1 行 back online
   {
     const tmpOffset = join(tmpdir(), `test-poll-${Date.now()}`);
@@ -1294,30 +1141,25 @@ async function selfTest() {
     const origLog = console.log;
     const errors = [];
     const logs = [];
-    const sleptMs = [];
+    const attempts = [];
     console.error = (...args) => errors.push(args.join(" "));
     console.log = (...args) => logs.push(args.join(" "));
-
-    tg.pollSleep = async (ms) => {
-      sleptMs.push(ms);
-    };
 
     let pollStep = 0;
     let pollPromise;
     const donePromise = new Promise((resolve) => {
       tg.call = async () => {
+        attempts.push(Date.now());
         pollStep++;
         if (pollStep === 1) throw new Error("poll outage 1");
         if (pollStep === 2) throw new Error("poll outage 2");
         if (pollStep === 3) return [{ update_id: 10 }];
         throw new Error("unexpected poll");
       };
-      pollPromise = tg.poll(() => { resolve(); return Promise.resolve(); });
+      pollPromise = tg.poll(() => { tg.stopPolling(); resolve(); return Promise.resolve(); });
     });
 
     await donePromise;
-    tg.stopPolling();
-    tg.stopWakeMonitor();
     await pollPromise;
     console.error = origError;
     console.log = origLog;
@@ -1327,9 +1169,8 @@ async function selfTest() {
     assert.equal(errors.filter((l) => l.includes("poll outage 2")).length, 0, "断网期间后续失败应保持静默");
     assert.equal(logs.filter((l) => l.includes("[tg:poll] back online after")).length, 1, "恢复后应记录 1 行 back online");
     assert.ok(logs.some((l) => l.includes("(2 failed polls)")), "恢复日志需体现连续失败次数");
-    assert.equal(sleptMs.length, 2, "断网期间应触发 2 次退避睡眠");
-    assert.ok(sleptMs[0] >= 500 && sleptMs[0] <= 1000, `failure 1 退避范围 500..1000，实际: ${sleptMs[0]}`);
-    assert.ok(sleptMs[1] >= 500 && sleptMs[1] <= 2000, `failure 2 退避范围 500..2000，实际: ${sleptMs[1]}`);
+    assert.equal(attempts.length, 3);
+    for (let i = 1; i < attempts.length; i++) assert.ok(attempts[i] - attempts[i - 1] >= 490, "poll failures back off");
   }
 
   // 1. poll() Conflict 处理：记录 [tg:poll] conflict:，不计入 outage/back-online，15s 可中断休眠
@@ -1340,30 +1181,25 @@ async function selfTest() {
     const origLog = console.log;
     const errors = [];
     const logs = [];
-    const sleptMs = [];
+    const attempts = [];
     console.error = (...args) => errors.push(args.join(" "));
     console.log = (...args) => logs.push(args.join(" "));
-
-    tg.pollSleep = async (ms) => {
-      sleptMs.push(ms);
-    };
 
     let step = 0;
     let pollPromise;
     const donePromise = new Promise((resolve) => {
       tg.call = async () => {
+        attempts.push(Date.now());
         step++;
         if (step === 1) throw new Error("Conflict: terminated by other getUpdates request");
         if (step === 2) throw new Error("Conflict: duplicate");
         if (step === 3) return [{ update_id: 20 }];
         throw new Error("unexpected poll");
       };
-      pollPromise = tg.poll(() => { resolve(); return Promise.resolve(); });
+      pollPromise = tg.poll(() => { tg.stopPolling(); resolve(); return Promise.resolve(); });
     });
 
     await donePromise;
-    tg.stopPolling();
-    tg.stopWakeMonitor();
     await pollPromise;
     console.error = origError;
     console.log = origLog;
@@ -1372,7 +1208,8 @@ async function selfTest() {
     assert.equal(errors.filter((l) => l.includes("[tg:poll] offline:")).length, 0, "Conflict 不应被当作 offline outage");
     assert.equal(logs.filter((l) => l.includes("[tg:poll] back online")).length, 0, "Conflict 恢复不应打 back online");
     assert.equal(tg.pollFailures, 0, "Conflict 不应计入 pollFailures");
-    assert.deepEqual(sleptMs, [15_000, 15_000], "Conflict 每次应请求 15s 休眠");
+    assert.equal(attempts.length, 3);
+    for (let i = 1; i < attempts.length; i++) assert.ok(attempts[i] - attempts[i - 1] >= 14_900, "conflicts back off for 15s");
   }
 
   // 2. getUpdates 空轮询不打成功日志，非空或其它方法打成功日志
@@ -1524,7 +1361,6 @@ async function selfTest() {
     const missingDir = join(tmpStateDir, "nonexistent-proj");
     await writeFile(join(tmpStateDir, "state.json"), JSON.stringify({
       cwd: validDir,
-      recentProjects: [validDir],
       topics: {
         "10": { cwd: validDir },
         "20": { cwd: missingDir },
@@ -1587,117 +1423,6 @@ async function selfTest() {
     assert.equal(gwClose.sessions.has(`t:${tid}`), false);
   }
 
-  // Topic cwd switch adds to recentProjects (ref: review issue 2)
-  {
-    const tmpDir = join(tmpdir(), `test-topic-recent-${Date.now()}`);
-    await mkdir(tmpDir, { recursive: true });
-    const p1 = join(tmpDir, "p1");
-    const p2 = join(tmpDir, "p2");
-    await mkdir(p1, { recursive: true });
-    await mkdir(p2, { recursive: true });
-    const gwTopCwd = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: p1 });
-    gwTopCwd.telegram.call = async () => ({});
-    const topSession = new ChatSession(gwTopCwd, { threadId: 55, cwd: p1 });
-    gwTopCwd.sessions.set("t:55", topSession);
-    topSession.send = async () => {};
-    topSession.createPi = () => ({
-      stop: () => {},
-      start: async () => {},
-      request: async () => ({ sessionId: "s1" }),
-    });
-    await topSession.switchCwd(p2, null);
-    const realP2 = await realpath(p2);
-    assert.ok(gwTopCwd.state.recentProjects.includes(realP2), "Topic cwd 切换应将目标加入 recentProjects");
-  }
-
-  // Phase 3：renderReplyHtml / nextFallbackModel / redactLog
-  {
-    const html = renderReplyHtml("# My Report\n\n<script>alert(1)</script>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
-    assert.ok(html.includes('meta name="viewport" content="width=device-width,initial-scale=1"'), "viewport meta");
-    assert.ok(!/<script>/.test(html) && html.includes("&lt;script&gt;"), "raw HTML escaped");
-    assert.ok(html.includes("<table>") && html.includes("<th>a</th>"), "GFM table rendered");
-    assert.ok(html.match(/<title>[^<]*My Report[^<]*<\/title>/), "title from first heading");
-    assert.ok(html.includes("prefers-color-scheme: dark"), "dark mode media query");
-    const html2 = renderReplyHtml("no headings at all\nsecond line");
-    assert.ok(html2.includes("<title>no headings at all</title>"), "title falls back to first line");
-  }
-  {
-    const list = ["anthropic/claude", "google/gemini", "openai/gpt"];
-    assert.equal(nextFallbackModel(list, { provider: "anthropic", modelId: "claude" }), "google/gemini");
-    assert.equal(nextFallbackModel(list, { provider: "openai", modelId: "gpt" }), "anthropic/claude", "wrap-around");
-    assert.equal(nextFallbackModel(list, "unknown/model"), "anthropic/claude", "current not in list → first entry");
-    assert.equal(nextFallbackModel([], "anthropic/claude"), null, "empty list → null");
-    assert.equal(nextFallbackModel(["anthropic/claude"], { provider: "anthropic", modelId: "claude" }), null, "single-entry list at current → null");
-    assert.equal(nextFallbackModel(null, null), null, "no list → null");
-  }
-  {
-    const sample = "2026-01-01 bot 123:ABC connecting\napi_key=sk-123\nTOKEN: xyz\nauthorization: Bearer b\nplain line";
-    const redacted = redactLog(sample, "123:ABC");
-    assert.ok(!redacted.includes("sk-123") && !redacted.includes("123:ABC"), "secrets removed");
-    assert.ok(!redacted.includes("xyz") && !redacted.includes("Bearer b"), "token-style pairs removed");
-    assert.ok(redacted.includes("plain line"), "non-secret lines kept");
-  }
-  // Phase 2: parseNumstat — 解析 git diff -z --numstat 输出（含二进制、重命名与中文路径）
-  {
-    assert.deepEqual(parseNumstat(""), []);
-    assert.deepEqual(parseNumstat(null), []);
-
-    const raw = [
-      "10\t5\tsrc/index.js",
-      "-\t-\tassets/logo.png",
-      "3\t1\t中文文件.txt",
-      "0\t0\t", // rename: path 字段为空，后两个 NUL 段是 old/new
-    ].join("\0") + "\0old/dir/旧名.txt\u0000new/dir/新名.txt\0";
-
-    const parsed = parseNumstat(raw);
-    assert.equal(parsed.length, 4);
-    assert.deepEqual(parsed[0], { path: "src/index.js", added: 10, deleted: 5, binary: false });
-    assert.deepEqual(parsed[1], { path: "assets/logo.png", added: 0, deleted: 0, binary: true });
-    assert.deepEqual(parsed[2], { path: "中文文件.txt", added: 3, deleted: 1, binary: false });
-    assert.deepEqual(parsed[3], { path: "new/dir/新名.txt", added: 0, deleted: 0, binary: false, oldPath: "old/dir/旧名.txt" });
-  }
-
-  // Phase 2: formatRunCard
-  {
-    const card = formatRunCard({
-      durationMs: 133_000,
-      costDelta: 0.04,
-      tokensDelta: 12_300,
-      ctxPercent: 31,
-      files: [
-        { path: "src/gateway.mjs", added: 10, deleted: 4 },
-        { path: "README.md", added: 5, deleted: 0 },
-        { path: "new-file.txt", untracked: true },
-      ],
-    });
-    assert.ok(card.includes("✅ Done · 2m13s · +$0.04 · 12.3k tok · ctx 31%"));
-    assert.ok(card.includes("📝 3 files changed this run (+15 \u22124)"));
-    assert.ok(card.includes("• src/gateway.mjs +10 \u22124"));
-    assert.ok(card.includes("• README.md +5 \u22120"));
-    assert.ok(card.includes("• new-file.txt new"));
-
-    // non-git / no files
-    const nonGitCard = formatRunCard({ durationMs: 45_000, costDelta: 0.01, tokensDelta: 500, ctxPercent: 12 });
-    assert.equal(nonGitCard, "✅ Done · 45s · +$0.01 · 500 tok · ctx 12%");
-
-    // single file
-    const singleFileCard = formatRunCard({
-      durationMs: 10_000,
-      files: [{ path: "fix.js", added: 2, deleted: 1 }],
-    });
-    assert.ok(singleFileCard.includes("📝 1 file changed this run (+2 \u22121)"));
-    assert.ok(singleFileCard.includes("• fix.js +2 \u22121"));
-
-    // binary and > 8 files
-    const tenFiles = [];
-    for (let i = 1; i <= 10; i++) {
-      tenFiles.push(i === 1 ? { path: "img.png", binary: true } : { path: `f${i}.js`, added: 1, deleted: 0 });
-    }
-    const cardTen = formatRunCard({ durationMs: 2000, files: tenFiles });
-    assert.ok(cardTen.includes("• img.png binary"));
-    assert.ok(cardTen.includes("…and 2 more"));
-  }
-
   // Legacy status-board IDs are ignored without affecting session state.
   {
     const tmpStateDir = join(tmpdir(), `test-legacy-state-${Date.now()}`);
@@ -1712,120 +1437,10 @@ async function selfTest() {
     await rm(tmpStateDir, { recursive: true, force: true });
   }
 
-  // Phase 2 review: card computation does not block other sessions' Telegram output
+  // runCommand accepts nonzero success codes.
   {
-    const gwOrder = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-    gwOrder.chatReady = true;
-    const session1 = gwOrder.mainSession;
-    const session2 = new ChatSession(gwOrder, { threadId: 301, cwd: tmpdir() });
-    gwOrder.sessions.set("t:301", session2);
-
-    const deliveryLog = [];
-    session1.send = async (text) => {
-      return gwOrder.queueTelegram(async () => {
-        deliveryLog.push(`s1:${text}`);
-      });
-    };
-    session2.send = async (text) => {
-      return gwOrder.queueTelegram(async () => {
-        deliveryLog.push(`s2:${text}`);
-      });
-    };
-
-    let slowResolve;
-    const slowPromise = new Promise((resolve) => { slowResolve = resolve; });
-    session1.pi.request = async (cmd) => {
-      if (cmd === "get_session_stats") {
-        await slowPromise;
-        return { cost: 0.05, tokens: { total: 100 } };
-      }
-      return {};
-    };
-
-    gwOrder.queueTelegram(async () => {
-      deliveryLog.push("s1:final_reply");
-    });
-    const cardPromise = session1.sendRunCard(Promise.resolve(null), 1000);
-
-    await session2.send("fast_msg");
-
-    assert.deepEqual(deliveryLog, ["s1:final_reply", "s2:fast_msg"], "Session 2 output must not be blocked while Session 1 computes card");
-
-    slowResolve();
-    await cardPromise;
-
-    assert.equal(deliveryLog.length, 3);
-    assert.ok(deliveryLog[2].startsWith("s1:✅ Done"));
-  }
-
-  // Phase 2 review: git paths in subdirectory of repo (toplevel resolution, card diff, undo) & runCommand okCodes
-  {
-    let gitAvailable = true;
-    try {
-      await runCommand("git", ["--version"], { timeout: 2000 });
-    } catch {
-      gitAvailable = false;
-    }
-
-    if (gitAvailable) {
-      const testDiff = await runCommand("git", ["diff", "--no-index", "--", "/dev/null", "package.json"], { timeout: 5000, okCodes: [0, 1] });
-      assert.ok(testDiff.includes("package.json"), "runCommand with okCodes [0, 1] must resolve on exit code 1");
-
-      const repoDir = join(tmpdir(), `test-git-subrepo-${Date.now()}`);
-      await mkdir(repoDir, { recursive: true });
-      const subDir = join(repoDir, "packages", "sub");
-      await mkdir(subDir, { recursive: true });
-
-      await runCommand("git", ["init", "-q"], { cwd: repoDir, timeout: 5000 });
-      await runCommand("git", ["config", "user.name", "test"], { cwd: repoDir, timeout: 5000 });
-      await runCommand("git", ["config", "user.email", "test@test.com"], { cwd: repoDir, timeout: 5000 });
-
-      const trackedFile = join(subDir, "tracked.txt");
-      await writeFile(trackedFile, "initial content\n");
-      await runCommand("git", ["add", "."], { cwd: repoDir, timeout: 5000 });
-      await runCommand("git", ["commit", "-qm", "initial"], { cwd: repoDir, timeout: 5000 });
-
-      const gwSub = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir(), cwd: subDir });
-      gwSub.telegram.answer = async () => {};
-      gwSub.telegram.edit = async () => {};
-      const subSession = new ChatSession(gwSub, { threadId: 401, cwd: subDir });
-      subSession.pi.request = async () => ({});
-
-      const snapObj = await subSession.takeRunSnapshot();
-      assert.ok(snapObj?.git?.snap, "Snapshot must have snap commit");
-      const realRepoDir = await realpath(repoDir);
-      assert.equal(snapObj?.git?.toplevel, realRepoDir, "toplevel must resolve to repo root");
-
-      await writeFile(trackedFile, "modified content\n");
-      const newUntrackedFile = join(subDir, "new-sub.txt");
-      await writeFile(newUntrackedFile, "hello from subdir\n");
-
-      const diffNumstat = await runCommand("git", ["diff", "-z", "--numstat", snapObj.git.snap], { cwd: snapObj.git.toplevel, timeout: 5000 });
-      const parsedTracked = parseNumstat(diffNumstat);
-      assert.deepEqual(parsedTracked, [{ path: "packages/sub/tracked.txt", added: 1, deleted: 1, binary: false }]);
-
-      const untrackedRaw = await runCommand("git", ["ls-files", "-z", "--others", "--exclude-standard"], { cwd: snapObj.git.toplevel, timeout: 5000 });
-      const currentUntracked = untrackedRaw.split("\0").filter(Boolean);
-      const newUntracked = currentUntracked.filter((f) => !snapObj.git.untracked.has(f));
-      assert.deepEqual(newUntracked, ["packages/sub/new-sub.txt"]);
-
-      let replySent = "";
-      subSession.send = async (t) => { replySent = t; };
-      const undoAction = {
-        type: "run_undo",
-        toplevel: snapObj.git.toplevel,
-        snap: snapObj.git.snap,
-        trackedFiles: ["packages/sub/tracked.txt"],
-        untrackedFiles: ["packages/sub/new-sub.txt"],
-        confirmed: true,
-      };
-      await subSession.handleCallbackAction(undoAction, { id: "cb-undo" });
-
-      const contentAfterUndo = await readFile(trackedFile, "utf8");
-      assert.equal(contentAfterUndo, "initial content\n", "tracked file must be restored");
-      assert.equal(existsSync(newUntrackedFile), false, "untracked file in subdir must be deleted");
-      assert.ok(replySent.includes("Restored 2 file(s)"));
-    }
+    const result = await runCommand(process.execPath, ["-e", "process.stdout.write('ok'); process.exit(1)"], { okCodes: [0, 1] });
+    assert.equal(result, "ok");
   }
 
   assert.ok(HELP.includes("/topic") && BOT_COMMANDS.some((c) => c.command === "topic"), "/topic registered");
@@ -2014,11 +1629,12 @@ async function selfTest() {
     const main = gw.mainSession;
     main.pi.proc = {};
     let commands = [
-      ...["name", "upgrade", "start", "commands", "status"].map((name) => ({ name, source: "prompt", description: `Custom ${name}` })),
+      ...["name", "start", "status"].map((name) => ({ name, source: "prompt", description: `Custom ${name}` })),
       { name: "foo-bar", source: "extension" }, { name: "foo_bar", source: "prompt" },
       { name: `${"a".repeat(32)}-one`, source: "prompt" }, { name: `${"a".repeat(32)}-two`, source: "prompt" },
       { name: "skill:check-a", source: "skill" }, { name: "skill_check_a", source: "extension" },
       { name: "git-review", source: "extension", description: "Review changes" },
+      { name: "git-commit-push", source: "extension" },
     ];
     main.pi.request = async (type) => { assert.equal(type, "get_commands"); return { commands }; };
     const menus = [];
@@ -2026,10 +1642,10 @@ async function selfTest() {
     await gw.registerBotCommands();
     assert.equal(menus.length, 2, "register default and private-chat scopes");
     for (const { commands: menu } of menus) {
-      for (const name of ["name", "upgrade", "start", "commands", "foo_bar", "a".repeat(32), "skill_check_a"]) {
+      for (const name of ["start", "foo_bar", "a".repeat(32), "skill_check_a"]) {
         assert.ok(!menu.some((c) => c.command === name), `${name} is reserved or ambiguous, not a menu command`);
       }
-      assert.equal(menu.find((c) => c.command === "status").description, "Session status, tokens & cost");
+      assert.equal(menu.find((c) => c.command === "status").description, BOT_COMMANDS.find((c) => c.command === "status").description);
       assert.ok(menu.some((c) => c.command === "git_review"));
     }
     const handled = [...ChatSession.prototype.handleCommand.toString().matchAll(/case "([^"]+)":/g)].map((m) => m[1]);
@@ -2107,7 +1723,7 @@ async function selfTest() {
       assert.equal(sent.at(-1), HELP, "help sent before command discovery");
       return { commands };
     };
-    for (const name of ["help", "commands"]) {
+    for (const name of ["help"]) {
       sent.length = 0;
       await sess.handleCommand({ name, argument: "" }, `/${name}`);
       assert.deepEqual(sent, [HELP, "/review — Review changes\n/summarize\n/skill:check — Run checks"]);
@@ -2116,6 +1732,7 @@ async function selfTest() {
     sent.length = 0;
     await sess.handleCommand({ name: "help", argument: "" }, "/help");
     assert.deepEqual(sent, [HELP], "no empty command-list notice");
+    sess.pi.proc = null;
     sess.pi.request = async () => { assert.fail("static help must not start Pi"); };
     sent.length = 0;
     await sess.handleCommand({ name: "start", argument: "" }, "/start");
@@ -2126,7 +1743,7 @@ async function selfTest() {
     assert.deepEqual(sent, [HELP], "help stays available after Pi exits without restarting it");
   }
 
-  // Abort preserves both queues; queue clear removes them through native RPC.
+  // Abort preserves both queues.
   {
     const gwQueue = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
     const sess = gwQueue.mainSession;
@@ -2145,11 +1762,7 @@ async function selfTest() {
       await sess.handleCommand({ name: "abort", argument: "" }, "/abort");
       assert.equal(sess.queue, queue, "abort keeps queued messages");
       assert.deepEqual(calls, proc ? ["abort"] : []);
-      assert.ok(sent.at(-1).includes("use /queue clear to clear"));
-      await sess.handleCommand({ name: "queue", argument: "clear" }, "/queue clear");
-      assert.deepEqual(sess.queue, { steering: [], followUp: [] });
-      assert.deepEqual(calls, proc ? ["abort", "clear_queue"] : []);
-      assert.equal(sent.at(-1), proc ? "Cleared\nsteering: 1\nfollow-up: 1" : "Cleared\nsteering: 0\nfollow-up: 0");
+      assert.ok(sent.at(-1).includes("queued messages kept"));
     }
   }
 
@@ -2161,24 +1774,17 @@ async function selfTest() {
     assert.equal(parseCommand("/status@my_bot arg")?.argument, "arg");
   }
 
-  // 12. 回归：/compact、/sh 在 RPC 报 abort 错误时不得 fall-through 到下一个 case
+  // /compact propagates an abort; /sh consumes it without falling through.
   {
-    const gwAbort2 = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
-    const sess = gwAbort2.mainSession;
-    let exported = 0;
-    const sent = [];
-    sess.sendDocument = async () => { exported++; return { message_id: 1 }; };
-    sess.send = async (t) => { sent.push(t); return { message_id: 1 }; };
-    sess.pi.request = async (cmd) => {
-      if (cmd === "compact" || cmd === "bash") throw new Error("Pi aborted the current run");
-      if (cmd === "export_html") { exported++; return { path: "/tmp/x.html" }; }
-      return {};
-    };
-    await sess.handleCommand({ name: "compact", argument: "" }, "/compact");
-    assert.equal(exported, 0, "/compact abort 后不得 fall-through 到 /export");
-    await sess.handleCommand({ name: "sh", argument: "echo hi" }, "/sh echo hi");
-    assert.equal(exported, 0, "/sh abort 后不得 fall-through 到 /get 发送附件");
-    assert.ok(!sent.some((t) => t.includes("File missing")), "/sh abort 后不得 fall-through 到 /get");
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpdir() });
+    const s = gw.mainSession;
+    const requests = [];
+    s.pi.request = async (type) => { requests.push(type); throw new Error("Pi aborted the current run"); };
+    s.send = async () => assert.fail("aborted shell must not send an error");
+    await assert.rejects(() => s.handleCommand({ name: "compact", argument: "" }), /aborted/);
+    await s.handleCommand({ name: "sh", argument: "echo hi" });
+    assert.deepEqual(requests, ["compact", "bash"]);
+    assert.equal(s.typingTimer, null);
   }
 
   // 13. 回归：并发 saveState 全部成功落盘且最终文件包含全部键
@@ -2188,13 +1794,13 @@ async function selfTest() {
     const gwSave = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpStateDir });
     await Promise.all([
       gwSave.saveState({ cwd: "/a" }),
-      gwSave.saveState({ recentProjects: ["/a"] }),
+      gwSave.saveState({ pendingRestartMessageId: 99 }),
       gwSave.saveState({ topics: { 1: { cwd: "/a" } } }),
       gwSave.saveState({ herdrPanes: { main: "p1" } }),
     ]);
     const final = JSON.parse(readFileSync(join(tmpStateDir, "state.json"), "utf8"));
     assert.equal(final.cwd, "/a");
-    assert.deepEqual(final.recentProjects, ["/a"]);
+    assert.equal(final.pendingRestartMessageId, 99);
     assert.deepEqual(final.topics, { 1: { cwd: "/a" } });
     assert.deepEqual(final.herdrPanes, { main: "p1" });
     await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
@@ -2204,18 +1810,6 @@ async function selfTest() {
   {
     const out = await runCommand(process.execPath, ["-e", "const b = Buffer.from('中文测试', 'utf8'); process.stdout.write(b.subarray(0, 1)); await new Promise(r => setTimeout(r, 20)); process.stdout.write(b.subarray(1));"]);
     assert.equal(out, "中文测试");
-  }
-
-  // Numeric configuration rejects invalid values and preserves zero.
-  {
-    assert.equal(parseNumberConfig(undefined, undefined, 30, { min: 0 }), 30);
-    assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
-    assert.equal(parseNumberConfig(undefined, 0, 30, { min: 0 }), 0);
-    assert.equal(parseNumberConfig("abc", undefined, 4, { min: 1, integer: true }), 4);
-    assert.equal(parseNumberConfig(undefined, "abc", 4, { min: 1, integer: true }), 4);
-    assert.equal(parseNumberConfig("2.5", undefined, 4, { min: 1, integer: true }), 4);
-    assert.equal(parseNumberConfig("8", undefined, 4, { min: 1, integer: true }), 8);
-    assert.equal(parseNumberConfig("0", undefined, 30, { min: 0 }), 0);
   }
 
   // 16. 回归：send 与 sendOne 背靠背投递保序（sendOne 纳入输出队列）
@@ -2305,7 +1899,7 @@ async function selfTest() {
     const tmpDir = join(tmpdir(), `test-desk-${Date.now()}`);
     await mkdir(tmpDir, { recursive: true, mode: 0o700 });
     const presencePath = join(tmpDir, "presence-marker");
-    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir, presenceFile: presencePath, doneCard: true });
+    const gw = new Gateway({ allowedUserId: "1", botToken: "1:x", stateDir: tmpDir, cwd: tmpDir, presenceFile: presencePath });
     gw.chatReady = true;
     const sess = gw.mainSession;
     const sentCalls = [];
@@ -2317,45 +1911,11 @@ async function selfTest() {
     assert.equal(sess.runOrigin, "terminal");
     assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal echo is silent");
 
-    // Settles with reply: card is sent with disable_notification: true
-    sess.repliedInRun = true;
-    let cardPromise;
-    const origSendRunCard = sess.sendRunCard.bind(sess);
-    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
     await sess.handleEvent({ type: "agent_settled" });
-    await cardPromise;
-    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal-originated run card is silent");
-    assert.equal(sess.runOrigin, "telegram", "runOrigin resets to telegram");
-
-    // 2. Terminal-originated run with no text reply -> error message is silent
-    await sess.handleEvent({ type: "remote_user_input", text: "empty prompt" });
-    sess.repliedInRun = false;
-    sess.abortedRun = false;
-    await sess.handleEvent({ type: "agent_settled" });
-    await gw.telegramChain;
-    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "terminal empty-reply error is silent");
-
-    // 3. Telegram-originated run -> card is notified
-    sess.pi.request = async (cmd) => { if (cmd === "prompt") return {}; return { cost: 0 }; };
-    await sess.prompt("tg prompt");
-    assert.equal(sess.runOrigin, "telegram");
-    sess.repliedInRun = true;
-    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
-    await sess.handleEvent({ type: "agent_settled" });
-    await cardPromise;
-    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, undefined, "telegram-originated run card notifies");
-
-    // 4. presenceFile exists -> telegram run card, error, and blocked alert are silent
+    assert.equal(sess.runOrigin, "telegram", "origin resets after settling");
     assert.equal(gw.isUserPresent(), false);
     await writeFile(presencePath, "here");
     assert.equal(gw.isUserPresent(), true);
-
-    await sess.prompt("tg prompt with presence");
-    sess.repliedInRun = true;
-    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
-    await sess.handleEvent({ type: "agent_settled" });
-    await cardPromise;
-    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, true, "presenceFile silences telegram run card");
 
     // Herdr blocked alert with presence
     gw.herdrWatcher = {
@@ -2369,13 +1929,6 @@ async function selfTest() {
     // Presence removed -> notifies again
     await unlink(presencePath);
     assert.equal(gw.isUserPresent(), false);
-    await sess.prompt("tg prompt without presence");
-    sess.repliedInRun = true;
-    sess.sendRunCard = (...args) => (cardPromise = origSendRunCard(...args));
-    await sess.handleEvent({ type: "agent_settled" });
-    await cardPromise;
-    assert.equal(sentCalls.at(-1)?.extra?.disable_notification, undefined, "cleared presence notifies run card");
-
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 

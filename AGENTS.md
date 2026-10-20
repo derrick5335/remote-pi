@@ -29,6 +29,6 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
 - `HerdrWatcher`：仅用于 `/agents` 的只读列表/屏幕预览与 blocked 提醒；Pi 自行通过 Herdr 原生集成汇报状态。手机指令走 socket，不用模拟按键或抓取会话日志驱动 Pi。
 - `install.sh`：安装 launchd 服务，并将 `remote-pi.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`；安装/升级时替换已有软链目标，不覆盖用户普通文件。`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
-- Telegram 命令：`/sh`（直跑 shell）、`/get`（下载文件）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。`/resume` 使用统一原生会话列表，已运行的会话只切换视图。
+- Telegram 命令：`/sh`（直跑 shell）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。`/resume` 使用统一原生会话列表，已运行的会话只切换视图。
 - Pi 1.3.0 限制：无公开原生队列检查/清空 API，`clear_queue` 仅返回空结果并重置网关显示；无公开自动重试事件钩子，不转发重试开始/结束通知。
 - 安全：只接受配置的私聊用户；Telegram 非端到端加密，控制该账号即等于控制本机用户权限，勿拉群。

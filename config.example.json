@@ -4,5 +4,6 @@
     "allowedUserId": "123456789"
   },
   "cwd": "~/dev/my-project",
+  "sttCommand": "",
   "presenceFile": "~/.local/var/remote-pi/present"
 }
