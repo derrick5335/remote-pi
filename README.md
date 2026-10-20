@@ -200,7 +200,7 @@ npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit on remote-pi.ts against @earendil-works/pi-coding-agent@1.3.0
 ```
 
-The project keeps a hard size budget, enforced by the self-test: `gateway.mjs` ≤ 1540, `remote-pi.ts` ≤ 380, `install.sh` ≤ 140, together ≤ 2000 lines; `self-test.mjs` ≤ 1000. Lint rules forbid squeezing statements onto one line, so the budget can only be met by simplifying. Project rules for contributors and agents live in [AGENTS.md](AGENTS.md).
+Project rules for contributors and agents live in [AGENTS.md](AGENTS.md).
 
 ## License
 

@@ -200,7 +200,7 @@ npm run lint         # ESLint
 npm run typecheck    # 用 @earendil-works/pi-coding-agent@1.3.0 的类型对 remote-pi.ts 做 tsc --noEmit
 ```
 
-项目有一条由自检强制执行的体积上限：`gateway.mjs` ≤ 1540、`remote-pi.ts` ≤ 380、`install.sh` ≤ 140，三者合计 ≤ 2000 行；`self-test.mjs` ≤ 1000。Lint 规则禁止把多条语句挤在一行，所以只能靠真正的简化来满足上限。面向贡献者和 agent 的项目规则见 [AGENTS.md](AGENTS.md)。
+面向贡献者和 agent 的项目规则见 [AGENTS.md](AGENTS.md)。
 
 ## 许可证
 

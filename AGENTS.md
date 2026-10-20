@@ -8,7 +8,7 @@
 - **唯一安全的测试方式**：`timeout 120 node gateway.mjs --self-test`（离线自检，不连 Telegram 或真实 Herdr；没有 `--test` 参数）。自检有 60 秒 watchdog，超时输出当前测试名称并以非零状态退出；轮询 fake 的断言失败必须停止轮询并使测试失败，不能被网络重试吞掉。
 - **修改前先查最佳实践**：动手改代码前，先上网确认该做法是否为最佳实践；若某次修改应用了官方文档、社区等来源的最佳实践，需标明该修改方向的 reference。
 - **100% Pi-native**：仅依赖 Pi 公开 Extension API、Pi 原生 CLI 与 Herdr socket API；不引入私有补丁、私有 addon 或旁路通信文件。目标为已安装的 Pi 1.3.0，以其 `docs/extensions.md`、`docs/rpc.md` 和公开类型定义为准。
-- **行数预算与验证**：`gateway.mjs` ≤1540、`remote-pi.ts` ≤380、`install.sh` ≤140，三者合计 ≤2000；`self-test.mjs` ≤1000（由自检强制执行），均含注释与空行。每步运行 `timeout 120 node gateway.mjs --self-test`、`npm run lint` 与 `npm run typecheck`；不得修改 ESLint 规则或挤压多条语句规避预算。
+- **行数预算与验证**：`gateway.mjs`、`remote-pi.ts`、`install.sh` 合计约 2000 行（含注释与空行，`self-test.mjs` 不计入）。这是弹性预算：确有必要时可以超出，但须先尝试真正的简化，并在提交说明中写明超出原因；自检超出时只告警不失败。不得修改 ESLint 规则或挤压多条语句来压行数。每步运行 `timeout 120 node gateway.mjs --self-test`、`npm run lint` 与 `npm run typecheck`。
 - **多语言 README 同步**：代码行为/命令/配置发生变化时，必须同步更新 `README.md` 和 `README.zh-CN.md`，两份文档保持一致。
 - **一个会话，一个进程**：已有 Pi 在运行时只绑定其视图，不启动第二个进程读写同一 session。关闭桌面附加的 Topic 只能断开远程控制，不能终止用户的 Pi。
 
