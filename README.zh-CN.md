@@ -268,7 +268,7 @@ pi-remote-gateway stop     # 停止后台服务
 - **恢复会话而不创建第二个写入者**：`/resume` 经连接的 Pi 调用公开 `SessionManager.list`，使用 Pi 当前原生会话目录，列出当前 cwd 最近修改的 12 个会话。如果会话已在其他窗格运行，网关提供将 Topic 指向该窗格的按钮，不再启动另一个 Pi 读写同一文件。
 - **提问与审批**：`remote_ask` 同时出现在两个视图，先回答的一端使另一端关闭。其他扩展的 TUI 对话仍留在终端；Herdr 待确认通知仅附屏幕末尾内容及 `⏎ Enter` / `⎋ Esc` 控件。
 - **生命周期与终端标识**：会话按 Herdr 终端物理标识（`terminal_id`）绑定，避免 Herdr 重启后复用窗格 ID 误操作新窗格。网关（重）启动只重新附加仍在运行的 Pi 窗格，绝不自行启动新 Pi；若没有正在运行的 Pi，第一条消息才会启动它。断线重连保持待答的 `remote_ask` 提问有效并重新同步至 Telegram。Pi 退出至 Shell 后，下次手机指令在同一窗格恢复。关闭桌面附加的 Topic 绝不会终止该 Pi。
-- **待确认提示**：绑定会话工作期间每 3 秒轮询 Herdr 原生 agent 状态；仅为进入 blocked 状态的绑定窗格发送屏幕末尾预览及 Enter/Esc 按钮，已有 `remote_ask` 对话时不重复提醒。发送按键前会重新检查 blocked 状态。
+- **待确认提示**：绑定会话工作期间每 3 秒通过 Herdr socket API 轮询 Herdr 原生 agent 状态；仅为进入 blocked 状态的绑定窗格发送屏幕末尾预览及 Enter/Esc 按钮，已有 `remote_ask` 对话时不重复提醒。发送按键前会重新检查 blocked 状态。
 
 **Pi 1.3.0 公开 API 限制**：不支持检查或清空原生队列，也不支持自动重试开始/结束通知。压缩及 agent 生命周期事件正常转发。
 

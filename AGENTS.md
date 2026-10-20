@@ -31,7 +31,7 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - `remote-pi.ts`：统一 Pi extension，通过公开 Extension API 实现 RPC 形状的桥接命令与事件转发，提供 `/remote-control on|off|status`。Herdr 原生 pane metadata token `remote_pi=on` 保存开关，扩展自动重连；会话替换后由新 runtime 的 hello 恢复绑定。
 - `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。断线重连保持待答提问有效并在重连后重发，显式断开才取消。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
 - 绑定与生命周期：会话按 Herdr `terminal_id` 匹配实际终端，避免窗格 ID 复用导致误绑或误关。Telegram 客户端删除的 Topic 在下次投递失败时自动对齐清理。`/new` 与 `/resume` 替换请求采用 60s 超时并向用户反馈清晰错误。
-- blocked 轮询：绑定会话工作期间每 3 秒读取 Herdr 原生 agent 状态，仅推送绑定窗格的 blocked 变化；已有 `remote_ask` 按钮时不重复提醒。Enter/Esc 回调重新验证 blocked；普通指令仍走 socket，不用模拟按键驱动 Pi。
+- blocked 轮询：绑定会话工作期间每 3 秒读取 Herdr 原生 agent 状态，仅推送绑定窗格的 blocked 变化；已有 `remote_ask` 按钮时不重复提醒。Enter/Esc 回调重新验证 blocked；按键、屏幕读取与状态查询均走 Herdr socket API，不用模拟按键驱动 Pi。
 - `install.sh`：安装 launchd 服务，并将 `remote-pi.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`；安装/升级时替换已有软链目标，不覆盖用户普通文件。`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - `/new` 无论是否已有连接都必须请求 `new_session`，不能把旧 `binding.sessionFile` 的懒启动误报为新会话。
 - Telegram 命令：`/sh`（直跑 shell）、`/followup`（排队追加）、`/new /resume /abort /compact /model` 等；图片/文件/语音均可作上下文。`/resume` 使用统一原生会话列表，已运行的会话只切换视图。

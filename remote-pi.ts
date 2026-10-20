@@ -51,7 +51,7 @@ async function bridgePath(env) {
   const stateDir = path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(dirname(configPath), path);
   return join(stateDir, "bridge.sock");
 }
-function herdrRequest(env, method, params) {
+export function herdrRequest(env, method, params = {}) {
   return new Promise((resolveRequest, reject) => {
     const socket = net.createConnection(env.HERDR_SOCKET_PATH);
     const id = randomUUID();

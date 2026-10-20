@@ -10,7 +10,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import MarkdownIt from "markdown-it";
-import { readJsonLines, writeJsonLine } from "./remote-pi.ts";
+import { herdrRequest, readJsonLines, writeJsonLine } from "./remote-pi.ts";
 const MAX_MESSAGE = 4000;
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 let HERDR_DISABLED_FOR_TEST = false;
@@ -975,10 +975,9 @@ class Gateway {
   async liveSessionPane(sessionFile) {
     const connected = this.bridge.find({ sessionFile });
     if (connected) return connected.hello.paneId;
-    const env = this.herdrEnvironment;
-    if (!env?.HERDR_BIN_PATH) return null;
-    const data = JSON.parse(await runCommand(env.HERDR_BIN_PATH, ["agent", "list"], { env: { ...process.env, ...env }, timeout: 5000 }));
-    return (data.result?.agents || data.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
+    if (!this.herdrEnvironment?.HERDR_SOCKET_PATH) return null;
+    const data = await this.herdr("agent.list", {});
+    return (data?.agents || []).find((a) => a.agent === "pi" && resolveAgentSessionFile(a) === sessionFile)?.pane_id || null;
   }
   ensurePaneSession(rpc, options = {}) {
     // Serialize starts, including sessions arriving concurrently from different topics.
@@ -1297,10 +1296,11 @@ class Gateway {
     this.actions.set(token, { ...payload, expires: now + ttl });
     return `a:${token}`;
   }
-  herdr(args) {
-    const env = this.herdrEnvironment;
-    if (!env?.HERDR_BIN_PATH) throw new Error("Herdr is unavailable");
-    return runCommand(env.HERDR_BIN_PATH, ["agent", ...args], { env: { ...process.env, ...env }, timeout: 5000 });
+  // ref: Herdr socket API (`herdr api schema --json`).
+  herdr(method, params = {}) {
+    if (HERDR_DISABLED_FOR_TEST) throw new Error(`Self-test must never call herdr: ${method}`);
+    if (!this.herdrEnvironment?.HERDR_SOCKET_PATH) throw new Error("Herdr is unavailable");
+    return herdrRequest(this.herdrEnvironment, method, params);
   }
   startBlockedPoller() {
     if (HERDR_DISABLED_FOR_TEST || this.blockedTimer) return;
@@ -1309,18 +1309,18 @@ class Gateway {
     }, 3000);
     this.blockedTimer.unref();
   }
-  // ref: https://herdr.dev/docs/cli-reference/ — agent_status is authoritative; never parse numbered screen choices.
+  // ref: Herdr socket API (`herdr api schema --json`) — agent_status is authoritative; never parse numbered screen choices.
   async pollBlocked() {
     const sessions = [...this.sessions.values()].filter((s) => s.pi.proc && s.binding.paneId);
     if (this.blockedPolling || !sessions.some((s) => s.isStreaming)) return;
     this.blockedPolling = true;
     try {
-      const agents = JSON.parse(await this.herdr(["list"])).result.agents;
-      const current = new Map(agents.map((a) => [a.pane_id, a.agent_status]));
+      const res = await this.herdr("agent.list", {});
+      const current = new Map((res?.agents || []).map((a) => [a.pane_id, a.agent_status]));
       for (const session of sessions) {
         const paneId = session.binding.paneId;
         if (current.get(paneId) !== "blocked" || this.blockedStatuses.get(paneId) === "blocked" || session.uiMessages?.size) continue;
-        const screen = await this.herdr(["read", paneId, "--source", "visible", "--lines", "40"]);
+        const screen = (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text;
         if (!session.pi.proc || session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
         const group = randomBytes(6).toString("hex");
         await session.send(`✋ Pi needs your confirmation\n\n${expandableBlockquote(herdrTail(screen, 40))}`, {
@@ -1397,9 +1397,9 @@ class Gateway {
         case "herdr_keys": {
           for (const [key, value] of this.actions) if (value.group === action.group) this.actions.delete(key);
           const target = this.sessions.get(action.sessionKey);
-          const agent = JSON.parse(await this.herdr(["get", action.paneId])).result?.agent;
+          const agent = (await this.herdr("agent.get", { target: action.paneId }))?.agent;
           if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
-            await this.herdr(["send-keys", action.paneId, action.key]);
+            await this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] });
           } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
           if (callback?.message) await this.telegram.call("editMessageReplyMarkup", {
             chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },

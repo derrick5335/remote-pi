@@ -688,13 +688,13 @@ async function selfTest() {
       const { gw, s, calls } = await fresh(), requests = [];
       s.binding.paneId = "bound";
       let status = "blocked";
-      gw.herdr = async (args) => {
-        requests.push(args);
-        if (args[0] === "list") return JSON.stringify({ result: { agents: [
+      gw.herdr = async (method, params) => {
+        requests.push({ method, params });
+        if (method === "agent.list") return { agents: [
           { pane_id: "bound", agent_status: status }, { pane_id: "unbound", agent_status: "blocked" },
-        ] } });
-        if (args[0] === "get") return JSON.stringify({ result: { agent: { agent_status: status } } });
-        return "screen";
+        ] };
+        if (method === "agent.get") return { agent: { agent_status: status } };
+        return { read: { text: "screen" } };
       };
       await gw.pollBlocked();
       assert.equal(requests.length, 0);
@@ -714,20 +714,20 @@ async function selfTest() {
       const alerts = () => calls.filter((c) => c.method === "sendMessage");
       assert.equal(alerts().length, 1);
       assert.equal(alerts()[0].body.disable_notification, false);
-      assert.ok(!requests.some((a) => a.includes("unbound")));
+      assert.ok(!requests.some((r) => r.params?.target === "unbound"));
       await gw.pollBlocked();
       assert.equal(alerts().length, 1);
       const callback = (button) => ({ id: "cb", data: button.callback_data, message: { chat: { id: 1 }, message_id: 8 } });
       status = "idle";
       await gw.handleCallback(callback(alerts()[0].body.reply_markup.inline_keyboard[0][0]));
-      assert.ok(!requests.some((a) => a[0] === "send-keys"));
+      assert.ok(!requests.some((r) => r.method === "agent.send_keys"));
       await gw.pollBlocked();
       gw.isUserPresent = () => true;
       status = "blocked";
       await gw.pollBlocked();
       assert.equal(alerts().at(-1).body.disable_notification, true);
       await gw.handleCallback(callback(alerts().at(-1).body.reply_markup.inline_keyboard[1][0]));
-      assert.ok(requests.some((a) => a.join(" ") === "send-keys bound esc"));
+      assert.ok(requests.some((r) => r.method === "agent.send_keys" && r.params?.target === "bound" && r.params?.keys?.[0] === "esc"));
       assert.equal(calls.at(-1).method, "editMessageReplyMarkup");
       s.stop();
     }
