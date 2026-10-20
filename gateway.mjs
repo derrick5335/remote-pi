@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import MarkdownIt from "markdown-it";
-import { herdrRequest, readJsonLines, writeJsonLine } from "./remote-pi.ts";
+import { herdrRequest, readJsonLines, reconnectDelayMs, textOf, writeJsonLine } from "./remote-pi.ts";
 // ref: https://nodejs.org/api/child_process.html#child_processexecfilefile-args-options-callback — bounded, promisified subprocesses.
 const execFileAsync = promisify(execFile);
 const MAX_MESSAGE = 4000;
@@ -185,8 +185,6 @@ function chunks(text, limit = MAX_MESSAGE) {
   if (from < str.length) parts.push(renderChunk(str, from, str.length));
   return parts;
 }
-const extractText = (content) => typeof content === "string" ? content
-  : Array.isArray(content) ? content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : "";
 function toolSummary(name, args = {}) {
   const val = args?.command || args?.path || args?.pattern || args?.query || (Array.isArray(args?.queries) && args.queries.join(", ")) || args?.url || Object.values(args || {}).find((v) => typeof v === "string");
   if (val) return `${name}: ${val}`;
@@ -203,6 +201,10 @@ function formatAssistantError(errorMessage) {
     : /rate limit|too many requests|429/i.test(message) ? "provider rate limit hit. Retry shortly, or use /model to switch models." : "";
   return tip ? `⚠️ ${message}\n\n💡 Tip: ${tip}` : `❌ ${message}`;
 }
+const topicTitle = (owned, name) => `${owned === false ? "📡 " : ""}${name}`.slice(0, 128);
+const helloName = (hello) => hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi";
+// Non-final chunks keep the thread and silence but not reply_markup.
+const continuation = ({ message_thread_id, disable_notification } = {}) => ({ message_thread_id, disable_notification });
 function resolvePath(pathStr, baseDir = process.cwd()) {
   if (!pathStr || typeof pathStr !== "string") return "";
   const expanded = pathStr.startsWith("~/") ? join(homedir(), pathStr.slice(2)) : pathStr === "~" ? homedir() : pathStr;
@@ -222,9 +224,9 @@ function loadState(stateDir) {
       .filter(([, info]) => typeof info?.cwd === "string" && existsSync(info.cwd)).map(([id, info]) => [id, { cwd: info.cwd }]));
     const herdrPanes = Object.fromEntries(Object.entries(raw.herdrPanes || {})
       .filter(([, pane]) => pane && typeof pane === "object" && typeof pane.cwd === "string")
-      .map(([key, { cwd, paneId, terminalId, sessionFile, workspaceId, owned }]) => [key, {
+      .map(([key, { cwd, paneId, terminalId, sessionFile, owned }]) => [key, {
         cwd, ...(paneId ? { paneId } : {}), ...(sessionFile ? { sessionFile } : {}),
-        ...(terminalId ? { terminalId } : {}), ...(workspaceId ? { workspaceId } : {}), owned: owned === true,
+        ...(terminalId ? { terminalId } : {}), owned: owned === true,
       }]));
     return { cwd: typeof raw.cwd === "string" ? raw.cwd : null, topics, herdrPanes, pendingRestartMessageId: Number.isSafeInteger(raw.pendingRestartMessageId) && raw.pendingRestartMessageId > 0 ? raw.pendingRestartMessageId : null };
   } catch { return { cwd: null, topics: {}, herdrPanes: {} }; }
@@ -246,7 +248,7 @@ function loadConfig() {
   const telegram = file.telegram && typeof file.telegram === "object" ? file.telegram : {};
   const config = {
     botToken: telegram.botToken, allowedUserId: String(telegram.allowedUserId || ""),
-    cwd: targetCwd, configPath: path, stateDir, downloadsDir: join(stateDir, "downloads"),
+    cwd: targetCwd, configPath: path, stateDir, savedState, downloadsDir: join(stateDir, "downloads"),
     presenceFile: file.presenceFile ? resolvePath(file.presenceFile, configDir) : "",
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     sttCommand: file.sttCommand || "",
@@ -300,10 +302,9 @@ class Telegram {
       // ref: https://core.telegram.org/bots/api#sendmessage — HTML parse/length failures may fall back to plain text.
       log("tg:call", "HTML parse/length fallback:", error.message);
       const length = editing ? Math.min(4000, plain.length) : plain.length;
-      const base = { message_thread_id: extra.message_thread_id, disable_notification: extra.disable_notification };
       let last;
       for (let i = 0; i < length; i += 4000) last = await this.call(method, {
-        ...fields, text: plain.slice(i, i + 4000), ...(i + 4000 >= length ? extra : base),
+        ...fields, text: plain.slice(i, i + 4000), ...(i + 4000 >= length ? extra : continuation(extra)),
       });
       return last;
     }
@@ -311,13 +312,12 @@ class Telegram {
   sendOne(chatId, text, extra = {}) { return this.htmlMessage("sendMessage", { chat_id: chatId }, text, extra); }
   async send(chatId, text, extra = {}) {
     let last;
-    const parts = chunks(text), base = {};
-    if (extra?.message_thread_id) base.message_thread_id = extra.message_thread_id;
-    if (extra?.disable_notification) base.disable_notification = extra.disable_notification;
-    for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : base);
+    const parts = chunks(text);
+    for (let i = 0; i < parts.length; i++) last = await this.sendOne(chatId, parts[i], i === parts.length - 1 ? extra : continuation(extra));
     return last;
   }
   edit(chatId, messageId, text) { return this.htmlMessage("editMessageText", { chat_id: chatId, message_id: messageId }, text); }
+  clearKeyboard(chatId, messageId) { return this.call("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }); }
   answer(callbackQueryId, text = "") { return this.call("answerCallbackQuery", { callback_query_id: callbackQueryId, text }).catch((error) => log("tg:call", error)); }
   async sendDocument(chatId, path, extra = {}) {
     const form = new FormData();
@@ -461,9 +461,8 @@ class PaneServer {
     await chmod(this.path, 0o600);
     this.server = server.unref();
   }
-  find(binding) {
-    return [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable && matchesBinding(binding, c.hello));
-  }
+  live(predicate) { return [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable && predicate(c)); }
+  find(binding) { return this.live((c) => matchesBinding(binding, c.hello)); }
   waitFor(predicate, timeout = 30_000) {
     return new Promise((done, reject) => {
       const finish = (error, value) => {
@@ -472,7 +471,7 @@ class PaneServer {
         if (error) reject(error); else done(value);
       };
       const waiter = { check: () => {
-        const connection = [...this.connections.values()].find((c) => !c.socket.destroyed && c.socket.writable && predicate(c));
+        const connection = this.live(predicate);
         if (connection) finish(null, connection);
       }, cancel: () => finish(new Error("Bridge server stopped")) };
       const timer = setTimeout(() => finish(new Error("Timed out waiting for Pi bridge hello")), timeout);
@@ -633,9 +632,7 @@ class ChatSession {
       group.resolveReady();
     }
     this.mediaGroups.clear();
-    for (const [key, action] of this.gateway.actions) {
-      if (action.type === "ui" && action.sessionKey === this.key) this.gateway.actions.delete(key);
-    }
+    this.gateway.dropActions((action) => action.type === "ui" && action.sessionKey === this.key);
     this.uiMessages?.clear();
   }
   async prompt(message, images, streamingBehavior, triggerMessageId = null) {
@@ -677,7 +674,7 @@ class ChatSession {
       return this.send(`✅ New session started${state?.model ? ` · ${state.model.provider}/${state.model.id}` : ""}`);
     } catch (error) { return this.send(`❌ ${error.message}`); }
   }
-  async handleCommand({ name, argument }, original, updateId = null, triggerMessageId = null) {
+  async handleCommand({ name, argument }, updateId = null, triggerMessageId = null) {
     const simple = {
       start: "showHelp", help: "showHelp", model: "showModels", thinking: "showThinking",
       resume: "showSessions", status: "showSession", new: "newSession",
@@ -791,7 +788,7 @@ class ChatSession {
     }
     if (event.type === "session_info_changed") {
       if (!this.threadId) return;
-      const newName = `${this.binding.owned === false ? "📡 " : ""}${(event.name || basename(this.cwd) || "topic").trim()}`.slice(0, 128);
+      const newName = topicTitle(this.binding.owned, (event.name || basename(this.cwd) || "topic").trim());
       if (this.lastTopicName === newName) return;
       this.lastTopicName = newName;
       // ref: https://core.telegram.org/bots/api#editforumtopic — private chats support topic names.
@@ -800,12 +797,10 @@ class ChatSession {
       return;
     }
     if (event.type === "extension_ui_resolved") {
-      for (const [key, action] of this.gateway.actions) {
-        if (action.type === "ui" && action.requestId === event.id && action.sessionKey === this.key) this.gateway.actions.delete(key);
-      }
+      this.gateway.dropActions((action) => action.type === "ui" && action.requestId === event.id && action.sessionKey === this.key);
       const messageId = this.uiMessages?.get(event.id);
       this.uiMessages?.delete(event.id);
-      if (messageId) await this.gateway.telegram.call("editMessageReplyMarkup", { chat_id: this.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      if (messageId) await this.gateway.telegram.clearKeyboard(this.chatId, messageId).catch(() => {});
       return;
     }
     if (event.type === "agent_start") this.ensureRun(this.nextTrigger);
@@ -818,7 +813,7 @@ class ChatSession {
     if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta" && run) run.text += event.assistantMessageEvent.delta;
     if (event.type === "message_end" && event.message?.role === "assistant" && run) {
       const message = event.message;
-      let text = extractText(message.content);
+      let text = textOf(message.content);
       if (message.stopReason === "aborted") run.aborted = true;
       run.error = Boolean(message.stopReason === "error" || message.errorMessage);
       if (run.error) text = [text, formatAssistantError(message.errorMessage)].filter(Boolean).join("\n\n");
@@ -843,9 +838,7 @@ class ChatSession {
     if (event.type === "tool_execution_end") {
       if (run) run.tool = null;
       if (event.toolName === "remote_attach" && !event.isError) {
-        const rawPaths = event.result?.details?.paths || event.args?.paths || [];
-        const paths = event.result?.details?.paths ? rawPaths : rawPaths.map((p) => resolve(this.cwd, p));
-        for (const path of paths) {
+        for (const path of event.result?.details?.paths || []) {
           this.uploadChain = this.uploadChain.then(() => this.gateway.telegram.sendDocument(this.chatId, path, this.threadExtra()))
             .catch((error) => this.send(`❌ Failed to send attachment ${basename(path)}: ${error.message}`))
             .catch((error) => log("upload", error));
@@ -873,7 +866,7 @@ class ChatSession {
 class Gateway {
   constructor(config) {
     Object.assign(this, {
-      config, chatId: config.allowedUserId, chatReady: false, state: loadState(config.stateDir),
+      config, chatId: config.allowedUserId, chatReady: false, state: config.savedState || loadState(config.stateDir),
       telegram: new Telegram(config.botToken, join(config.stateDir, "telegram-offset")), actions: new Map(),
       stateWriteChain: Promise.resolve(), paneStartChain: Promise.resolve(), downloadCleanupTimer: null,
       blockedStatuses: new Map(), subscribedPanesKey: "", herdrSocketPath: null, herdrSubSocket: null, herdrSubTimer: null, herdrSubRetries: 0,
@@ -905,8 +898,7 @@ class Gateway {
         log("bridge", `Topics must be enabled to attach desktop pane ${hello.paneId}`);
         return;
       }
-      const topicTitle = `📡 ${hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi"}`.slice(0, 128);
-      const session = await this.createTopic({ cwd: hello.cwd, name: topicTitle,
+      const session = await this.createTopic({ cwd: hello.cwd, name: topicTitle(false, helloName(hello)),
         binding: { paneId: hello.paneId, terminalId: hello.terminalId, sessionFile: hello.sessionFile, cwd: hello.cwd, owned: false } });
       targets = [session];
       await session.send(`📡 Remote control on — ${hello.paneId}\n${hello.cwd}\nThe terminal and this topic share one Pi session.`);
@@ -915,9 +907,7 @@ class Gateway {
       if (recent.length) await session.send(recent.join("\n\n"), { disable_notification: true });
     }
     for (const session of targets) {
-      if (session.threadId && !session.lastTopicName) {
-        session.lastTopicName = `${session.binding.owned === false ? "📡 " : ""}${hello.sessionName || hello.recent?.firstUserText || basename(hello.cwd) || "Pi"}`.slice(0, 128);
-      }
+      if (session.threadId && !session.lastTopicName) session.lastTopicName = topicTitle(session.binding.owned, helloName(hello));
       const wasUnbound = !session.pi.proc;
       session.pi.bind(connection);
       const state = hello.state;
@@ -961,11 +951,7 @@ class Gateway {
     if (!connection) {
       if (!spawn) return false;
       if (!this.herdrSocketPath) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
-      let pane, created = false;
-      if (session.binding.owned && session.binding.paneId && session.binding.terminalId) {
-        try { pane = (await this.herdr("pane.get", { pane_id: session.binding.paneId }))?.pane; } catch {}
-        if (pane?.terminal_id !== session.binding.terminalId) pane = null;
-      }
+      let pane = await this.ownedPane(session.binding), created = false;
       if (!pane?.pane_id) {
         const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
         try {
@@ -975,7 +961,7 @@ class Gateway {
       }
       if (!pane?.pane_id) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
       const paneId = pane.pane_id;
-      session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, workspaceId: pane.workspace_id, cwd: session.cwd, owned: true };
+      session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, cwd: session.cwd, owned: true };
       await this.persistPaneSession(session);
       const shell = await this.waitForShell(paneId, created ? 10 : 1);
       if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
@@ -993,6 +979,13 @@ class Gateway {
     await this.persistPaneSession(session);
     return true;
   }
+  // The terminal_id check guards against Herdr reusing a pane ID for another terminal.
+  async ownedPane(binding) {
+    if (!binding.owned || !binding.paneId || !binding.terminalId) return null;
+    let pane = null;
+    try { pane = (await this.herdr("pane.get", { pane_id: binding.paneId }))?.pane; } catch {}
+    return pane?.terminal_id === binding.terminalId ? pane : null;
+  }
   async closePaneSession(session) {
     const otherViews = [...this.sessions.values()].filter((s) => s !== session && matchesBinding(s.binding, session.binding));
     for (const other of otherViews) {
@@ -1000,14 +993,10 @@ class Gateway {
       await this.persistPaneSession(other);
     }
     if (!otherViews.length && session.pi.proc) await session.pi.request(session.binding.owned ? "quit" : "remote_off", {}, 10_000);
-    if (session.binding.owned && !otherViews.length && session.binding.paneId && this.herdrSocketPath) {
+    if (!otherViews.length && this.herdrSocketPath && await this.ownedPane(session.binding)) {
       const paneId = session.binding.paneId;
-      let pane = null;
-      try { pane = (await this.herdr("pane.get", { pane_id: paneId }))?.pane; } catch {}
-      if (session.binding.terminalId && pane?.terminal_id === session.binding.terminalId) {
-        if (!await this.waitForShell(paneId, 30)) throw new Error("Pi has not exited; pane and topic were kept");
-        await this.herdr("pane.close", { pane_id: paneId });
-      }
+      if (!await this.waitForShell(paneId, 30)) throw new Error("Pi has not exited; pane and topic were kept");
+      await this.herdr("pane.close", { pane_id: paneId });
     }
     session.stop();
   }
@@ -1067,14 +1056,15 @@ class Gateway {
       this.herdrSocketPath = JSON.parse(stdout).socket;
     } catch { throw new Error("Herdr is required: install herdr and ensure its server is reachable"); }
     await this.bridge.start();
-    await this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {});
-    this.me = await this.telegram.call("getMe");
-    try {
-      await this.telegram.call("getChat", { chat_id: this.chatId });
-      this.chatReady = true;
-    } catch (error) {
-      if (!error.message.includes("chat not found")) throw error;
-    }
+    // Independent startup probes; getChat only decides whether the private chat already exists.
+    [, this.me, this.chatReady] = await Promise.all([
+      this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {}),
+      this.telegram.call("getMe"),
+      this.telegram.call("getChat", { chat_id: this.chatId }).then(() => true, (error) => {
+        if (!error.message.includes("chat not found")) throw error;
+        return false;
+      }),
+    ]);
     // Startup attaches only; the first message owns lazy Pi startup.
     const attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
     await this.registerBotCommands();
@@ -1119,7 +1109,7 @@ class Gateway {
     if (update.stopped_message_generation) {
       const smg = update.stopped_message_generation;
       if (!this.isAllowed(smg.chat, smg.chat)) return;
-      return this.sessions.get(sessionKeyOf(smg))?.handleCommand({ name: "abort", argument: "" }, "/abort", update.update_id);
+      return this.sessions.get(sessionKeyOf(smg))?.handleCommand({ name: "abort", argument: "" }, update.update_id);
     }
     const m = update.message, callback = update.callback_query;
     if (!m && !callback || !this.isAllowed((m || callback).from, m?.chat || callback?.message?.chat)) return Promise.resolve();
@@ -1128,7 +1118,7 @@ class Gateway {
     this.chatReady = true;
     if (command?.name === "abort" || command?.name === "restart") {
       this.telegram.react(this.chatId, m.message_id, "👀");
-      return session.handleCommand(command, m.text, update.update_id);
+      return session.handleCommand(command, update.update_id);
     }
     // ref: https://docs.python-telegram-bot.org/en/stable/telegram.message.html#telegram.Message.media_group_id — serialize albums at the first message.
     if (m?.media_group_id) {
@@ -1197,7 +1187,7 @@ class Gateway {
     this.telegram.react(this.chatId, message.message_id, "👀");
     if (!media) {
       const command = parseCommand(text);
-      return command ? session.handleCommand(command, text, updateId, message.message_id)
+      return command ? session.handleCommand(command, updateId, message.message_id)
         : session.prompt(text, undefined, undefined, message.message_id);
     }
     if (message.voice && this.config.sttCommand) {
@@ -1241,9 +1231,10 @@ class Gateway {
     });
     return this.stateWriteChain;
   }
+  dropActions(predicate) { for (const [key, action] of this.actions) if (predicate(action)) this.actions.delete(key); }
   action(payload, ttl = 10 * 60_000) {
     const now = Date.now();
-    for (const [key, value] of this.actions) if (value.expires < now) this.actions.delete(key);
+    this.dropActions((value) => value.expires < now);
     const token = randomBytes(6).toString("base64url");
     this.actions.set(token, { ...payload, expires: now + ttl });
     return `a:${token}`;
@@ -1268,10 +1259,11 @@ class Gateway {
     const prev = this.blockedStatuses.get(paneId);
     this.blockedStatuses.set(paneId, status);
     if (status !== "blocked" || prev === "blocked") return;
+    let screen;
     for (const session of sessions) {
       if (!session.isStreaming || session.uiMessages?.size) continue;
       const connection = session.pi.connection;
-      const screen = (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text;
+      screen ??= (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text ?? "";
       if (this.blockedStatuses.get(paneId) !== "blocked" || session.pi.connection !== connection || !session.pi.proc ||
         session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
       const group = randomBytes(6).toString("hex");
@@ -1316,7 +1308,7 @@ class Gateway {
     socket.on("close", () => {
       if (this.herdrSubSocket !== socket || this.stopping) return;
       this.herdrSubSocket = null;
-      this.herdrSubTimer = setTimeout(() => this.syncBlockedSubscription(connect), Math.min(10_000, 250 * 2 ** Math.min(this.herdrSubRetries++, 6))).unref();
+      this.herdrSubTimer = setTimeout(() => this.syncBlockedSubscription(connect), reconnectDelayMs(this.herdrSubRetries++)).unref();
     });
   }
   async handleCallback(callback, session = this.mainSession, action = null) {
@@ -1370,26 +1362,22 @@ class Gateway {
           return session.send(result.cancelled ? "Resume cancelled" : "✅ Session resumed");
         }
         case "ui": {
-          for (const [key, value] of this.actions) {
-            if (value.type === "ui" && value.requestId === action.requestId) this.actions.delete(key);
-          }
+          this.dropActions((value) => value.type === "ui" && value.requestId === action.requestId);
           session.pi.write({ type: "extension_ui_response", id: action.requestId, ...action.response });
           if (callback?.message) {
-            const chosen = action.response?.value ?? (action.response?.confirmed ? "Confirm" : "Cancel");
+            const chosen = action.response.value;
             await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `${callback.message.text}\n\n✅ ${chosen}`).catch(() => {});
           }
           return;
         }
         case "herdr_keys": {
-          for (const [key, value] of this.actions) if (value.group === action.group) this.actions.delete(key);
+          this.dropActions((value) => value.group === action.group);
           const target = this.sessions.get(action.sessionKey);
           const agent = (await this.herdr("agent.get", { target: action.paneId }))?.agent;
           if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
             await this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] });
           } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
-          if (callback?.message) await this.telegram.call("editMessageReplyMarkup", {
-            chat_id: callback.message.chat.id, message_id: callback.message.message_id, reply_markup: { inline_keyboard: [] },
-          });
+          if (callback?.message) await this.telegram.clearKeyboard(callback.message.chat.id, callback.message.message_id);
           return;
         }
         case "close_topic":

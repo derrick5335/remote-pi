@@ -54,7 +54,7 @@ setup_plist() {
 </dict></plist>
 EOF
     plutil -lint "$PLIST"
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    bootout
     sleep 1
     for attempt in 1 2 3; do
         if launchctl bootstrap "$DOMAIN" "$PLIST"; then break; fi
@@ -65,31 +65,29 @@ EOF
     status
 }
 
-install() {
-    if [[ -f "$CONFIG" ]]; then
-        echo "Found existing config: $CONFIG"
-        printf 'Keep it and (re)install/update the service? (Y/n): '
-        read -r keep_config
-        if [[ ! "$keep_config" =~ ^[Nn]$ ]]; then
-            echo "Keeping existing config."
-            install_command
-            (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
-            setup_plist
-            return
-        fi
-    fi
-
+write_config() {
     local token user_id
     printf 'Telegram Bot Token: ' && read -rs token && printf '\nTelegram numeric user ID: ' && read -r user_id
     [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { echo 'Invalid Bot Token' >&2; exit 1; }
     [[ "$user_id" =~ ^[0-9]+$ ]] || { echo 'User ID must be numeric' >&2; exit 1; }
 
-    mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
+    mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     (umask 077 && CFG_TOKEN="$token" CFG_USER_ID="$user_id" CFG_CWD="$ROOT" "$NODE" -e '
       process.stdout.write(JSON.stringify({ telegram: { botToken: process.env.CFG_TOKEN, allowedUserId: process.env.CFG_USER_ID }, cwd: process.env.CFG_CWD }, null, 2) + "\n");
     ' > "$CONFIG")
     chmod 600 "$CONFIG"
+}
+
+install() {
+    local keep_config=n
+    if [[ -f "$CONFIG" ]]; then
+        echo "Found existing config: $CONFIG"
+        printf 'Keep it and (re)install/update the service? (Y/n): '
+        read -r keep_config
+    fi
+    if [[ -f "$CONFIG" && ! "$keep_config" =~ ^[Nn]$ ]]; then echo "Keeping existing config."; else write_config; fi
+    mkdir -p "$HOME/Library/LaunchAgents"
     install_command
     (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund)
     setup_plist
@@ -107,8 +105,10 @@ start() {
     status
 }
 
+bootout() { launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; }
+
 stop() {
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    bootout
     echo "🛑 remote-pi is stopped"
 }
 
@@ -128,6 +128,6 @@ case "${1:-install}" in
     restart)   start restart ;;
     status)    status ;;
     logs)      tail -f "$LOG_FILE" ;;
-    uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$PLIST" "$COMMAND"; [[ -L "$PI_EXTENSION" ]] && rm -f "$PI_EXTENSION"; echo "Removed service; kept $CONFIG" ;;
+    uninstall) bootout; rm -f "$PLIST" "$COMMAND"; [[ -L "$PI_EXTENSION" ]] && rm -f "$PI_EXTENSION"; echo "Removed service; kept $CONFIG" ;;
     *) echo "Usage: $0 [install|start|stop|restart|status|logs|uninstall]" >&2; exit 1 ;;
 esac

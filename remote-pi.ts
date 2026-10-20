@@ -15,12 +15,13 @@ export function readJsonLines(socket: net.Socket, onMessage: (message: any) => v
   let buffer = "";
   socket.setEncoding("utf8");
   socket.on("data", (chunk: string | Buffer) => {
+    let index = buffer.length; // resume where the last scan stopped so large records are scanned once
     buffer += chunk;
     if (buffer.length > 64 * 1024 * 1024) return socket.destroy(new Error("Bridge record too large"));
-    let index;
-    while ((index = buffer.indexOf("\n")) >= 0) {
+    while ((index = buffer.indexOf("\n", index)) >= 0) {
       const line = buffer.slice(0, index);
       buffer = buffer.slice(index + 1);
+      index = 0;
       if (!line.trim()) continue;
       let message;
       try {
@@ -70,8 +71,15 @@ export function herdrRequest(env: Record<string, string | undefined>, method: st
     }, false);
   });
 }
-const textOf = (content: string | { type: string; text?: string }[]) =>
+export const textOf = (content: string | { type: string; text?: string }[]) =>
   typeof content === "string" ? content : (content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+export const reconnectDelayMs = (attempt: number) => Math.min(10_000, 250 * 2 ** Math.min(attempt, 6));
+// ref: Pi dist/modes/json-event.d.ts toJsonEvent — drop cumulative snapshots and tool output the gateway never reads.
+function wireEvent({ type, ...event }: any) {
+  if (type === "message_update") return event.assistantMessageEvent.type === "text_delta" ? { type, assistantMessageEvent: { type: "text_delta", delta: event.assistantMessageEvent.delta } } : null;
+  if (type !== "tool_execution_end") return { type, ...event };
+  return { type, toolName: event.toolName, isError: event.isError, ...(event.toolName === "remote_attach" ? { result: { details: event.result?.details } } : {}) };
+}
 
 // ref: Pi docs/extensions.md#context-and-session-changes; dist/core/extensions/types.d.ts.
 // Lazy public import keeps the framing helpers usable by plain Node without a local Pi installation.
@@ -86,7 +94,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   let path: string, terminalId: string | undefined, retries = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
   const dialogs = new Map<string, { finish: (value?: string, error?: unknown) => void; request: { options: string[] } & Record<string, unknown> }>();
   const replacements = new Map<string, Record<string, any>>(), paneId = env.HERDR_PANE_ID;
-  const send = (message: unknown) => writeJsonLine(socket, message);
+  const send = (message: unknown) => message !== null && writeJsonLine(socket, message);
   const on = <K extends ExtensionEvent["type"]>(type: K, handler: (event: Extract<ExtensionEvent, { type: K }>) => unknown) => {
     const register = pi.on as (type: K, handler: (event: Extract<ExtensionEvent, { type: K }>, ctx: ExtensionContext) => unknown) => unknown;
     return register(type, (event, currentCtx) => {
@@ -136,7 +144,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     if (retry && enabled && !disposed) retryTimer = setTimeout(() => {
       retryTimer = null;
       open();
-    }, Math.min(10_000, 250 * 2 ** Math.min(retries++, 6))).unref();
+    }, reconnectDelayMs(retries++)).unref();
   };
   const open = () => {
     if (!enabled || disposed || socket || !path) return;
@@ -180,17 +188,12 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     ...identity(), sessionName: pi.getSessionName(), cwd: ctx?.cwd,
   });
   const stats = () => {
-    const tokens: Record<string, number> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
     let cost = 0;
     for (const entry of ctx.sessionManager.getEntries()) {
       const usage = entry.type === "message" ? ("usage" in entry.message ? entry.message.usage : undefined) : "usage" in entry ? entry.usage : undefined;
-      if (!usage) continue;
-      for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) tokens[key] += usage[key] || 0;
-      cost += usage.cost?.total || 0;
+      cost += usage?.cost?.total || 0;
     }
-    // ref: Pi AgentSession.getSessionStats — sum all four token buckets, including compaction/branch usage.
-    tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-    return { ...identity(), tokens, cost, contextUsage: ctx?.getContextUsage() };
+    return { ...identity(), cost, contextUsage: ctx?.getContextUsage() };
   };
   const levels = () => {
     if (!ctx?.model?.reasoning) return ["off"];
@@ -202,10 +205,10 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   async function dispatch(request: any): Promise<any> {
     if (!ctx || disposed) throw new Error("Pi session is not ready");
     switch (request.type) {
-      case "prompt": case "steer": case "follow_up": {
+      case "prompt": {
         if (typeof request.message !== "string" || request.images !== undefined && !Array.isArray(request.images)) throw new Error("Invalid prompt");
         if (request.images?.some((i: any) => i.type !== "image" || typeof i.data !== "string" || typeof i.mimeType !== "string")) throw new Error("Invalid image");
-        const deliverAs = request.type === "steer" ? "steer" : request.type === "follow_up" ? "followUp" : request.streamingBehavior;
+        const deliverAs = request.streamingBehavior;
         if (deliverAs !== undefined && !["steer", "followUp"].includes(deliverAs)) throw new Error("Invalid streaming behavior");
         if (!ctx.isIdle() && !deliverAs) throw new Error("Agent is streaming; specify streamingBehavior");
         const content = request.images?.length ? [{ type: "text", text: request.message }, ...request.images] : request.message;
@@ -355,7 +358,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     disconnect();
   });
   // Pi 1.3.0 exposes no public auto_retry_start/end hooks; retry notifications are unavailable here.
-  for (const type of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end", "session_info_changed"] as const) on(type, send);
+  for (const type of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end", "session_info_changed"] as const) on(type, (event) => send(wireEvent(event)));
   on("input", (event) => { if (event.source === "interactive") send({ type: "remote_user_input", text: event.text }); });
   on("session_before_switch", async (event) => {
     if (!enabled || event.reason !== "resume" || !event.targetSessionFile || !env.HERDR_SOCKET_PATH) return;
