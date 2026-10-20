@@ -37,7 +37,7 @@ const BOT_COMMANDS = [
   { command: "restart", description: "Restart the gateway service" },
 ];
 const RESERVED_COMMANDS = new Set([...BOT_COMMANDS.map((c) => c.command), "start"]);
-const HELP = `Remote Pi\n\nJust send text to chat with Pi; messages sent while it is working act as steering.\n\n` + BOT_COMMANDS.map((c) => `/${c.command.padEnd(19)} ${c.description}`).join("\n");
+const HELP = `telegram-herdr-pi\n\nJust send text to chat with Pi; messages sent while it is working act as steering.\n\n` + BOT_COMMANDS.map((c) => `/${c.command.padEnd(19)} ${c.description}`).join("\n");
 function parseCommand(text) {
   const match = text.match(/^\/([\w:-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
   return match ? { name: match[1].toLowerCase(), argument: match[2]?.trim() ?? "" } : null;

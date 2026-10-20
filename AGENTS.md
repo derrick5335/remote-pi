@@ -1,6 +1,6 @@
-# remote-pi
+# telegram-herdr-pi
 
-Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中的一个 Pi 进程，桌面终端与 Telegram 只是不同视图。
+用 Telegram 远程驱动运行在 Herdr 里的交互式 Pi（原名 remote-pi；运行时名称 `remote-pi.ts`、`pi-remote-gateway`、`~/.config/remote-pi`、`REMOTE_PI_*` 为兼容已有安装保持不变）。一个 session 对应 Herdr 窗格中的一个 Pi 进程，桌面终端与 Telegram 只是不同视图。
 
 ## 关键规则
 
@@ -8,7 +8,7 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - **唯一安全的测试方式**：`timeout 120 node gateway.mjs --self-test`（离线自检，不连 Telegram 或真实 Herdr；没有 `--test` 参数）。自检有 60 秒 watchdog，超时输出当前测试名称并以非零状态退出；轮询 fake 的断言失败必须停止轮询并使测试失败，不能被网络重试吞掉。
 - **修改前先查最佳实践**：动手改代码前，先上网确认该做法是否为最佳实践；若某次修改应用了官方文档、社区等来源的最佳实践，需标明该修改方向的 reference。
 - **100% Pi-native**：仅依赖 Pi 公开 Extension API、Pi 原生 CLI 与 Herdr socket API；不引入私有补丁、私有 addon 或旁路通信文件。目标为已安装的 Pi 1.3.0，以其 `docs/extensions.md`、`docs/rpc.md` 和公开类型定义为准。
-- **行数预算与验证**：`gateway.mjs` ≤1500、`remote-pi.ts` ≤360、`install.sh` ≤140，三者合计 ≤2000；`self-test.mjs` ≤900，均含注释与空行。每步运行 `timeout 120 node gateway.mjs --self-test`、`npm run lint` 与 `npm run typecheck`；不得修改 ESLint 规则或挤压多条语句规避预算。
+- **行数预算与验证**：`gateway.mjs` ≤1540、`remote-pi.ts` ≤380、`install.sh` ≤140，三者合计 ≤2000；`self-test.mjs` ≤1000（由自检强制执行），均含注释与空行。每步运行 `timeout 120 node gateway.mjs --self-test`、`npm run lint` 与 `npm run typecheck`；不得修改 ESLint 规则或挤压多条语句规避预算。
 - **多语言 README 同步**：代码行为/命令/配置发生变化时，必须同步更新 `README.md` 和 `README.zh-CN.md`，两份文档保持一致。
 - **一个会话，一个进程**：已有 Pi 在运行时只绑定其视图，不启动第二个进程读写同一 session。关闭桌面附加的 Topic 只能断开远程控制，不能终止用户的 Pi。
 
@@ -35,7 +35,7 @@ Telegram Bot gateway for interactive Pi。一个 session 对应 Herdr 窗格中�
 - 启动：`agent.start` 前先经 Herdr `pane.report_metadata` 设置 `remote_pi=on`，保留前台 Shell 检查；不注入 Shell `export` 或 `pane run`。扩展经配置解析 `bridge.sock`，不使用 `REMOTE_PI_ATTACH` / `REMOTE_PI_BRIDGE_SOCKET`。
 - Herdr 通信：生命周期操作统一走 socket API；只在启动时经 promisified `execFile` 执行一次 `herdr status server --json`（5 秒超时）发现 socket。语音转写共用该 helper，执行 `bash -c <sttCommand> stt <path>`，超时 120 秒。`agent.start` 使用 `timeout_ms: 45000`，请求额外预留 2 秒通信时间。
 - 命令菜单：仅注册默认 scope 的 `setMyCommands`。旧的 `all_private_chats` 等更具体 scope 会覆盖默认菜单，清理属于需单独授权的迁移操作。
-- 类型检查：`npm run typecheck` 执行 `tsc --noEmit`；`tsconfig.json` 映射本机安装的 Pi 1.3.0 与 TypeBox 公开类型，不复制声明。Node 原生剥离类型后直接导入扩展；ESLint 仅为 TS 配置 parser，不改变规则。
+- 类型检查：`npm run typecheck` 执行 `tsc --noEmit`；类型来自锁定版本的开发依赖 `@earendil-works/pi-coding-agent@1.3.0`（npm），不复制声明、不依赖本机路径。Node 原生剥离类型后直接导入扩展；ESLint 仅为 TS 配置 parser，不改变规则。
 - 草稿 Stop：接收 `stopped_message_generation`，其对象只有 chat/thread/draft ID、没有 `from`；校验白名单私聊 chat ID 后，对已有对应会话立即执行 `/abort`，不新建 Topic。
 - `install.sh`：安装 launchd 服务，并将 `remote-pi.ts` 软链到 `~/.pi/agent/extensions/remote-pi.ts`；安装/升级时替换已有软链目标，不覆盖用户普通文件。`caffeinate -s -i -- node gateway.mjs` 防睡眠，KeepAlive 崩溃自启。
 - `/new` 无论是否已有连接都必须请求 `new_session`，不能把旧 `binding.sessionFile` 的懒启动误报为新会话。

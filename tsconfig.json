@@ -3,15 +3,11 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "paths": {
-      "@earendil-works/pi-coding-agent": [
-        "/Users/panyunpeng/.pi/agent/install/releases/1.3.0/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-      ],
-      "typebox": ["/Users/panyunpeng/.pi/agent/install/releases/1.3.0/node_modules/typebox/build/index.d.mts"]
-    },
     "noEmit": true,
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["remote-pi.ts"]
+  "include": [
+    "remote-pi.ts"
+  ]
 }
